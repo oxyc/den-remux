@@ -67,7 +67,11 @@ async fn an_hdr10_release_reads_as_hdr_and_is_tone_mapped() {
     let info = probe_with_head(&fixture("hdr10.mkv"), crate::scout::HEAD_BYTES as usize).await;
     assert_keyframes(&info.keyframes, &HEVC_MKV_KF);
     assert_eq!(info.video, VideoCodec::Hevc);
-    assert!(info.codecs.as_deref().is_some_and(|c| c.starts_with("hvc1.2.4.L")), "Main 10: {:?}", info.codecs);
+    assert!(
+        info.codecs.as_deref().is_some_and(|c| c.starts_with("hvc1.2.4.L")),
+        "Main 10: {:?}",
+        info.codecs
+    );
     assert!(info.hdr, "the PQ transfer");
     assert!(info.dolby_vision.is_none());
     assert!(crate::session::tonemaps(&info), "a conversion of it has to tone-map, or it plays nowhere");
@@ -846,7 +850,11 @@ async fn hevc_for_a_player_without_it_takes_the_one_transcode() {
     let r = call(&state, "POST", "/remux/session", Some(&phone), h264_only).await;
     assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
     let j = r.json();
-    assert_eq!(j["video"], serde_json::json!({"codec": "h264", "transcoded": true}));
+    // A fixture too small to come down any further, and SDR, so it plays at its own size untouched in colour.
+    let played = serde_json::json!({
+        "codec": "h264", "transcoded": true, "width": 320, "height": 180, "tonemapped": false
+    });
+    assert_eq!(j["video"], played);
     let master = call(&state, "GET", j["playlist"].as_str().unwrap(), None, "").await.text();
     assert!(master.contains("CODECS=\"avc1.640029,mp4a.40.2\""), "{master}");
 
@@ -854,7 +862,10 @@ async fn hevc_for_a_player_without_it_takes_the_one_transcode() {
     let r = call(&state, "POST", "/remux/session", Some(&laptop), h264_only).await;
     assert_eq!(r.json()["error"], "transcode_unavailable", "MAX_TRANSCODES is 1");
     let r = call(&state, "POST", "/remux/session", Some(&laptop), r#"{"imdb":"tt0000002"}"#).await;
-    assert_eq!(r.json()["video"], serde_json::json!({"codec": "hevc", "transcoded": false}), "copied");
+    let copied = serde_json::json!({
+        "codec": "hevc", "transcoded": false, "width": 320, "height": 180, "tonemapped": false
+    });
+    assert_eq!(r.json()["video"], copied, "copied");
 
     state.end_session(j["sid"].as_str().unwrap(), "test").await;
     let r = call(&state, "POST", "/remux/session", Some(&laptop), h264_only).await;

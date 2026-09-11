@@ -378,6 +378,14 @@ where
         .unwrap()
 }
 
+/// The picture's size as it plays: the release's, or what a conversion brings it down to.
+fn played(s: &session::Session) -> (u32, u32) {
+    match s.transcoded {
+        true => session::transcode_size(s.info.width, s.info.height),
+        false => (s.info.width, s.info.height),
+    }
+}
+
 /// The logged-in browser the request's cookie names, if any.
 fn browser_of(state: &AppState, parts: &hyper::http::request::Parts) -> Option<String> {
     let cookies: Vec<&str> =
@@ -521,12 +529,17 @@ where
         Ok(s) => httputil::json(
             StatusCode::CREATED,
             &serde_json::json!({
+                // What is playing, which a converted release is not what its name says: the size it came down to,
+                // and whether its colours were tone-mapped to SDR.
                 "video": {
                     "codec": match s.transcoded || s.info.video == probe::VideoCodec::H264 {
                         true => "h264",
                         false => "hevc",
                     },
                     "transcoded": s.transcoded,
+                    "width": played(&s).0,
+                    "height": played(&s).1,
+                    "tonemapped": s.transcoded && session::tonemaps(&s.info),
                 },
                 "sid": s.sid,
                 "playlist": format!("/remux/s/{}/{}/master.m3u8", s.sid, s.sig),

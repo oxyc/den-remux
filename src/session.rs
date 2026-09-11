@@ -783,7 +783,7 @@ fn plays(want: &Want<'_>, takes_hevc: bool, info: &crate::probe::MediaInfo) -> b
 /// A transcode's output size: the source's, fitted inside `TRANSCODE_WIDTH` × `TRANSCODE_HEIGHT` with its
 /// aspect kept (a 2.4:1 4K film becomes 1920 × 800 — 1080 lines of it would be wider than level 4.1
 /// allows), never scaled up, both even. 0 × 0 when the source's is unknown.
-fn transcode_size(w: u32, h: u32) -> (u32, u32) {
+pub(crate) fn transcode_size(w: u32, h: u32) -> (u32, u32) {
     if w == 0 || h == 0 {
         return (0, 0);
     }
