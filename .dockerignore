@@ -1,0 +1,8 @@
+.git
+.github
+target
+testdata
+*.md
+!README.md
+cache
+.env
