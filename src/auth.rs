@@ -1,9 +1,11 @@
 //! Who may do what.
 //!
-//! A browser proves itself once, by posting its key to `/remux/login`; the key's SHA-256 has to be one
-//! of `BROWSER_KEY_HASHES`. What it gets back is a cookie — `HttpOnly`, so script on the page cannot
-//! read it — that authorises one thing: **creating** a session. Native HLS in Safari cannot add
-//! headers to its requests, which is why this is a cookie and not a bearer token.
+//! Creating a session takes one of two credentials. Usually it is the full scout install URL the request
+//! names — the credential every Den addon's install URL is — and scout alone decides whether it plays.
+//! A browser may also prove itself once, by posting its key to `/remux/login` (its SHA-256 has to be one
+//! of `BROWSER_KEY_HASHES`), for what needs den-remux to vouch: an availability-only scout install, or
+//! this service's own. What it gets back is a cookie — `HttpOnly`, so script on the page cannot read it —
+//! that authorises one thing: **creating** a session.
 //!
 //! Everything a session serves is under a signed path, `/remux/s/<sid>/<sig>/…`, and the cookie is not
 //! asked for there. A Cast or AirPlay receiver has no cookie, and the signed path is what lets it play
@@ -93,6 +95,12 @@ pub fn url_sig_ok(key: &[u8], sid: &str, exp: u64, presented: &str) -> bool {
 /// stops matching the moment that hash is removed from `BROWSER_KEY_HASHES`.
 pub fn browser_id(hash: &[u8; 32]) -> String {
     hex(&hash[..8])
+}
+
+/// Whom a session started without a login belongs to: the install it names, as the first 8 bytes of the
+/// install URL's hash — stable across requests, and not the URL, which is a secret.
+pub fn install_id(base: &str) -> String {
+    format!("install:{}", hex(&sha256(base.as_bytes())[..8]))
 }
 
 /// The browser `key` belongs to, if any. Every configured hash is compared, with no early exit, so

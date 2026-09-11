@@ -1,8 +1,8 @@
 //! Runtime configuration, all from the environment.
 //!
 //! Env: PORT, SCOUT_ORIGINS, REMUX_SCOUT_KEY, SCOUT_INSTALL_URL, SUBTITLE_ORIGINS, BROWSER_KEY_HASHES, REMUX_URL_KEY,
-//!      MAX_SESSIONS, SESSION_IDLE_SECS, SCRATCH_DIR, SCRATCH_MAX_BYTES, FFMPEG_PATH, MAX_TRANSCODES,
-//!      VAAPI_DEVICE, METRICS_TOKEN, LOG_REQUESTS.
+//!      MAX_SESSIONS, MAX_SESSIONS_PER_INSTALL, SESSION_IDLE_SECS, SCRATCH_DIR, SCRATCH_MAX_BYTES, FFMPEG_PATH,
+//!      MAX_TRANSCODES, VAAPI_DEVICE, TRUSTED_PROXIES, METRICS_TOKEN, LOG_REQUESTS.
 
 use std::env;
 use std::path::PathBuf;
@@ -33,6 +33,9 @@ pub struct Config {
     /// browsers out. Reported by /health.
     pub url_key_ephemeral: bool,
     pub max_sessions: usize,
+    /// `MAX_SESSIONS_PER_INSTALL` — sessions one scout install may play at once without a login (default
+    /// 2), under `MAX_SESSIONS`: one household, or one leaked install URL, cannot take every slot.
+    pub max_sessions_per_install: usize,
     pub session_idle: Duration,
     pub scratch_dir: PathBuf,
     pub scratch_max_bytes: u64,
@@ -42,6 +45,9 @@ pub struct Config {
     pub max_transcodes: usize,
     /// `VAAPI_DEVICE` — the GPU's render node.
     pub vaapi_device: PathBuf,
+    /// `TRUSTED_PROXIES` — proxies (comma-separated IPs) whose `X-Forwarded-For` names the visitor, for the
+    /// per-visitor limit on logins and new sessions. `tailscale serve` connects from its host's address.
+    pub trusted_proxies: Vec<std::net::IpAddr>,
     /// `METRICS_TOKEN` — the bearer token `/metrics` requires. `None` turns the endpoint off (404).
     pub metrics_token: Option<String>,
     /// `LOG_REQUESTS` — one stderr line per response when set (anything but empty or `0`).
@@ -99,6 +105,21 @@ pub(crate) fn parse_origins(raw: &str) -> Vec<String> {
         .collect()
 }
 
+/// `TRUSTED_PROXIES`: comma-separated IP addresses. A malformed entry is said once and skipped.
+pub(crate) fn parse_proxies(raw: &str) -> Vec<std::net::IpAddr> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| {
+            let parsed = s.parse().ok();
+            if parsed.is_none() {
+                eprintln!("warning: TRUSTED_PROXIES entry {s:?} is not an IP address; skipping it");
+            }
+            parsed
+        })
+        .collect()
+}
+
 /// Below this the cap cannot hold one window of a 4K session, and every job would sit paused.
 const MIN_SCRATCH_BYTES: u64 = 64 * 1024 * 1024;
 
@@ -127,6 +148,10 @@ impl Config {
                 .and_then(|v| v.parse().ok())
                 .filter(|n| *n >= 1)
                 .unwrap_or(2),
+            max_sessions_per_install: env_opt("MAX_SESSIONS_PER_INSTALL")
+                .and_then(|v| v.parse().ok())
+                .filter(|n| *n >= 1)
+                .unwrap_or(2),
             // Floored: an idle window shorter than a player's pause-and-resume would kill sessions
             // that are merely paused.
             session_idle: Duration::from_secs(
@@ -142,6 +167,7 @@ impl Config {
             vaapi_device: env_opt("VAAPI_DEVICE")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("/dev/dri/renderD128")),
+            trusted_proxies: parse_proxies(&env_opt("TRUSTED_PROXIES").unwrap_or_default()),
             metrics_token: env_opt("METRICS_TOKEN"),
             log_requests: log_requests_on(env::var("LOG_REQUESTS").ok().as_deref()),
         }
@@ -158,6 +184,12 @@ mod tests {
             "http://192.168.86.193:8080/, HTTPS://Scout.lan ,http://x/path,ftp://y,http://u@z,",
         );
         assert_eq!(o, ["http://192.168.86.193:8080", "https://scout.lan"]);
+    }
+
+    #[test]
+    fn trusted_proxies_are_addresses() {
+        let p = parse_proxies("192.168.86.149, ::1,pve,,10.0.0.1/8");
+        assert_eq!(p, ["192.168.86.149".parse::<std::net::IpAddr>().unwrap(), "::1".parse().unwrap()]);
     }
 
     #[test]

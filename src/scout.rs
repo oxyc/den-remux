@@ -1,8 +1,8 @@
 //! The stream source: den-scout.
 //!
 //! A session's releases come from the scout install the web app names — its library's full install URL,
-//! or a scope=availability one that scout honours only with `X-Den-Remux-Key` — or, as a fallback, this
-//! service's own `SCOUT_INSTALL_URL`. The browser never gets a ticket or a debrid link: it asks for a
+//! or, for a logged-in browser, a scope=availability one that scout honours only with `X-Den-Remux-Key` —
+//! or, as a fallback, this service's own `SCOUT_INSTALL_URL`. The browser never gets a ticket or a debrid link: it asks for a
 //! title and gets back a signed session for one release. Scout's ranking is kept as-is:
 //! the first release that is cached on the debrid, in a codec the browser can take copied, and that
 //! probes cleanly, wins.
@@ -177,19 +177,27 @@ pub fn validate_scoped(url: &str, origins: &[String]) -> Result<String, &'static
     Ok(format!("{origin}/{config}"))
 }
 
-/// The stream list for `imdb`, with the service key. `client` must not follow redirects: one would
-/// carry the key off scout's origin.
-pub async fn list(client: &reqwest::Client, src: &ScoutSource, imdb: &str) -> Result<Vec<Stream>, String> {
+/// Why a stream list could not be had: scout's status when it answered one, and what happened.
+pub struct ListError {
+    pub status: Option<u16>,
+    pub detail: String,
+}
+
+/// The stream list for `imdb`, with the service key when the source has one. `client` must not follow
+/// redirects: one would carry the key off scout's origin.
+pub async fn list(client: &reqwest::Client, src: &ScoutSource, imdb: &str) -> Result<Vec<Stream>, ListError> {
+    let fail = |status: Option<u16>, detail: String| ListError { status, detail };
     let mut req = client.get(stream_list_url(&src.base, imdb));
     if let Some(k) = &src.key {
         req = req.header(KEY_HEADER, k);
     }
-    let resp = req.send().await.map_err(|e| e.without_url().to_string())?;
+    let resp = req.send().await.map_err(|e| fail(None, e.without_url().to_string()))?;
     if !resp.status().is_success() {
-        return Err(format!("scout answered {}", resp.status().as_u16()));
+        let status = resp.status().as_u16();
+        return Err(fail(Some(status), format!("scout answered {status}")));
     }
-    let body = crate::probe::read_capped(resp, 8 << 20).await?;
-    parse(&body)
+    let body = crate::probe::read_capped(resp, 8 << 20).await.map_err(|d| fail(None, d))?;
+    parse(&body).map_err(|d| fail(None, d))
 }
 
 /// How many redirects a play URL may take to reach the file. Scout's is one 302; a debrid may add one.

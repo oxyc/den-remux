@@ -5,8 +5,7 @@ laptop cannot play what den-scout returns: Matroska, and Dolby/DTS/TrueHD audio.
 video, re-encodes the audio to AAC stereo, and serves HLS (fMP4) cut on the file's own keyframes.
 
 ```
-browser ──POST /remux/login {key}─────────────►  cookie (HttpOnly, SameSite=Strict, Path=/remux)
-browser ──POST /remux/session {imdb, scout}───►  scout (the library's install URL) → cached H.264/HEVC release
+browser ──POST /remux/session {imdb, scout}───►  scout (the library's install URL, its credential) → cached H.264/HEVC release
         ◄──{ playlist: /remux/s/<sid>/<sig>/master.m3u8 }       probe: duration, tracks, keyframe index
 <video> ──GET /remux/s/<sid>/<sig>/seg<N>.m4s─►  ffmpeg: -c:v copy -c:a aac, one fMP4 file per GOP
 ```
@@ -16,13 +15,15 @@ This is the MVP ("phase 2") of oxyc/den#11: movies and episodes, cached releases
 ## Routes
 
 ```
-POST   /remux/login                     {key} → 204 + Set-Cookie; 401 bad_key
+POST   /remux/login                     {key} → 204 + Set-Cookie; 401 bad_key · 429 rate_limited
 POST   /remux/session                   {imdb, season?, episode?, filename?, scout?, audio?, audioTrack?,
-                                         subtitles?, subtitleLanguages?, videoCodecs?} (cookie) → 201
+                                         subtitles?, subtitleLanguages?, videoCodecs?} (a full scout install,
+                                         or the cookie) → 201
                                         {sid, playlist, release:{label,filename,size}, duration, expiresAt,
                                          video:{codec,transcoded}, audioTrack, audioTracks, subtitles}
-                                        401 not_logged_in · 400 bad_request/bad_scout/bad_subtitles/bad_audio_track
-                                        404 no_release/no_playable_release · 429 too_many_sessions
+                                        401 not_logged_in · 403 scout_refused
+                                        400 bad_request/bad_scout/bad_subtitles/bad_audio_track
+                                        404 no_release/no_playable_release · 429 too_many_sessions/rate_limited
                                         502 scout_unavailable · 503 scout_unconfigured/transcode_unavailable
 GET    /remux/s/<sid>/<sig>/master.m3u8 one variant: CODECS "<avc1…|hvc1…>,mp4a.40.2", BANDWIDTH from size/duration
 GET    /remux/s/<sid>/<sig>/media.m3u8  VOD, #EXT-X-MAP init.mp4, segments on real keyframes, #EXT-X-ENDLIST
@@ -37,7 +38,7 @@ anything else                           404 {"error":"not_found"}
 ```
 
 `scout` is the scout install URL the web app reads from the library's `set:plugins` group
-(`http://<scout>:8080/<config>`); without it the server's `SCOUT_INSTALL_URL` is used. `filename` prefers that release when it is playable here.
+(`http://<scout>:8080/<config>`); without it — for a logged-in browser — the server's `SCOUT_INSTALL_URL` is used. `filename` prefers that release when it is playable here.
 
 - **Audio.** `audio` is the player's languages, most wanted first, in any spelling a release or a browser
   uses (`en-US`, `eng`, `fin`). The first language a track is in wins — the default-flagged track among
@@ -61,18 +62,26 @@ anything else                           404 {"error":"not_found"}
 `application/vnd.apple.mpegurl` and `no-store`; `init.mp4` and segments are `video/mp4`. Login and session
 creation get no CORS at all: they are for the Den web app on the same origin.
 
-A browser that creates a session while it already has one ends the old one (it has moved on to another
-title), so `MAX_SESSIONS` counts browsers watching, not titles clicked.
+A logged-in browser that creates a session while it already has one ends the old one (it has moved on to
+another title), and an install past `MAX_SESSIONS_PER_INSTALL` ends its oldest, so `MAX_SESSIONS` counts
+people watching, not titles clicked.
 
 ## Security model
 
-- **The browser names its own scout install.** Every device in a Den library holds the library's plugin
+- **The scout install is the credential.** Every device in a Den library holds the library's plugin
   list, scout's full install URL included (one trust level, oxyc/den#12), and the web app sends that URL
-  with each session request. A scope=availability URL works too: den-scout lets it list and play only
-  when the caller presents `X-Den-Remux-Key` (`REMUX_SCOUT_KEY`), so that URL on its own plays nothing.
-  den-remux accepts either only on an origin in `SCOUT_ORIGINS` with exactly one base64url config segment
-  and no credentials, query or fragment — the SSRF guard, without which a logged-in browser could make
-  this service fetch anything on the LAN.
+  with each session request. That URL is what every Den addon's credential is, so it admits a session on
+  its own: no login, and nothing per browser or per household to configure. Scout alone decides —
+  den-remux sends no key of its own for such a request — so an install scout revokes (`REVOKED_INSTALLS`,
+  `CONFIG_EPOCH`) stops playing here too (`403 scout_refused`), and a scope=availability URL, which
+  den-scout lets list and play only for `X-Den-Remux-Key` (`REMUX_SCOUT_KEY`), plays nothing unless a
+  logged-in browser sends it (`401 not_logged_in`). A scout URL is accepted only on an origin in
+  `SCOUT_ORIGINS` with exactly one base64url config segment and no credentials, query or fragment — the
+  SSRF guard, without which a request could make this service fetch anything on the LAN.
+- **Shares and limits.** An install plays `MAX_SESSIONS_PER_INSTALL` sessions at once and its oldest gives
+  way to a new one, so one household — or one leaked install URL — cannot hold every slot; `MAX_SESSIONS`
+  and `MAX_TRANSCODES` cap the box. Logins and new sessions are limited to 10 a minute per visitor: the
+  address a `TRUSTED_PROXIES` proxy forwarded, else the connection's.
 - **The key reaches scout and nothing else.** An HTTP client forwards custom headers across a
   cross-origin redirect, which would hand the key to the debrid's CDN on scout's 302. den-remux talks to
   scout with a client that follows no redirect and follows play URLs by hand, sending the key only to
@@ -82,11 +91,12 @@ title), so `MAX_SESSIONS` counts browsers watching, not titles clicked.
   Scout's play URL and the debrid link it leads to are used only by this process and its ffmpeg, so every
   byte leaves from the homelab's IP. `SCOUT_INSTALL_URL`, this service's own install, is a fallback for
   driving it by hand.
-- **The cookie only creates sessions.** A browser posts its key once; the server holds only SHA-256 hashes
-  (`BROWSER_KEY_HASHES`). The cookie is `HttpOnly; Secure; SameSite=Strict; Path=/remux`, HMAC-signed with
-  an expiry (30 days), and stops working when its key's hash is removed or `REMUX_URL_KEY` rotates. It is a
-  cookie, not a header, because native HLS in Safari cannot add headers. Script on the page cannot read it;
-  at worst an XSS starts sessions, and there are two of those.
+- **A browser key is for what needs den-remux to vouch.** An availability-only scout install, or the
+  `SCOUT_INSTALL_URL` fallback, plays only for a browser that posted its key once; the server holds only
+  SHA-256 hashes (`BROWSER_KEY_HASHES`, optional). The cookie it gets is `HttpOnly; Secure;
+  SameSite=Strict; Path=/remux`, HMAC-signed with an expiry (30 days), and stops working when its key's
+  hash is removed or `REMUX_URL_KEY` rotates. Script on the page cannot read it, and it only ever creates
+  sessions.
 - **Session URLs are signed bearer URLs.** `/remux/s/<sid>/<sig>/…`: `sid` is 128 random bits, `sig` is
   `HMAC-SHA256(REMUX_URL_KEY, sid‖exp)` truncated to 128 bits, compared in constant time. No cookie is
   asked for there, which is what will let a Cast or AirPlay receiver play. A session lives for the film's
@@ -176,15 +186,17 @@ Every variable is unprefixed; `.env.example` lists them with their defaults.
 | `REMUX_SCOUT_KEY` | — | **Secret.** Sent to scout (and only to scout's origin) as `X-Den-Remux-Key`; a scope=availability config lists and plays only with it (a full install URL doesn't need it). `/health` says `scout_key_missing` when origins are set without it. |
 | `SCOUT_INSTALL_URL` | — | Fallback when a request names no scout: an install of this service's own, sealed config included (`http://<scout>:8080/<config>`). **Secret**; never logged. |
 | `SUBTITLE_ORIGINS` | — | Origins a request's den-subtitles install, and the subtitle URLs it answers with, may be on. Empty turns subtitles off. |
-| `BROWSER_KEY_HASHES` | — | Comma-separated hex SHA-256 of each browser's key. Removing one logs that browser out. |
+| `BROWSER_KEY_HASHES` | — | Optional. Comma-separated hex SHA-256 of each browser key, for an availability-only scout install or `SCOUT_INSTALL_URL`. Removing one logs that browser out. |
 | `REMUX_URL_KEY` | random | **Secret.** Signs cookies and session URLs. **Set it**: unset, every restart logs the browsers out (`/health` says `url_key_ephemeral`). Rotating it kills every cookie and session URL. |
 | `MAX_SESSIONS` | `2` | Sessions at once; the next gets 429 `too_many_sessions`. |
+| `MAX_SESSIONS_PER_INSTALL` | `2` | Sessions one scout install plays at once without a login; past it, its oldest ends. |
 | `SESSION_IDLE_SECS` | `600` | A session with no request for this long is ended (min 30). |
 | `SCRATCH_DIR` | `/cache` | Where GOP files go. den-remux's alone: every `s-*` directory in it is deleted at start. |
 | `SCRATCH_MAX_BYTES` | `1073741824` | Cap across sessions; past it a job pauses once the requested segment is done (min 64 MiB). |
 | `FFMPEG_PATH` | `ffmpeg` | The image sets `/usr/local/bin/ffmpeg`. (There is no `FFPROBE_PATH`: probing is done in-process.) |
 | `MAX_TRANSCODES` | `1` | Sessions transcoding on the GPU at once; `0` turns transcoding off. Copies do not count. |
 | `VAAPI_DEVICE` | `/dev/dri/renderD128` | The GPU's render node. Transcoding is on only when it exists and ffmpeg has the VAAPI encoder and filters (the startup line says `transcode=vaapi(max N)` or `off`). |
+| `TRUSTED_PROXIES` | — | Proxy IPs (comma-separated) whose `X-Forwarded-For` names the visitor, for the limit on logins and new sessions: `tailscale serve`'s host. |
 | `METRICS_TOKEN` | — | Turns on `/metrics` behind `Authorization: Bearer <token>`; otherwise it is a 404. |
 | `LOG_REQUESTS` | off | `1` writes `<METHOD> <path> <status> <ms>ms[ rid=<X-Request-Id>]` per response. |
 | `PORT` | `8095` | |
@@ -196,7 +208,7 @@ A browser key and its hash: `key=$(head -c 24 /dev/urandom | base64 | tr '+/' '-
 `/health` is 200 with `status: ok`, or `degraded` with the first reason sessions cannot work:
 `ffmpeg_unavailable` (checked at start: matroska and mov demuxers, hls muxer, aac encoder, https),
 `scratch_unwritable`, `scout_unconfigured` (neither `SCOUT_ORIGINS` nor `SCOUT_INSTALL_URL`),
-`scout_key_missing`, `no_browser_keys`, `url_key_ephemeral`.
+`scout_key_missing`, `url_key_ephemeral`.
 
 `/metrics` (gauges and counters prefixed `remux_`): sessions and the cap, ffmpeg processes alive, scratch
 bytes and the cap, transcodes and their cap (0 when off), sessions and ffmpeg runs started. The log is state changes: the startup line, one line

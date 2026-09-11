@@ -1,14 +1,15 @@
 //! den-remux — Den's playback for browsers, AirPlay and Cast receivers.
 //!
-//!   POST /remux/login   {key}               → cookie for creating sessions
+//!   POST /remux/login   {key}               → cookie for what needs this service to vouch
 //!   POST /remux/session {imdb, season?, episode?, filename?, scout?} → a signed session: /remux/s/<sid>/<sig>/master.m3u8
 //!   GET  /remux/s/<sid>/<sig>/…             → HLS (fMP4): master, media, init.mp4, seg<N>.m4s
 //!   DELETE /remux/s/<sid>/<sig>             → end it (410 from then on)
 //!   GET  /health, /metrics
 //!
-//! A release comes from den-scout — a scope=availability install named per request and opened with
-//! this service's key, or this service's own install. Its video is copied, its audio re-encoded to
-//! AAC stereo, and it is served as a VOD playlist cut on its own keyframes.
+//! A release comes from den-scout — the full install the request names, which is its own credential; for a
+//! logged-in browser also a scope=availability install opened with this service's key, or this service's
+//! own install. Its video is copied, its audio re-encoded to AAC stereo, and it is served as a VOD
+//! playlist cut on its own keyframes.
 
 mod auth;
 mod config;
@@ -92,8 +93,6 @@ fn health_verdict(state: &AppState) -> Option<(&'static str, &'static str)> {
         ))
     } else if !state.cfg.scout_origins.is_empty() && state.cfg.scout_key.is_none() {
         Some(("scout_key_missing", "set REMUX_SCOUT_KEY, or a scoped scout config refuses to list or play"))
-    } else if state.cfg.browser_key_hashes.is_empty() {
-        Some(("no_browser_keys", "set BROWSER_KEY_HASHES, or no browser can log in"))
     } else if state.cfg.url_key_ephemeral {
         Some(("url_key_ephemeral", "set REMUX_URL_KEY, or every restart logs the browsers out"))
     } else {
@@ -258,6 +257,15 @@ where
                 .unwrap()
         }
         "/health" | "/metrics" => method_not_allowed("GET, HEAD"),
+        "/remux/login" | "/remux/session"
+            if parts.method == Method::POST && !state.admit(visitor(state, parts)) =>
+        {
+            httputil::json(
+                StatusCode::TOO_MANY_REQUESTS,
+                &serde_json::json!({"error": "rate_limited", "detail": "Too many logins or new sessions from here; wait a minute."}),
+                &[("retry-after", "60")],
+            )
+        }
         "/remux/login" if parts.method == Method::POST => login(state, body).await,
         "/remux/session" if parts.method == Method::POST => create_session(state, parts, body).await,
         "/remux/login" | "/remux/session" => method_not_allowed("POST"),
@@ -266,6 +274,28 @@ where
             None => httputil::not_found(),
         },
     }
+}
+
+/// The connection's peer address, which the server puts on every request.
+#[derive(Clone, Copy)]
+pub struct Peer(pub std::net::IpAddr);
+
+/// Who is asking, for the per-visitor limit: the connection's address, or — through a proxy in
+/// `TRUSTED_PROXIES` — the last address its `X-Forwarded-For` names, the one that proxy saw.
+pub(crate) fn visitor(state: &AppState, parts: &hyper::http::request::Parts) -> Option<std::net::IpAddr> {
+    let peer = parts.extensions.get::<Peer>()?.0;
+    if !state.cfg.trusted_proxies.contains(&peer) {
+        return Some(peer);
+    }
+    let forwarded = parts
+        .headers
+        .get_all("x-forwarded-for")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .map(str::trim)
+        .rfind(|s| !s.is_empty());
+    Some(forwarded.and_then(|s| s.parse().ok()).unwrap_or(peer))
 }
 
 /// A small JSON request body; `None` if it is larger than any real request.
@@ -325,15 +355,8 @@ where
     let cookies: Vec<&str> =
         parts.headers.get_all(hyper::header::COOKIE).iter().filter_map(|v| v.to_str().ok()).collect();
     let cookie = cookies.join("; ");
-    let Some(browser) =
-        auth::cookie_browser(&state.cfg.url_key, &state.cfg.browser_key_hashes, Some(&cookie), unix_now())
-    else {
-        return httputil::error(
-            StatusCode::UNAUTHORIZED,
-            "not_logged_in",
-            "Log in with this browser's key first.",
-        );
-    };
+    let browser =
+        auth::cookie_browser(&state.cfg.url_key, &state.cfg.browser_key_hashes, Some(&cookie), unix_now());
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
     struct Create {
@@ -358,6 +381,19 @@ where
              \"videoCodecs\"?: [\"h264\", \"hevc\"]}.",
         );
     };
+    // A logged-in browser, or — with no cookie — whoever holds the scout install the request names: that
+    // URL is the credential, as every addon's is. Without either there is nothing to play with.
+    let admission = match (browser, &req.scout) {
+        (Some(b), _) => session::Admission::Browser(b),
+        (None, Some(_)) => session::Admission::Install,
+        (None, None) => {
+            return httputil::error(
+                StatusCode::UNAUTHORIZED,
+                "not_logged_in",
+                "Name a scout install, or log in with this browser's key.",
+            )
+        }
+    };
     if !scout::is_imdb(&req.imdb) {
         return bad_request("imdb must be an IMDb id, tt followed by digits.");
     }
@@ -381,7 +417,7 @@ where
         subtitle_languages: &req.subtitle_languages,
         video_codecs: &req.video_codecs,
     };
-    match session::create(state, browser, &want).await {
+    match session::create(state, admission, &want).await {
         Ok(s) => httputil::json(
             StatusCode::CREATED,
             &serde_json::json!({
@@ -504,8 +540,8 @@ async fn run(cfg: Config) -> std::io::Result<()> {
     let on = |b: bool| if b { "on" } else { "off" };
     eprintln!(
         "den-remux {} listening on :{} — metrics={} log_requests={} scout_origins={} scout_key={} scout_install={} \
-         browser_keys={} url_key={} \
-         max_sessions={} idle={}s scratch={} scratch_max={} ffmpeg={} transcode={}",
+         browser_keys={} url_key={} trusted_proxies={} \
+         max_sessions={} per_install={} idle={}s scratch={} scratch_max={} ffmpeg={} transcode={}",
         env!("CARGO_PKG_VERSION"),
         state.cfg.port,
         on(state.cfg.metrics_token.is_some()),
@@ -515,7 +551,9 @@ async fn run(cfg: Config) -> std::io::Result<()> {
         on(state.cfg.scout_install_url.is_some()),
         state.cfg.browser_key_hashes.len(),
         if state.cfg.url_key_ephemeral { "ephemeral" } else { "set" },
+        state.cfg.trusted_proxies.len(),
         state.cfg.max_sessions,
+        state.cfg.max_sessions_per_install,
         state.cfg.session_idle.as_secs(),
         state.cfg.scratch_dir.display(),
         state.cfg.scratch_max_bytes,
@@ -556,7 +594,7 @@ async fn serve_until(
     let graceful = GracefulShutdown::new();
     tokio::pin!(shutdown);
     loop {
-        let (stream, _) = tokio::select! {
+        let (stream, peer) = tokio::select! {
             accepted = listener.accept() => match accepted {
                 Ok(pair) => pair,
                 Err(e) => {
@@ -570,7 +608,9 @@ async fn serve_until(
             _ = &mut shutdown => break,
         };
         let state = state.clone();
-        let service = service_fn(move |req| {
+        let peer = Peer(peer.ip());
+        let service = service_fn(move |mut req: Request<hyper::body::Incoming>| {
+            req.extensions_mut().insert(peer);
             let state = state.clone();
             async move { Ok::<_, Infallible>(handle_request(state, req).await) }
         });

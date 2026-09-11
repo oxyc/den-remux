@@ -2,6 +2,7 @@
 //! counters `/health` and `/metrics` read.
 
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -17,6 +18,10 @@ pub fn unix_now() -> u64 {
 /// How many ended sessions are remembered, so their URLs answer 410 rather than 404.
 const TOMBSTONES_MAX: usize = 1024;
 
+/// Logins and new sessions one visitor may start a minute: far above a person trying titles, far below
+/// what it takes to keep every slot churning or to guess at a browser key.
+pub const STARTS_PER_MINUTE: u32 = 10;
+
 pub struct AppState {
     pub cfg: Config,
     pub http: reqwest::Client,
@@ -28,6 +33,8 @@ pub struct AppState {
     tombstones: Mutex<HashMap<String, u64>>,
     /// Sessions being set up: they hold a slot against `MAX_SESSIONS` while their release is probed.
     creating: AtomicUsize,
+    /// Starts per visitor in the current minute: `(minute, count)`.
+    starts: Mutex<HashMap<IpAddr, (u64, u32)>>,
     pub scratch_bytes: AtomicU64,
     pub sessions_started: AtomicU64,
     pub jobs_started: AtomicU64,
@@ -76,6 +83,7 @@ impl AppState {
             sessions: Mutex::new(HashMap::new()),
             tombstones: Mutex::new(HashMap::new()),
             creating: AtomicUsize::new(0),
+            starts: Mutex::new(HashMap::new()),
             scratch_bytes: AtomicU64::new(0),
             sessions_started: AtomicU64::new(0),
             jobs_started: AtomicU64::new(0),
@@ -113,6 +121,18 @@ impl AppState {
         }
         self.creating.fetch_add(1, Relaxed);
         Some(Slot(&self.creating))
+    }
+
+    /// Count a login or a new session for `visitor`: false once it has had `STARTS_PER_MINUTE` this
+    /// minute. No address means no limit — only a test's request comes without one.
+    pub fn admit(&self, visitor: Option<IpAddr>) -> bool {
+        let Some(ip) = visitor else { return true };
+        let minute = unix_now() / 60;
+        let mut starts = self.starts.lock().unwrap_or_else(|e| e.into_inner());
+        starts.retain(|_, (m, _)| *m == minute);
+        let (_, count) = starts.entry(ip).or_insert((minute, 0));
+        *count += 1;
+        *count <= STARTS_PER_MINUTE
     }
 
     pub fn insert_session(&self, s: Arc<Session>) {

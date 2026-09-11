@@ -283,12 +283,14 @@ fn state_with(origin: &str, max_sessions: usize, idle: Duration, scout_key: Opti
         url_key: b"integration-test-key".to_vec(),
         url_key_ephemeral: false,
         max_sessions,
+        max_sessions_per_install: 2,
         session_idle: idle,
         scratch_dir: dir.clone(),
         scratch_max_bytes: 1 << 30,
         ffmpeg: tool("FFMPEG_PATH", "ffmpeg"),
         max_transcodes: 1,
         vaapi_device: PathBuf::from("/dev/dri/renderD128"),
+        trusted_proxies: vec!["192.168.86.149".parse().unwrap()],
         metrics_token: None,
         log_requests: false,
     });
@@ -596,12 +598,93 @@ async fn a_scoped_scout_gets_the_service_key_and_nothing_else_does() {
     }
     state.end_all("test").await;
 
-    // Without the key the scoped config will not list, and that is scout being unavailable.
+    // Without the key the scoped config will not list: scout refuses it, and den-remux says so.
     let keyless = state_with(&origin, 2, Duration::from_secs(600), None);
     let cookie = login(&keyless, "phone-key").await;
     let r = call(&keyless, "POST", "/remux/session", Some(&cookie), &scoped(&good)).await;
-    assert_eq!(r.status, StatusCode::BAD_GATEWAY, "{}", r.text());
-    assert_eq!(r.json()["error"], "scout_unavailable");
+    assert_eq!(r.status, StatusCode::FORBIDDEN, "{}", r.text());
+    assert_eq!(r.json()["error"], "scout_refused");
+}
+
+/// With no cookie the install URL is the credential: a full install plays; an availability-only one needs
+/// a logged-in browser, since den-remux's key is sent for nobody else; and one scout won't open (revoked,
+/// or not its own) is refused as such. No ffmpeg needed.
+#[tokio::test]
+async fn a_full_install_url_is_its_own_credential() {
+    let origin = origin().await;
+    let state = test_state(&origin, 4, Duration::from_secs(600));
+    let with = |config: &str| format!(r#"{{"imdb":"tt0000001","scout":"{origin}/{config}"}}"#);
+    let r = call(&state, "POST", "/remux/session", None, &with("cfg")).await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    assert_eq!(r.json()["release"]["filename"], "h264.mkv");
+    let r = call(&state, "POST", "/remux/session", None, &with(SCOPED)).await;
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED, "{}", r.text());
+    assert_eq!(r.json()["error"], "not_logged_in");
+    let r = call(&state, "POST", "/remux/session", None, &with("cmV2b2tlZA")).await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN, "{}", r.text());
+    assert_eq!(r.json()["error"], "scout_refused");
+    state.end_all("test").await;
+}
+
+/// An install plays `MAX_SESSIONS_PER_INSTALL` (2 here) at once and its oldest gives way to a new one, so
+/// one household — or one leaked URL — cannot hold every slot; `MAX_SESSIONS` still caps the whole box.
+#[tokio::test]
+async fn an_install_plays_its_share_and_its_oldest_gives_way() {
+    let origin = origin().await;
+    let state = test_state(&origin, 3, Duration::from_secs(600));
+    let full = format!(r#"{{"imdb":"tt0000001","scout":"{origin}/cfg"}}"#);
+    let mut sids = Vec::new();
+    for _ in 0..3 {
+        let r = call(&state, "POST", "/remux/session", None, &full).await;
+        assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+        sids.push(r.json()["sid"].as_str().unwrap().to_string());
+    }
+    assert!(state.session(&sids[0]).is_none(), "the install's oldest gave way");
+    assert!(state.session(&sids[1]).is_some() && state.session(&sids[2]).is_some());
+    // The third slot goes to a browser; then the box is full for anyone else.
+    let phone = login(&state, "phone-key").await;
+    let r = call(&state, "POST", "/remux/session", Some(&phone), r#"{"imdb":"tt0000001"}"#).await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let laptop = login(&state, "laptop-key").await;
+    let r = call(&state, "POST", "/remux/session", Some(&laptop), r#"{"imdb":"tt0000001"}"#).await;
+    assert_eq!(r.json()["error"], "too_many_sessions");
+    state.end_all("test").await;
+}
+
+#[tokio::test]
+async fn a_visitor_gets_a_few_starts_a_minute() {
+    let state = test_state("http://127.0.0.1:9", 2, Duration::from_secs(600));
+    let ip = Some("100.64.0.7".parse().unwrap());
+    for _ in 0..crate::state::STARTS_PER_MINUTE {
+        assert!(state.admit(ip));
+    }
+    assert!(!state.admit(ip));
+    assert!(state.admit(Some("100.64.0.8".parse().unwrap())), "another visitor has their own");
+    assert!(state.admit(None), "no address, no limit: only a test's request comes without one");
+}
+
+/// Through a trusted proxy the visitor is the last address it forwarded; anyone else is their own address.
+#[tokio::test]
+async fn the_visitor_is_the_address_a_trusted_proxy_saw() {
+    let state = test_state("http://127.0.0.1:9", 2, Duration::from_secs(600));
+    let parts = |peer: &str, forwarded: Option<&str>| {
+        let mut b = Request::builder().extension(crate::Peer(peer.parse().unwrap()));
+        if let Some(f) = forwarded {
+            b = b.header("x-forwarded-for", f);
+        }
+        b.body(()).unwrap().into_parts().0
+    };
+    let ip = |s: &str| Some(s.parse().unwrap());
+    let visitor = |p| crate::visitor(&state, &p);
+    assert_eq!(visitor(parts("192.168.86.149", Some("100.64.0.7"))), ip("100.64.0.7"));
+    assert_eq!(
+        visitor(parts("192.168.86.149", Some("6.6.6.6, 100.64.0.7"))),
+        ip("100.64.0.7"),
+        "the last hop"
+    );
+    assert_eq!(visitor(parts("192.168.86.149", None)), ip("192.168.86.149"));
+    assert_eq!(visitor(parts("192.168.86.50", Some("100.64.0.7"))), ip("192.168.86.50"), "not a proxy");
+    assert_eq!(crate::visitor(&state, &Request::builder().body(()).unwrap().into_parts().0), None);
 }
 
 /// The fixture carries English then Swedish: a preference picks the track, `audioTrack` overrides it,

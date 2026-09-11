@@ -109,7 +109,11 @@ pub struct Session {
     pub sid: String,
     pub sig: String,
     pub exp: u64,
-    pub browser: String,
+    /// Whom it counts against: a logged-in browser's id, or the install it was started with
+    /// (`auth::install_id`).
+    pub owner: String,
+    /// When it was set up, so an install past its share ends its oldest.
+    pub started: Instant,
     pub imdb: String,
     pub dir: PathBuf,
     pub release: Release,
@@ -682,9 +686,10 @@ pub struct Want<'a> {
     pub id: &'a str,
     /// The release to prefer, when it is playable here.
     pub filename: Option<&'a str>,
-    /// The scout install from the web app's library (full, or scope=availability), accepted only on a
-    /// `SCOUT_ORIGINS` origin and presented with `REMUX_SCOUT_KEY`. Without it this service's own
-    /// `SCOUT_INSTALL_URL` is used, which is how it can be driven by hand.
+    /// The scout install from the web app's library, accepted only on a `SCOUT_ORIGINS` origin: a full
+    /// one, or — for a logged-in browser, presented with `REMUX_SCOUT_KEY` — a scope=availability one.
+    /// Without it this service's own `SCOUT_INSTALL_URL` is used, for a logged-in browser only, which is
+    /// how it can be driven by hand.
     pub scout: Option<&'a str>,
     /// Audio languages, most wanted first.
     pub audio: &'a [String],
@@ -713,8 +718,23 @@ fn transcode_size(w: u32, h: u32) -> (u32, u32) {
     (even(w), even(h))
 }
 
+/// Who a session is for, which decides what den-remux vouches for.
+pub enum Admission {
+    /// A browser logged in with its key. For it den-remux presents its own scout key, so an
+    /// availability-only install — or the `SCOUT_INSTALL_URL` fallback — can play.
+    Browser(String),
+    /// No login: the scout install the request names is the credential, as every addon's install URL is.
+    /// den-remux's key is not sent, so scout alone decides: a full install lists and plays, and an
+    /// availability-only, revoked or foreign one does not.
+    Install,
+}
+
 /// `POST /remux/session`: pick and probe a release, choose its audio track, and set up its session.
-pub async fn create(st: &Arc<AppState>, browser: String, want: &Want<'_>) -> Result<Arc<Session>, ApiError> {
+pub async fn create(
+    st: &Arc<AppState>,
+    admission: Admission,
+    want: &Want<'_>,
+) -> Result<Arc<Session>, ApiError> {
     let imdb = want.id;
     let base = match want.scout {
         Some(url) => scout::validate_scoped(url, &st.cfg.scout_origins).map_err(|why| {
@@ -728,7 +748,12 @@ pub async fn create(st: &Arc<AppState>, browser: String, want: &Want<'_>) -> Res
             )
         })?,
     };
-    let source = scout::ScoutSource { base, key: st.cfg.scout_key.clone() };
+    let by_install = matches!(admission, Admission::Install);
+    let (owner, key, share) = match admission {
+        Admission::Browser(b) => (b, st.cfg.scout_key.clone(), 1),
+        Admission::Install => (crate::auth::install_id(&base), None, st.cfg.max_sessions_per_install),
+    };
+    let source = scout::ScoutSource { base, key };
     // Checked before any work: a bad install is the browser's mistake, not a reason to probe a release.
     let mut sub_langs: Vec<String> = Vec::new();
     for l in want.subtitle_languages.iter().map(|l| crate::lang::canonical(l)) {
@@ -749,10 +774,13 @@ pub async fn create(st: &Arc<AppState>, browser: String, want: &Want<'_>) -> Res
         _ => None,
     };
     // A browser starting another title is done with the one it was watching; making it wait out the
-    // idle timer for its own old session would turn every change of mind into a 429.
-    let mine: Vec<String> =
-        st.sessions().values().filter(|s| s.browser == browser).map(|s| s.sid.clone()).collect();
-    for sid in mine {
+    // idle timer for its own old session would turn every change of mind into a 429. An install plays
+    // `MAX_SESSIONS_PER_INSTALL` at once — a household's people — and past that its oldest gives way.
+    let mut mine: Vec<(Instant, String)> =
+        st.sessions().values().filter(|s| s.owner == owner).map(|s| (s.started, s.sid.clone())).collect();
+    mine.sort();
+    let excess = (mine.len() + 1).saturating_sub(share);
+    for (_, sid) in mine.into_iter().take(excess) {
         st.end_session(&sid, "replaced").await;
     }
     let Some(_slot) = st.reserve() else {
@@ -763,9 +791,29 @@ pub async fn create(st: &Arc<AppState>, browser: String, want: &Want<'_>) -> Res
         ));
     };
     let secrets = [source.base.as_str()];
-    let list = scout::list(&st.scout_http, &source, imdb).await.map_err(|e| {
-        crate::log_limited("scout_list", || format!("scout: {}", crate::redact::scrub(&e, &secrets)));
-        api(StatusCode::BAD_GATEWAY, "scout_unavailable", "Could not list releases.")
+    let list = scout::list(&st.scout_http, &source, imdb).await.map_err(|e| match e.status {
+        // Out of scope: an availability-only install, which plays only with den-remux's key — sent for a
+        // logged-in browser alone.
+        Some(403) if by_install => api(
+            StatusCode::UNAUTHORIZED,
+            "not_logged_in",
+            "This scout install can't play on its own; log in with this browser's key.",
+        ),
+        // Scout would not open the install: revoked, out of scope, or not one of its own.
+        Some(status @ (400 | 403)) => {
+            crate::log_limited("scout_refused", || format!("scout: refused the install ({status})"));
+            api(
+                StatusCode::FORBIDDEN,
+                "scout_refused",
+                "Scout refused this install: revoked, or one it can't open.",
+            )
+        }
+        _ => {
+            crate::log_limited("scout_list", || {
+                format!("scout: {}", crate::redact::scrub(&e.detail, &secrets))
+            });
+            api(StatusCode::BAD_GATEWAY, "scout_unavailable", "Could not list releases.")
+        }
     })?;
     let mut candidates = scout::candidates(&list, want.filename);
     if candidates.is_empty() {
@@ -883,7 +931,8 @@ pub async fn create(st: &Arc<AppState>, browser: String, want: &Want<'_>) -> Res
         sid: sid.clone(),
         sig,
         exp,
-        browser,
+        owner,
+        started: Instant::now(),
         imdb: imdb.to_string(),
         dir,
         release: Release { label: c.attributes.label.clone(), filename: c.filename().to_string(), size },
