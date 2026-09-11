@@ -215,6 +215,11 @@ fn parse_moov(moov: &[u8]) -> Result<MediaInfo, ProbeError> {
         }
         other => (VideoCodec::Other(String::from_utf8_lossy(other).into_owned()), None),
     };
+    // `colr` of type `nclx`: primaries, transfer, matrix as u16s.
+    let hdr = config(b"colr")
+        .filter(|c| c.get(0..4) == Some(b"nclx"))
+        .and_then(|c| u16_at(c, 6))
+        .is_some_and(|t| super::is_hdr_transfer(t as u64));
     if video.timescale == 0 {
         return Err(ProbeError::Truncated("mdhd"));
     }
@@ -238,6 +243,9 @@ fn parse_moov(moov: &[u8]) -> Result<MediaInfo, ProbeError> {
             language: t.language.clone(),
             // AudioSampleEntry: 8 bytes of SampleEntry, 8 reserved, then channelcount.
             channels: u16_at(t.entry, 16).unwrap_or(2) as u32,
+            name: None,
+            default: true,
+            commentary: false,
         })
         .collect();
     Ok(MediaInfo {
@@ -247,6 +255,7 @@ fn parse_moov(moov: &[u8]) -> Result<MediaInfo, ProbeError> {
         codecs,
         width: u16_at(video.entry, 24).unwrap_or(0) as u32,
         height: u16_at(video.entry, 26).unwrap_or(0) as u32,
+        hdr,
         audio,
         keyframes,
     })

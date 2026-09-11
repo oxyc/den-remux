@@ -14,12 +14,14 @@ mod auth;
 mod config;
 mod httputil;
 mod job;
+mod lang;
 mod playlist;
 mod probe;
 mod redact;
 mod scout;
 mod session;
 mod state;
+mod subs;
 
 #[cfg(test)]
 mod tests;
@@ -153,6 +155,20 @@ fn metrics_body(state: &AppState) -> String {
     );
     metric("remux_scratch_max_bytes", "gauge", "SCRATCH_MAX_BYTES.", "", state.cfg.scratch_max_bytes);
     metric(
+        "remux_transcodes",
+        "gauge",
+        "Sessions transcoding on the GPU now.",
+        "",
+        state.transcodes.load(Relaxed) as u64,
+    );
+    metric(
+        "remux_transcodes_max",
+        "gauge",
+        "MAX_TRANSCODES, or 0 when transcoding is off.",
+        "",
+        if state.transcode_ok.load(Relaxed) { state.cfg.max_transcodes as u64 } else { 0 },
+    );
+    metric(
         "remux_sessions_started_total",
         "counter",
         "Sessions created since start.",
@@ -258,7 +274,8 @@ where
     B: hyper::body::Body<Data = Bytes> + Send + 'static,
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
-    http_body_util::Limited::new(body, 4096).collect().await.ok().map(|c| c.to_bytes())
+    // Two install URLs with sealed configs fit well inside this.
+    http_body_util::Limited::new(body, 16 * 1024).collect().await.ok().map(|c| c.to_bytes())
 }
 
 fn bad_request(detail: &str) -> Response<Body> {
@@ -318,16 +335,27 @@ where
         );
     };
     #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
     struct Create {
         imdb: String,
         season: Option<u32>,
         episode: Option<u32>,
         filename: Option<String>,
         scout: Option<String>,
+        #[serde(default)]
+        audio: Vec<String>,
+        audio_track: Option<usize>,
+        subtitles: Option<String>,
+        #[serde(default)]
+        subtitle_languages: Vec<String>,
+        #[serde(default)]
+        video_codecs: Vec<String>,
     }
     let Some(req) = read_body(body).await.and_then(|b| serde_json::from_slice::<Create>(&b).ok()) else {
         return bad_request(
-            "Expected {\"imdb\": \"tt…\", \"season\"?: n, \"episode\"?: n, \"filename\"?: \"…\", \"scout\"?: \"…\"}.",
+            "Expected {\"imdb\": \"tt…\", \"season\"?: n, \"episode\"?: n, \"filename\"?: \"…\", \"scout\"?: \"…\", \
+             \"audio\"?: [\"en\", …], \"audioTrack\"?: n, \"subtitles\"?: \"…\", \"subtitleLanguages\"?: [\"en\", …], \
+             \"videoCodecs\"?: [\"h264\", \"hevc\"]}.",
         );
     };
     if !scout::is_imdb(&req.imdb) {
@@ -338,16 +366,48 @@ where
         (None, None) => None,
         _ => return bad_request("An episode needs both season and episode."),
     };
+    let tags_ok = |tags: &[String]| tags.len() <= 8 && tags.iter().all(|l| l.len() <= 35);
+    if !tags_ok(&req.audio) || !tags_ok(&req.subtitle_languages) || !tags_ok(&req.video_codecs) {
+        return bad_request("audio, subtitleLanguages and videoCodecs are at most 8 short tags each.");
+    }
     let id = scout::title_id(&req.imdb, episode);
-    match session::create(state, browser, &id, req.filename.as_deref(), req.scout.as_deref()).await {
+    let want = session::Want {
+        id: &id,
+        filename: req.filename.as_deref(),
+        scout: req.scout.as_deref(),
+        audio: &req.audio,
+        audio_track: req.audio_track,
+        subtitles: req.subtitles.as_deref(),
+        subtitle_languages: &req.subtitle_languages,
+        video_codecs: &req.video_codecs,
+    };
+    match session::create(state, browser, &want).await {
         Ok(s) => httputil::json(
             StatusCode::CREATED,
             &serde_json::json!({
+                "video": {
+                    "codec": match s.transcoded || s.info.video == probe::VideoCodec::H264 {
+                        true => "h264",
+                        false => "hevc",
+                    },
+                    "transcoded": s.transcoded,
+                },
                 "sid": s.sid,
                 "playlist": format!("/remux/s/{}/{}/master.m3u8", s.sid, s.sig),
                 "release": {"label": s.release.label, "filename": s.release.filename, "size": s.release.size},
                 "duration": s.info.duration,
                 "expiresAt": s.exp,
+                "audioTrack": s.audio,
+                "audioTracks": s.info.audio.iter().map(|a| serde_json::json!({
+                    "language": a.language,
+                    "name": a.name,
+                    "channels": a.channels,
+                    "commentary": a.commentary,
+                })).collect::<Vec<_>>(),
+                "subtitles": s.subs.iter().flat_map(|x| &x.langs).map(|l| serde_json::json!({
+                    "language": l,
+                    "name": lang::name(l),
+                })).collect::<Vec<_>>(),
             }),
             &[],
         ),
@@ -398,9 +458,21 @@ async fn session_route(
                     httputil::text("application/vnd.apple.mpegurl", text)
                 }
                 "init.mp4" => s.serve_init(state, head).await,
-                _ => match session::seg_index(f).filter(|n| *n < s.segments.len()) {
-                    Some(n) => s.serve_segment(state, n, head).await,
-                    None => httputil::not_found(),
+                _ => match session::sub_file(f)
+                    .filter(|(n, _)| s.subs.as_ref().is_some_and(|x| *n < x.langs.len()))
+                {
+                    Some((n, false)) => {
+                        s.touch();
+                        httputil::text("application/vnd.apple.mpegurl", s.subtitle_playlist(n))
+                    }
+                    Some((n, true)) => {
+                        s.touch();
+                        httputil::text("text/vtt; charset=utf-8", s.subtitle(state, n).await)
+                    }
+                    None => match session::seg_index(f).filter(|n| *n < s.segments.len()) {
+                        Some(n) => s.serve_segment(state, n, head).await,
+                        None => httputil::not_found(),
+                    },
                 },
             };
             if head {
@@ -418,6 +490,9 @@ async fn run(cfg: Config) -> std::io::Result<()> {
     state::sweep_scratch(&state.cfg.scratch_dir);
     state.scratch_ok.store(state::check_scratch(&state.cfg.scratch_dir), Relaxed);
     state.ffmpeg_ok.store(state::check_ffmpeg(&state.cfg.ffmpeg).await, Relaxed);
+    let transcode = state.cfg.max_transcodes > 0
+        && state::check_transcode(&state.cfg.ffmpeg, &state.cfg.vaapi_device).await;
+    state.transcode_ok.store(transcode, Relaxed);
     if let Some((reason, detail)) = health_verdict(&state) {
         eprintln!("health: degraded ({reason}) — {detail}");
     }
@@ -430,7 +505,7 @@ async fn run(cfg: Config) -> std::io::Result<()> {
     eprintln!(
         "den-remux {} listening on :{} — metrics={} log_requests={} scout_origins={} scout_key={} scout_install={} \
          browser_keys={} url_key={} \
-         max_sessions={} idle={}s scratch={} scratch_max={} ffmpeg={}",
+         max_sessions={} idle={}s scratch={} scratch_max={} ffmpeg={} transcode={}",
         env!("CARGO_PKG_VERSION"),
         state.cfg.port,
         on(state.cfg.metrics_token.is_some()),
@@ -445,6 +520,7 @@ async fn run(cfg: Config) -> std::io::Result<()> {
         state.cfg.scratch_dir.display(),
         state.cfg.scratch_max_bytes,
         if state.ffmpeg_ok.load(Relaxed) { "ok" } else { "missing" },
+        if transcode { format!("vaapi(max {})", state.cfg.max_transcodes) } else { "off".to_string() },
     );
 
     let drained = serve_until(listener, state.clone(), shutdown, DRAIN_GRACE, HEADER_READ_TIMEOUT).await;

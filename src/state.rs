@@ -33,12 +33,25 @@ pub struct AppState {
     pub jobs_started: AtomicU64,
     pub ffmpeg_ok: AtomicBool,
     pub scratch_ok: AtomicBool,
+    /// Can this ffmpeg transcode on the GPU (`check_transcode`), with `MAX_TRANSCODES` above 0?
+    pub transcode_ok: AtomicBool,
+    /// Sessions transcoding now, against `MAX_TRANSCODES`.
+    pub transcodes: Arc<AtomicUsize>,
 }
 
 /// A held slot against `MAX_SESSIONS`; released when dropped.
 pub struct Slot<'a>(&'a AtomicUsize);
 
 impl Drop for Slot<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Relaxed);
+    }
+}
+
+/// A held transcode against `MAX_TRANSCODES`, owned by its session; released when the session is dropped.
+pub struct TranscodeSlot(Arc<AtomicUsize>);
+
+impl Drop for TranscodeSlot {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Relaxed);
     }
@@ -68,7 +81,20 @@ impl AppState {
             jobs_started: AtomicU64::new(0),
             ffmpeg_ok: AtomicBool::new(false),
             scratch_ok: AtomicBool::new(false),
+            transcode_ok: AtomicBool::new(false),
+            transcodes: Arc::new(AtomicUsize::new(0)),
         })
+    }
+
+    /// A transcode for a new session, or `None` when transcoding is off or `MAX_TRANSCODES` are running.
+    /// The GPU is shared with the camera stack and Incus gives no GPU priority, so this cap is the only one.
+    pub fn reserve_transcode(&self) -> Option<TranscodeSlot> {
+        if !self.transcode_ok.load(Relaxed) {
+            return None;
+        }
+        let max = self.cfg.max_transcodes;
+        self.transcodes.fetch_update(Relaxed, Relaxed, |n| (n < max).then_some(n + 1)).ok()?;
+        Some(TranscodeSlot(self.transcodes.clone()))
     }
 
     pub fn sessions(&self) -> MutexGuard<'_, HashMap<String, Arc<Session>>> {
@@ -147,18 +173,43 @@ pub fn check_scratch(dir: &Path) -> bool {
 /// Does this ffmpeg have what a session needs? The image carries a minimal build, and a component
 /// dropped from its configure line would otherwise surface as every session failing.
 pub async fn check_ffmpeg(ffmpeg: &str) -> bool {
-    let checks: [(&[&str], &str); 5] = [
-        (&["-hide_banner", "-h", "demuxer=matroska"], "Demuxer matroska"),
-        (&["-hide_banner", "-h", "demuxer=mov"], "Demuxer mov"),
-        (&["-hide_banner", "-h", "muxer=hls"], "Muxer hls"),
-        (&["-hide_banner", "-h", "encoder=aac"], "Encoder aac"),
-        (&["-hide_banner", "-protocols"], "https"),
-    ];
+    reports_all(
+        ffmpeg,
+        &[
+            (&["-hide_banner", "-h", "demuxer=matroska"], "Demuxer matroska"),
+            (&["-hide_banner", "-h", "demuxer=mov"], "Demuxer mov"),
+            (&["-hide_banner", "-h", "muxer=hls"], "Muxer hls"),
+            (&["-hide_banner", "-h", "encoder=aac"], "Encoder aac"),
+            (&["-hide_banner", "-protocols"], "https"),
+        ],
+    )
+    .await
+}
+
+/// Can sessions transcode: the GPU's device node is here, and this ffmpeg has the VAAPI encoder and
+/// filters? Off is normal — a host without the device, or a local ffmpeg.
+pub async fn check_transcode(ffmpeg: &str, device: &Path) -> bool {
+    if !device.exists() {
+        return false;
+    }
+    reports_all(
+        ffmpeg,
+        &[
+            (&["-hide_banner", "-h", "encoder=h264_vaapi"], "Encoder h264_vaapi"),
+            (&["-hide_banner", "-h", "filter=scale_vaapi"], "Filter scale_vaapi"),
+            (&["-hide_banner", "-h", "filter=tonemap_vaapi"], "Filter tonemap_vaapi"),
+        ],
+    )
+    .await
+}
+
+/// Does `ffmpeg <args>` print `want`, for every pair? Says the first that does not.
+async fn reports_all(ffmpeg: &str, checks: &[(&[&str], &str)]) -> bool {
     for (args, want) in checks {
         let out = tokio::time::timeout(
             Duration::from_secs(10),
             tokio::process::Command::new(ffmpeg)
-                .args(args)
+                .args(*args)
                 .stdin(std::process::Stdio::null())
                 .kill_on_drop(true)
                 .output(),

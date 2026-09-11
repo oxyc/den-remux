@@ -17,15 +17,19 @@ This is the MVP ("phase 2") of oxyc/den#11: movies and episodes, cached releases
 
 ```
 POST   /remux/login                     {key} → 204 + Set-Cookie; 401 bad_key
-POST   /remux/session                   {imdb, season?, episode?, filename?, scout?} (cookie) → 201
-                                        {sid, playlist, release:{label,filename,size}, duration, expiresAt}
-                                        401 not_logged_in · 400 bad_request/bad_scout
+POST   /remux/session                   {imdb, season?, episode?, filename?, scout?, audio?, audioTrack?,
+                                         subtitles?, subtitleLanguages?, videoCodecs?} (cookie) → 201
+                                        {sid, playlist, release:{label,filename,size}, duration, expiresAt,
+                                         video:{codec,transcoded}, audioTrack, audioTracks, subtitles}
+                                        401 not_logged_in · 400 bad_request/bad_scout/bad_subtitles/bad_audio_track
                                         404 no_release/no_playable_release · 429 too_many_sessions
-                                        502 scout_unavailable · 503 scout_unconfigured
+                                        502 scout_unavailable · 503 scout_unconfigured/transcode_unavailable
 GET    /remux/s/<sid>/<sig>/master.m3u8 one variant: CODECS "<avc1…|hvc1…>,mp4a.40.2", BANDWIDTH from size/duration
 GET    /remux/s/<sid>/<sig>/media.m3u8  VOD, #EXT-X-MAP init.mp4, segments on real keyframes, #EXT-X-ENDLIST
 GET    /remux/s/<sid>/<sig>/init.mp4
 GET    /remux/s/<sid>/<sig>/seg<N>.m4s  200 when made (waits up to 20 s), else 503 + Retry-After: 2
+GET    /remux/s/<sid>/<sig>/sub<N>.m3u8 a subtitle rendition: one WebVTT segment spanning the film
+GET    /remux/s/<sid>/<sig>/sub<N>.vtt  text/vtt; an empty document when nothing in that language was found
 DELETE /remux/s/<sid>/<sig>             204; the session's URLs answer 410 from then on
 GET    /health                          200 {status} — ok, or degraded with a reason (Maintenance)
 GET    /metrics                         Prometheus text (bearer METRICS_TOKEN; 404 without it)
@@ -34,6 +38,23 @@ anything else                           404 {"error":"not_found"}
 
 `scout` is the scout install URL the web app reads from the library's `set:plugins` group
 (`http://<scout>:8080/<config>`); without it the server's `SCOUT_INSTALL_URL` is used. `filename` prefers that release when it is playable here.
+
+- **Audio.** `audio` is the player's languages, most wanted first, in any spelling a release or a browser
+  uses (`en-US`, `eng`, `fin`). The first language a track is in wins — the default-flagged track among
+  several — and a commentary never does (Matroska's FlagCommentary, or "commentary" in the track title).
+  No match: the first default track that is not a commentary. `audioTrack` picks one by index from an
+  earlier session's `audioTracks` (send that session's `filename` with it). The track is re-encoded to AAC
+  stereo as before; one per session, so switching language is a new session.
+- **Subtitles.** `subtitles` is den-subtitles' install URL from the library, on `SUBTITLE_ORIGINS`;
+  `subtitleLanguages` (up to 4) become WebVTT renditions in the master playlist — what AirPlay and Cast
+  receivers show, which a page's own `<track>` never reaches. Nothing is fetched until a player opens one:
+  then den-remux asks den-subtitles for the title with the release's OpenSubtitles hash, size and
+  filename (the Apple TV's hints, so an exact-encode match ranks first) and serves the first subtitle in
+  that language. A subtitle URL off `SUBTITLE_ORIGINS` is skipped.
+- **Video codecs.** `videoCodecs` is what the player takes (`["h264"]` for Firefox or an old
+  Chromecast); empty is H.264 and HEVC. Without HEVC, H.264 releases are tried first, and an HEVC-only
+  title is transcoded to H.264 on the GPU (Hardware transcode, below) — or refused with
+  `transcode_unavailable` while transcoding is off or in use.
 
 `/remux/s/…` responses carry `Access-Control-Allow-Origin: *`, allow `Range` and expose
 `Content-Range`/`Content-Length` — a Cast receiver's page is on Google's origin. Playlists are
@@ -120,9 +141,11 @@ hold every source frame exactly once over the full duration — for H.264 and HE
 
 Low resource use comes first, and the design follows from it:
 
-- **Image: 13.4 MB** — a static musl `den-remux` and a static ffmpeg configured with `--disable-everything`
-  plus only what a session uses, on `distroless/static`. den-reel's image on the box is 693 MB (Debian
-  ffmpeg, yt-dlp, deno, MP4Box).
+- **Image** — a static musl `den-remux` and an ffmpeg configured with `--disable-everything` plus only what
+  a session uses, on Alpine. Until the GPU transcode it was 13.4 MB on `distroless/static`; libva has to
+  load Intel's driver at run time, which a fully static binary cannot, and that driver is most of the
+  image now. Disk only: nothing loads it until a transcode starts. den-reel's image on the box is 693 MB
+  (Debian ffmpeg, yt-dlp, deno, MP4Box).
 - **Idle is zero work.** No timers, sweeps or polling without sessions: scratch is swept at start and a
   session's directory is removed when it ends. Each session has one task, which ticks every 500 ms only
   while its ffmpeg is actually running and otherwise sleeps until a request or its idle deadline.
@@ -152,6 +175,7 @@ Every variable is unprefixed; `.env.example` lists them with their defaults.
 | `SCOUT_ORIGINS` | — | Origins (`scheme://host[:port]`, comma-separated) a request's `scout` URL may point at. The SSRF guard; empty refuses every `scout` URL. |
 | `REMUX_SCOUT_KEY` | — | **Secret.** Sent to scout (and only to scout's origin) as `X-Den-Remux-Key`; a scope=availability config lists and plays only with it (a full install URL doesn't need it). `/health` says `scout_key_missing` when origins are set without it. |
 | `SCOUT_INSTALL_URL` | — | Fallback when a request names no scout: an install of this service's own, sealed config included (`http://<scout>:8080/<config>`). **Secret**; never logged. |
+| `SUBTITLE_ORIGINS` | — | Origins a request's den-subtitles install, and the subtitle URLs it answers with, may be on. Empty turns subtitles off. |
 | `BROWSER_KEY_HASHES` | — | Comma-separated hex SHA-256 of each browser's key. Removing one logs that browser out. |
 | `REMUX_URL_KEY` | random | **Secret.** Signs cookies and session URLs. **Set it**: unset, every restart logs the browsers out (`/health` says `url_key_ephemeral`). Rotating it kills every cookie and session URL. |
 | `MAX_SESSIONS` | `2` | Sessions at once; the next gets 429 `too_many_sessions`. |
@@ -159,6 +183,8 @@ Every variable is unprefixed; `.env.example` lists them with their defaults.
 | `SCRATCH_DIR` | `/cache` | Where GOP files go. den-remux's alone: every `s-*` directory in it is deleted at start. |
 | `SCRATCH_MAX_BYTES` | `1073741824` | Cap across sessions; past it a job pauses once the requested segment is done (min 64 MiB). |
 | `FFMPEG_PATH` | `ffmpeg` | The image sets `/usr/local/bin/ffmpeg`. (There is no `FFPROBE_PATH`: probing is done in-process.) |
+| `MAX_TRANSCODES` | `1` | Sessions transcoding on the GPU at once; `0` turns transcoding off. Copies do not count. |
+| `VAAPI_DEVICE` | `/dev/dri/renderD128` | The GPU's render node. Transcoding is on only when it exists and ffmpeg has the VAAPI encoder and filters (the startup line says `transcode=vaapi(max N)` or `off`). |
 | `METRICS_TOKEN` | — | Turns on `/metrics` behind `Authorization: Bearer <token>`; otherwise it is a 404. |
 | `LOG_REQUESTS` | off | `1` writes `<METHOD> <path> <status> <ms>ms[ rid=<X-Request-Id>]` per response. |
 | `PORT` | `8095` | |
@@ -173,7 +199,7 @@ A browser key and its hash: `key=$(head -c 24 /dev/urandom | base64 | tr '+/' '-
 `scout_key_missing`, `no_browser_keys`, `url_key_ephemeral`.
 
 `/metrics` (gauges and counters prefixed `remux_`): sessions and the cap, ffmpeg processes alive, scratch
-bytes and the cap, sessions and ffmpeg runs started. The log is state changes: the startup line, one line
+bytes and the cap, transcodes and their cap (0 when off), sessions and ffmpeg runs started. The log is state changes: the startup line, one line
 per session start and end (with the reason: `idle`, `expired`, `deleted`, `replaced`, `shutdown`), a
 failed ffmpeg run's last stderr line (scrubbed), and rate-limited upstream failures.
 
@@ -183,30 +209,35 @@ dependabot cannot bump it, so bump both lines by hand.
 ## Limits (MVP)
 
 - **Cached releases only** (an uncached one would start a debrid download).
-- **H.264 and HEVC only**, copied. AV1, VP9, MPEG-4 Part 2/XviD and VC-1 would need a video re-encode and are
-  skipped. Files without a keyframe index (Matroska with no Cues) are skipped.
-- **Audio is AAC stereo** from the first audio track; no track choice yet.
-- **No subtitles.** den-subtitles' VTT as an HLS subtitle track is the next step; PGS never will be.
-- **Dolby Vision profile 5** has no HDR10/SDR base layer: Safari shows it, Chrome cannot. It is not
-  excluded yet.
+- **H.264 and HEVC sources only.** AV1, VP9, MPEG-4 Part 2/XviD and VC-1 are skipped. Files without a
+  keyframe index (Matroska with no Cues) are skipped.
+- **Audio is AAC stereo**, one track per session.
+- **Text subtitles only**, from den-subtitles; the release's own tracks (PGS, ASS) are not carried.
+- **Dolby Vision profile 5** has no HDR10/SDR base layer: Safari shows it, Chrome cannot, and a transcode
+  gets its colours wrong. It is not excluded yet.
 - **Bandwidth**: at home this is fine. Away from home every byte crosses the home **upload** link, so a
-  remote session is bounded by it — a 4K remux will not fit; reducing that needs a re-encode.
+  remote session is bounded by it — a 4K remux will not fit. A transcode is 8 Mbit/s at most 1080p, but
+  nothing asks for one on bandwidth grounds yet.
 - **One listener.** The public `/remux/s/` listener for Cast/AirPlay (#11 §C) is phase 3.
 
-### Hardware transcode (later)
+### Hardware transcode
 
-The box's UHD 630 can decode and encode H.264 and HEVC (VAAPI/QSV), which would cover old Chromecasts
-(HEVC → H.264) and remote bitrate. The seam is `job::Video`: a transcode variant adds its encoder flags plus
-`-force_key_frames` at the playlist's segment starts, and the GOP joining is unchanged.
+For a player without HEVC (`videoCodecs` without it), an HEVC release is decoded, scaled and — HDR10 or
+HLG — tone-mapped on the box's UHD 630, and encoded to H.264 High 4.1 there (VAAPI, the `h264_vaapi`
+encoder), fitted inside 1920 × 1080 at 8 Mbit/s (12 max). `-force_key_frames source` puts an output
+keyframe on every source keyframe, so the GOPs, the playlist and the joining are exactly a copy's; the
+audio and subtitles are unchanged.
 
-- **Image**: `--enable-vaapi`, libva (and the iHD driver), the `h264_vaapi`/`hevc_vaapi` encoders and the
-  `scale_vaapi` filter in the configure line. Not built now: tens of MB of driver in an image whose point is
-  being small.
-- **Deploy**: `/dev/dri/renderD128` passed into the den container and on to this one
-  (`AddDevice=/dev/dri/renderD128`), with the `render` group.
+- **Image**: `--enable-vaapi`, the h264/hevc VAAPI hwaccels, the `h264_vaapi` encoder and the
+  `scale_vaapi`/`tonemap_vaapi` filters, with libva and Intel's `iHD` driver (amd64 only).
+- **Deploy**: `/dev/dri/renderD128` is passed into the den container, and `provision-podman.sh` passes it
+  on to this one with the node's group (a drop-in written only where the device exists).
 - **A cap of its own.** The iGPU is shared with the camera stack (Frigate/Scrypted), and Incus has no GPU
-  priority — `/dev/dri` is first come, first served. So transcodes must be capped inside den-remux:
-  `MAX_TRANSCODES` (default 1), separate from `MAX_SESSIONS`, with copy-only sessions not counting against it.
+  priority — `/dev/dri` is first come, first served. So transcodes are capped inside den-remux:
+  `MAX_TRANSCODES` (default 1), separate from `MAX_SESSIONS`; copies do not count against it, and an ended
+  session gives its transcode back at once.
+- **Tested** by the flags (`job.rs`) and the slot (`tests.rs`) here, and on the box's GPU by hand: CI has no
+  GPU.
 
 ## Run
 
@@ -228,11 +259,13 @@ The cookie is `Secure`: a browser keeps it over HTTPS (tailscale serve) or on `l
 signing, cookies, redaction, release picking, the scoped-scout validation, and a session created against a
 fake scout that refuses a scoped config without the key and a file host that fails if it ever sees the
 key. The `#[ignore]`d tests drive the whole path with real ffmpeg: three end-to-end remuxes (H.264 and HEVC
-Matroska, MP4), the session cap, the idle kill (ffmpeg killed and reaped), and `DELETE` → 410. Run them
-with ffmpeg and ffprobe on PATH:
+Matroska, MP4), the session cap, the idle kill (ffmpeg killed and reaped), and `DELETE` → 410. They
+run in the Dockerfile's `test` stage, against the ffmpeg the image ships — another version seeks
+differently (ffmpeg 8.0 lands a restarted H.264 Matroska run one keyframe early), and the alignment
+depends on exactly how it seeks. CI's `e2e` job runs the same:
 
 ```bash
-cargo test -- --include-ignored
+docker build --target test .
 ```
 
 ## Deploy

@@ -1,8 +1,8 @@
 //! Runtime configuration, all from the environment.
 //!
-//! Env: PORT, SCOUT_ORIGINS, REMUX_SCOUT_KEY, SCOUT_INSTALL_URL, BROWSER_KEY_HASHES, REMUX_URL_KEY,
-//!      MAX_SESSIONS, SESSION_IDLE_SECS, SCRATCH_DIR, SCRATCH_MAX_BYTES, FFMPEG_PATH, METRICS_TOKEN,
-//!      LOG_REQUESTS.
+//! Env: PORT, SCOUT_ORIGINS, REMUX_SCOUT_KEY, SCOUT_INSTALL_URL, SUBTITLE_ORIGINS, BROWSER_KEY_HASHES, REMUX_URL_KEY,
+//!      MAX_SESSIONS, SESSION_IDLE_SECS, SCRATCH_DIR, SCRATCH_MAX_BYTES, FFMPEG_PATH, MAX_TRANSCODES,
+//!      VAAPI_DEVICE, METRICS_TOKEN, LOG_REQUESTS.
 
 use std::env;
 use std::path::PathBuf;
@@ -20,6 +20,9 @@ pub struct Config {
     /// service's own, sealed config included, with no trailing slash. A secret: it lists and plays
     /// anything, so it is never logged and never leaves the process.
     pub scout_install_url: Option<String>,
+    /// `SUBTITLE_ORIGINS` — the only origins a request's den-subtitles install, and the subtitle URLs it
+    /// answers with, may be on. Empty turns subtitles off.
+    pub subtitle_origins: Vec<String>,
     /// `BROWSER_KEY_HASHES` — SHA-256 of each browser's key. Only hashes live in the env file, so the
     /// file on the box cannot be replayed as a key.
     pub browser_key_hashes: Vec<[u8; 32]>,
@@ -34,6 +37,11 @@ pub struct Config {
     pub scratch_dir: PathBuf,
     pub scratch_max_bytes: u64,
     pub ffmpeg: String,
+    /// `MAX_TRANSCODES` — sessions transcoding on the GPU at once (default 1; 0 turns transcoding off).
+    /// Separate from `MAX_SESSIONS`: a copy costs no GPU.
+    pub max_transcodes: usize,
+    /// `VAAPI_DEVICE` — the GPU's render node.
+    pub vaapi_device: PathBuf,
     /// `METRICS_TOKEN` — the bearer token `/metrics` requires. `None` turns the endpoint off (404).
     pub metrics_token: Option<String>,
     /// `LOG_REQUESTS` — one stderr line per response when set (anything but empty or `0`).
@@ -111,6 +119,7 @@ impl Config {
             scout_origins: parse_origins(&env_opt("SCOUT_ORIGINS").unwrap_or_default()),
             scout_key: env_opt("REMUX_SCOUT_KEY"),
             scout_install_url: env_opt("SCOUT_INSTALL_URL").map(|u| u.trim_end_matches('/').to_string()),
+            subtitle_origins: parse_origins(&env_opt("SUBTITLE_ORIGINS").unwrap_or_default()),
             browser_key_hashes: parse_key_hashes(&env_opt("BROWSER_KEY_HASHES").unwrap_or_default()),
             url_key,
             url_key_ephemeral,
@@ -129,6 +138,10 @@ impl Config {
                 .filter(|b| *b >= MIN_SCRATCH_BYTES)
                 .unwrap_or(1024 * 1024 * 1024),
             ffmpeg: env_opt("FFMPEG_PATH").unwrap_or_else(|| "ffmpeg".to_string()),
+            max_transcodes: env_opt("MAX_TRANSCODES").and_then(|v| v.parse().ok()).unwrap_or(1),
+            vaapi_device: env_opt("VAAPI_DEVICE")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("/dev/dri/renderD128")),
             metrics_token: env_opt("METRICS_TOKEN"),
             log_requests: log_requests_on(env::var("LOG_REQUESTS").ok().as_deref()),
         }

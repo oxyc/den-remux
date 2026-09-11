@@ -24,9 +24,14 @@ const CODEC_ID: u32 = 0x86;
 const CODEC_PRIVATE: u32 = 0x63A2;
 const LANGUAGE: u32 = 0x22B59C;
 const LANGUAGE_BCP47: u32 = 0x22B59D;
+const NAME: u32 = 0x536E;
+const FLAG_DEFAULT: u32 = 0x88;
+const FLAG_COMMENTARY: u32 = 0x55AF;
 const VIDEO: u32 = 0xE0;
 const PIXEL_WIDTH: u32 = 0xB0;
 const PIXEL_HEIGHT: u32 = 0xBA;
+const COLOUR: u32 = 0x55B0;
+const TRANSFER_CHARACTERISTICS: u32 = 0x55BA;
 const AUDIO: u32 = 0xE1;
 const CHANNELS: u32 = 0x9F;
 const CUES: u32 = 0x1C53BB6B;
@@ -104,8 +109,12 @@ struct Track {
     codec_id: String,
     private: Vec<u8>,
     language: Option<String>,
+    name: Option<String>,
+    default: bool,
+    commentary: bool,
     width: u32,
     height: u32,
+    transfer: u64,
     channels: u32,
 }
 
@@ -113,7 +122,8 @@ fn parse_tracks(b: &[u8]) -> Vec<Track> {
     children(b)
         .filter(|(id, _)| *id == TRACK_ENTRY)
         .map(|(_, entry)| {
-            let mut t = Track { channels: 1, ..Track::default() };
+            // FlagDefault defaults to on: a track is a default unless its muxer said otherwise.
+            let mut t = Track { channels: 1, default: true, ..Track::default() };
             let mut bcp47 = None;
             for (id, v) in children(entry) {
                 match id {
@@ -123,9 +133,16 @@ fn parse_tracks(b: &[u8]) -> Vec<Track> {
                     CODEC_PRIVATE => t.private = v.to_vec(),
                     LANGUAGE => t.language = Some(string(v)),
                     LANGUAGE_BCP47 => bcp47 = Some(string(v)),
+                    NAME => t.name = Some(string(v)).filter(|n| !n.is_empty()),
+                    FLAG_DEFAULT => t.default = uint(v) != 0,
+                    FLAG_COMMENTARY => t.commentary = uint(v) != 0,
                     VIDEO => {
                         t.width = child(v, PIXEL_WIDTH).map(uint).unwrap_or(0) as u32;
                         t.height = child(v, PIXEL_HEIGHT).map(uint).unwrap_or(0) as u32;
+                        t.transfer = child(v, COLOUR)
+                            .and_then(|c| child(c, TRANSFER_CHARACTERISTICS))
+                            .map(uint)
+                            .unwrap_or(0);
                     }
                     AUDIO => t.channels = child(v, CHANNELS).map(uint).unwrap_or(1) as u32,
                     _ => {}
@@ -277,7 +294,16 @@ pub async fn probe(src: &Source<'_>, head: &[u8]) -> Result<MediaInfo, ProbeErro
     let audio = tracks
         .iter()
         .filter(|t| t.kind == 2)
-        .map(|t| AudioTrack { codec: t.codec_id.clone(), language: t.language.clone(), channels: t.channels })
+        .map(|t| AudioTrack {
+            codec: t.codec_id.clone(),
+            language: t.language.clone(),
+            channels: t.channels,
+            name: t.name.clone(),
+            default: t.default,
+            // FlagCommentary is recent; most releases only say so in the track's title.
+            commentary: t.commentary
+                || t.name.as_deref().is_some_and(|n| n.to_ascii_lowercase().contains("commentary")),
+        })
         .collect();
     Ok(MediaInfo {
         container: "matroska",
@@ -286,6 +312,7 @@ pub async fn probe(src: &Source<'_>, head: &[u8]) -> Result<MediaInfo, ProbeErro
         codecs,
         width: video.width,
         height: video.height,
+        hdr: super::is_hdr_transfer(video.transfer),
         audio,
         keyframes,
     })

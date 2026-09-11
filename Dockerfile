@@ -1,11 +1,13 @@
-# den-remux — a static Rust binary and a static, minimal ffmpeg, on distroless/static.
+# den-remux — a static Rust binary and a minimal ffmpeg, on Alpine.
 #
 # Low resource use is the design goal, and most of it is decided here. Debian's ffmpeg package brings a
 # few hundred MB of codecs, filters and X libraries this service never touches. This ffmpeg is built
 # from source with everything disabled, then only what a session uses switched back on: the Matroska
 # and MP4 demuxers, the hls/mp4 muxers, the audio decoders a release can carry, the native AAC encoder,
-# and HTTP(S). Both binaries are static against musl (and OpenSSL, for ffmpeg), so the runtime image
-# needs no libc and no package manager of its own. Builds for whatever arch buildx asks; the box is amd64.
+# HTTP(S), and the VAAPI pieces of a GPU transcode. VAAPI is why this is Alpine rather than
+# distroless/static: libva loads the GPU's driver at run time, which a fully static binary cannot, so
+# ffmpeg links OpenSSL, zlib and libva dynamically and the runtime carries them plus Intel's driver.
+# Idle it runs nothing either way; the driver is only loaded by a transcode.
 
 # ---- build: Rust -----------------------------------------------------------
 FROM rust:1-alpine3.22 AS build
@@ -20,7 +22,7 @@ RUN touch src/main.rs && cargo build --release --locked   # `strip = true` in th
 
 # ---- build: ffmpeg ---------------------------------------------------------
 FROM alpine:3.22 AS ffmpeg
-RUN apk add --no-cache build-base nasm pkgconf openssl-dev openssl-libs-static zlib-dev zlib-static linux-headers
+RUN apk add --no-cache build-base nasm pkgconf openssl-dev zlib-dev libva-dev linux-headers
 # Checksummed: this source is compiled into the image and parses untrusted media, with nothing else
 # checking it. Dependabot has no ecosystem for it; bump both lines together.
 ARG FFMPEG_VERSION=9.0.1
@@ -33,46 +35,59 @@ WORKDIR /tmp/ffmpeg-${FFMPEG_VERSION}
 #   demuxers   matroska, mov                  — the containers scout's releases come in
 #   muxers     hls (+ mp4, which it drives)   — fMP4 HLS output
 #   decoders   every audio codec a release carries: AC-3/E-AC-3, DTS (core of DTS-HD), TrueHD, FLAC,
-#              Opus, AAC, MP3/MP2, Vorbis, LPCM. And h264/hevc, although video is only ever copied:
-#              stream probing needs them to learn the B-frame reorder delay. Without them ffmpeg
-#              guesses every copied packet's DTS ("Invalid DTS … replacing by guess" for every GOP).
-#   encoder    aac                            — ffmpeg's native AAC, stereo 192k
+#              Opus, AAC, MP3/MP2, Vorbis, LPCM. And h264/hevc: a copy needs them for stream probing
+#              (to learn the B-frame reorder delay — without them ffmpeg guesses every copied packet's
+#              DTS), and a transcode decodes through them with the VAAPI hwaccels below.
+#   encoders   aac (ffmpeg's native, stereo 192k); h264_vaapi for a transcode
 #   parsers    for the codecs the demuxers hand over unparsed
-#   filters    the audio graph -ac 2 builds: resample/downmix and format negotiation, plus the buffer
-#              endpoints every graph has
+#   filters    the audio graph -ac 2 builds (resample/downmix, format negotiation, the buffer
+#              endpoints every graph has); scale_vaapi and tonemap_vaapi for a transcode
 #   protocols  file, and http(s) over tcp/tls (OpenSSL); --enable-version3 is what OpenSSL 3 requires
-# A hardware transcode later would add --enable-vaapi, libva, and the h264_vaapi/hevc_vaapi encoders
-# (README, "Hardware transcode").
+# ffmpeg's own libraries are linked in statically; OpenSSL, zlib and libva are the system's.
 RUN ./configure \
       --prefix=/opt/ffmpeg \
-      --pkg-config-flags=--static --extra-ldflags=-static \
       --enable-static --disable-shared --enable-small \
       --disable-everything --disable-autodetect --disable-doc --disable-debug \
-      --disable-ffplay --disable-ffprobe --disable-avdevice --disable-swscale \
-      --enable-version3 --enable-openssl --enable-zlib \
+      --disable-ffplay --disable-avdevice --disable-swscale \
+      --enable-version3 --enable-openssl --enable-zlib --enable-vaapi \
       --enable-protocol=file,http,https,tcp,tls \
       --enable-demuxer=matroska,mov \
       --enable-muxer=hls,mp4 \
       --enable-decoder=h264,hevc,aac,ac3,eac3,dca,truehd,mlp,flac,opus,mp3,mp2,vorbis,pcm_s16le,pcm_s24le,pcm_s32le,pcm_f32le,pcm_s16be,pcm_s24be \
-      --enable-encoder=aac \
+      --enable-hwaccel=h264_vaapi,hevc_vaapi \
+      --enable-encoder=aac,h264_vaapi \
       --enable-parser=h264,hevc,aac,ac3,dca,mlp,flac,opus,mpegaudio,vorbis \
-      --enable-filter=aresample,aformat,anull,atrim,abuffer,abuffersink,null,trim,buffer,buffersink,format \
+      --enable-filter=aresample,aformat,anull,atrim,abuffer,abuffersink,null,trim,buffer,buffersink,format,scale_vaapi,tonemap_vaapi \
       --enable-swresample \
-    && make -j"$(nproc)" && make install \
-    && mkdir /cache
+    && make -j"$(nproc)" && make install
+
+# ---- test: the #[ignore]d end-to-end tests against this image's own ffmpeg ---------------
+# `docker build --target test .` (CI runs it; the default build skips it). The segment alignment depends
+# on exactly how ffmpeg seeks, so these tests only count with the ffmpeg the image ships. ffprobe is built
+# for them alone; the runtime image does not carry it. No GPU here: the transcode's flags are unit-tested.
+FROM build AS test
+RUN apk add --no-cache libssl3 zlib libva
+COPY --from=ffmpeg /opt/ffmpeg/bin/ffmpeg /opt/ffmpeg/bin/ffprobe /usr/local/bin/
+COPY testdata ./testdata
+RUN cargo test --locked -- --include-ignored
 
 # ---- runtime ---------------------------------------------------------------
-# distroless/static: CA certificates (ffmpeg verifies the debrid's TLS against them), tzdata and a
-# passwd entry for nonroot (65532, the uid every den addon image uses) — and nothing else. No shell.
-FROM gcr.io/distroless/static-debian12:nonroot
+# The libraries ffmpeg links, CA certificates (ffmpeg verifies the debrid's TLS against them), and on
+# amd64 — the box, with its UHD 630 — Intel's VAAPI driver. nonroot is 65532, the uid every den addon
+# image uses.
+FROM alpine:3.22
+RUN apk add --no-cache ca-certificates libssl3 zlib libva \
+    && if [ "$(apk --print-arch)" = x86_64 ]; then apk add --no-cache intel-media-driver; fi \
+    && adduser -D -H -u 65532 -s /sbin/nologin nonroot \
+    && install -d -o 65532 -g 65532 /cache
 COPY --from=ffmpeg /opt/ffmpeg/bin/ffmpeg /usr/local/bin/ffmpeg
 COPY --from=build /src/target/release/den-remux /usr/local/bin/den-remux
-# Created owned by nonroot, so a fresh volume mounted over it is writable too.
-COPY --from=ffmpeg --chown=65532:65532 /cache /cache
 
+# LIBVA_DRIVER_NAME: the UHD 630's driver, named, so libva does not probe for others.
 ENV PORT=8095 \
     SCRATCH_DIR=/cache \
-    FFMPEG_PATH=/usr/local/bin/ffmpeg
+    FFMPEG_PATH=/usr/local/bin/ffmpeg \
+    LIBVA_DRIVER_NAME=iHD
 VOLUME ["/cache"]
 EXPOSE 8095
 

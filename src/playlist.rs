@@ -52,14 +52,38 @@ pub fn media(segs: &[Segment]) -> String {
     out
 }
 
-/// The master playlist: one variant, the copied video plus AAC-LC stereo.
-pub fn master(video_codecs: &str, bandwidth: u64, average: u64, resolution: Option<(u32, u32)>) -> String {
+/// The master playlist: one variant, the copied video plus AAC-LC stereo, and a WebVTT rendition per
+/// `(language, name)` in `subs`.
+pub fn master(
+    video_codecs: &str,
+    bandwidth: u64,
+    average: u64,
+    resolution: Option<(u32, u32)>,
+    subs: &[(String, String)],
+) -> String {
     let res = resolution.filter(|(w, h)| *w > 0 && *h > 0).map(|(w, h)| format!(",RESOLUTION={w}x{h}"));
-    format!(
-        "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-INDEPENDENT-SEGMENTS\n\
-         #EXT-X-STREAM-INF:BANDWIDTH={bandwidth},AVERAGE-BANDWIDTH={average},CODECS=\"{video_codecs},mp4a.40.2\"{}\n\
+    let mut out = String::from("#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-INDEPENDENT-SEGMENTS\n");
+    for (i, (lang, name)) in subs.iter().enumerate() {
+        out.push_str(&format!(
+            "#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"subs\",NAME=\"{name}\",LANGUAGE=\"{lang}\",\
+             DEFAULT=NO,AUTOSELECT=YES,FORCED=NO,URI=\"sub{i}.m3u8\"\n"
+        ));
+    }
+    out.push_str(&format!(
+        "#EXT-X-STREAM-INF:BANDWIDTH={bandwidth},AVERAGE-BANDWIDTH={average},CODECS=\"{video_codecs},mp4a.40.2\"{}{}\n\
          media.m3u8\n",
-        res.unwrap_or_default()
+        res.unwrap_or_default(),
+        if subs.is_empty() { "" } else { ",SUBTITLES=\"subs\"" }
+    ));
+    out
+}
+
+/// A subtitle rendition's playlist: one WebVTT segment spanning the film.
+pub fn subtitle_media(duration: f64, n: usize) -> String {
+    format!(
+        "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:{}\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PLAYLIST-TYPE:VOD\n\
+         #EXTINF:{duration:.6},\nsub{n}.vtt\n#EXT-X-ENDLIST\n",
+        duration.ceil().max(1.0) as u64
     )
 }
 
@@ -134,11 +158,27 @@ mod tests {
         let (peak, avg) = bandwidth(Some(3_750_000), 30.0);
         assert_eq!(avg, 1_000_000);
         assert!(peak > avg);
-        let m = master("hvc1.1.6.L93.B0", peak, avg, Some((320, 180)));
+        let m = master("hvc1.1.6.L93.B0", peak, avg, Some((320, 180)), &[]);
         assert!(m.contains("CODECS=\"hvc1.1.6.L93.B0,mp4a.40.2\""), "{m}");
         assert!(m.contains("RESOLUTION=320x180"));
         assert!(m.contains(&format!("BANDWIDTH={peak},AVERAGE-BANDWIDTH={avg}")));
         assert!(m.ends_with("media.m3u8\n"));
-        assert!(!master("avc1.64001e", 1, 1, None).contains("RESOLUTION"));
+        assert!(!m.contains("SUBTITLES"));
+        assert!(!master("avc1.64001e", 1, 1, None, &[]).contains("RESOLUTION"));
+    }
+
+    #[test]
+    fn subtitles_are_renditions_of_one_group() {
+        let subs = [("en".to_string(), "English".to_string()), ("fi".to_string(), "Finnish".to_string())];
+        let m = master("avc1.640028", 1, 1, None, &subs);
+        assert!(m.contains("TYPE=SUBTITLES,GROUP-ID=\"subs\",NAME=\"Finnish\",LANGUAGE=\"fi\""), "{m}");
+        assert!(m.contains("URI=\"sub1.m3u8\""));
+        assert!(m.contains(",SUBTITLES=\"subs\"\nmedia.m3u8"), "{m}");
+        let s = subtitle_media(30.021, 1);
+        assert!(
+            s.contains("#EXT-X-TARGETDURATION:31\n") && s.contains("#EXTINF:30.021000,\nsub1.vtt\n"),
+            "{s}"
+        );
+        assert!(s.ends_with("#EXT-X-ENDLIST\n"));
     }
 }

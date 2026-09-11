@@ -63,9 +63,17 @@ pub fn title_id(imdb: &str, episode: Option<(u32, u32)>) -> String {
     }
 }
 
+/// The Stremio type a title id names.
+pub fn kind(id: &str) -> &'static str {
+    if id.contains(':') {
+        "series"
+    } else {
+        "movie"
+    }
+}
+
 pub fn stream_list_url(install: &str, id: &str) -> String {
-    let kind = if id.contains(':') { "series" } else { "movie" };
-    format!("{install}/stream/{kind}/{id}.json")
+    format!("{install}/stream/{}/{id}.json", kind(id))
 }
 
 pub fn parse(body: &[u8]) -> Result<Vec<Stream>, String> {
@@ -101,6 +109,16 @@ pub fn candidates(streams: &[Stream], filename: Option<&str>) -> Vec<Stream> {
         }
     }
     out
+}
+
+/// For a player that cannot take HEVC: H.264 releases first, then those scout named no codec for, then
+/// HEVC, which needs the GPU. Stable, so scout's order holds within each.
+pub fn h264_first(c: &mut [Stream]) {
+    c.sort_by_key(|s| match s.attributes.codec.as_deref().map(str::to_ascii_lowercase).as_deref() {
+        Some("h264") => 0,
+        None => 1,
+        _ => 2,
+    });
 }
 
 /// How much of the file to read when resolving it. Enough for the Matroska SeekHead, Info and Tracks,
@@ -278,6 +296,14 @@ mod tests {
             ],
             "scout's order, minus uncached, cache-unknown, AV1, XviD, AVI and 3D"
         );
+    }
+
+    #[test]
+    fn a_player_without_hevc_gets_h264_releases_first() {
+        let mut c = candidates(&fixture(), None);
+        h264_first(&mut c);
+        assert_eq!(c[0].filename(), "Film.2019.1080p.WEB-DL.DDP5.1.H.264.mkv");
+        assert_eq!(c.last().unwrap().filename(), "Film.2019.2160p.UHD.BluRay.REMUX.HEVC.TrueHD.7.1.mkv");
     }
 
     #[test]

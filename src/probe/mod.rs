@@ -28,6 +28,12 @@ pub struct AudioTrack {
     pub codec: String,
     pub language: Option<String>,
     pub channels: u32,
+    /// The muxer's title for the track ("Director's Commentary", "English 5.1").
+    pub name: Option<String>,
+    /// Matroska's FlagDefault (which is on unless a muxer turned it off); always on for MP4.
+    pub default: bool,
+    /// Flagged a commentary (Matroska FlagCommentary) or titled as one.
+    pub commentary: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -40,6 +46,8 @@ pub struct MediaInfo {
     pub codecs: Option<String>,
     pub width: u32,
     pub height: u32,
+    /// PQ or HLG transfer (HDR10, HLG): a transcode to SDR H.264 has to tone-map it.
+    pub hdr: bool,
     pub audio: Vec<AudioTrack>,
     /// Keyframe presentation times in seconds, ascending — the timeline ffmpeg reports with
     /// `-copyts -start_at_zero`, which is the one the segments are cut on.
@@ -64,6 +72,11 @@ impl fmt::Display for ProbeError {
             ProbeError::Fetch(why) => write!(f, "read failed: {why}"),
         }
     }
+}
+
+/// Is this H.273 transfer characteristic HDR — PQ (16) or HLG (18)?
+pub fn is_hdr_transfer(t: u64) -> bool {
+    matches!(t, 16 | 18)
 }
 
 /// The largest single structure we will read: a `moov` or `Cues` for a long film is a few MB, and

@@ -1,8 +1,8 @@
 //! Tests that need the fixtures in testdata/ or a whole AppState.
 //!
 //! The probe tests run everywhere. The `#[ignore]`d ones run real ffmpeg against a local origin that
-//! plays scout (a stream list, a 302 play URL, Range-served files) — run them with ffmpeg and ffprobe
-//! on PATH: `cargo test -- --ignored`.
+//! plays scout (a stream list, a 302 play URL, Range-served files). They count only with the ffmpeg the
+//! image ships, since the segment alignment depends on how it seeks: `docker build --target test .`.
 
 use std::convert::Infallible;
 use std::path::{Path, PathBuf};
@@ -69,6 +69,7 @@ async fn hevc_matroska_gives_an_hvc1_codec_string() {
     assert_eq!(info.video, VideoCodec::Hevc);
     assert!(info.codecs.as_deref().is_some_and(|c| c.starts_with("hvc1.1.6.L")), "{:?}", info.codecs);
     assert_eq!(info.audio[0].codec, "A_EAC3");
+    assert!(!info.hdr, "the fixture is SDR");
 }
 
 #[tokio::test]
@@ -161,6 +162,24 @@ async fn origin_handle(
     // The key is for scout alone: the file host — the debrid, here — must never be sent it.
     if path.starts_with("/f/") && req.headers().contains_key("x-den-remux-key") {
         return origin_full(400, "the service key reached the file host");
+    }
+    // den-subtitles, install `subs`: an English subtitle, listed only with the file's hash and size; a
+    // Finnish one on an origin den-remux must refuse.
+    if let Some(extras) = path.strip_prefix("/subs/subtitles/movie/tt0000001/") {
+        if !(extras.contains("videoHash=")
+            && extras.contains("videoSize=")
+            && extras.contains("filename=h264.mkv"))
+        {
+            return origin_full(200, r#"{"subtitles":[]}"#);
+        }
+        let body = serde_json::json!({"subtitles": [
+            {"id": "1", "url": format!("http://{addr}/subs/subtitle/1.srt?lang=eng"), "lang": "eng"},
+            {"id": "2", "url": "http://169.254.169.254/subs/subtitle/2.srt", "lang": "fin"}
+        ]});
+        return origin_full(200, body.to_string());
+    }
+    if path == "/subs/subtitle/1.vtt" {
+        return origin_full(200, "WEBVTT\n\n00:00:01.000 --> 00:00:02.500\nHello\n");
     }
     let listing = path
         .strip_suffix(".json")
@@ -259,6 +278,7 @@ fn state_with(origin: &str, max_sessions: usize, idle: Duration, scout_key: Opti
         scout_origins: vec![origin.to_string()],
         scout_key: scout_key.map(String::from),
         scout_install_url: Some(format!("{origin}/cfg")),
+        subtitle_origins: vec![origin.to_string()],
         browser_key_hashes: vec![crate::auth::sha256(b"phone-key"), crate::auth::sha256(b"laptop-key")],
         url_key: b"integration-test-key".to_vec(),
         url_key_ephemeral: false,
@@ -267,6 +287,8 @@ fn state_with(origin: &str, max_sessions: usize, idle: Duration, scout_key: Opti
         scratch_dir: dir.clone(),
         scratch_max_bytes: 1 << 30,
         ffmpeg: tool("FFMPEG_PATH", "ffmpeg"),
+        max_transcodes: 1,
+        vaapi_device: PathBuf::from("/dev/dri/renderD128"),
         metrics_token: None,
         log_requests: false,
     });
@@ -538,7 +560,15 @@ async fn an_idle_session_is_ended_and_its_ffmpeg_does_not_outlive_it() {
     // Killed AND reaped: not even a zombie holds the pid.
     assert_eq!(unsafe { libc::kill(pid as i32, 0) }, -1, "ffmpeg {pid} outlived its session");
     assert_eq!(call(&state, "GET", &format!("{base}seg1.m4s"), None, "").await.status, StatusCode::GONE);
-    assert!(!state.cfg.scratch_dir.join(format!("s-{sid}")).exists());
+    // The session leaves the map first; its directory goes once ffmpeg is reaped, off the runtime thread.
+    let dir = state.cfg.scratch_dir.join(format!("s-{sid}"));
+    for _ in 0..50 {
+        if !dir.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(!dir.exists(), "the session's scratch outlived it");
 }
 
 /// den-scout's contract for a scope=availability config: it lists and plays only for the service key.
@@ -572,6 +602,105 @@ async fn a_scoped_scout_gets_the_service_key_and_nothing_else_does() {
     let r = call(&keyless, "POST", "/remux/session", Some(&cookie), &scoped(&good)).await;
     assert_eq!(r.status, StatusCode::BAD_GATEWAY, "{}", r.text());
     assert_eq!(r.json()["error"], "scout_unavailable");
+}
+
+/// The fixture carries English then Swedish: a preference picks the track, `audioTrack` overrides it,
+/// and an index past the release's tracks is refused. Creating a session starts no ffmpeg.
+#[tokio::test]
+async fn the_audio_track_follows_the_browsers_languages() {
+    let origin = origin().await;
+    let state = test_state(&origin, 2, Duration::from_secs(600));
+    let cookie = login(&state, "phone-key").await;
+    let create = |extra: &str| format!(r#"{{"imdb":"tt0000001"{extra}}}"#);
+    for (extra, want) in [
+        ("", 0),
+        (r#","audio":["sv-SE","en"]"#, 1),
+        (r#","audio":["fi","en"]"#, 0),
+        (r#","audioTrack":1"#, 1),
+    ] {
+        let r = call(&state, "POST", "/remux/session", Some(&cookie), &create(extra)).await;
+        assert_eq!(r.status, StatusCode::CREATED, "{extra}: {}", r.text());
+        let j = r.json();
+        assert_eq!(j["audioTrack"], want, "{extra}");
+        assert_eq!(j["audioTracks"][1]["language"], "swe");
+    }
+    let r = call(&state, "POST", "/remux/session", Some(&cookie), &create(r#","audioTrack":2"#)).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    assert_eq!(r.json()["error"], "bad_audio_track");
+    state.end_all("test").await;
+}
+
+/// Subtitle renditions: named in the master, one WebVTT segment each, fetched from den-subtitles with the
+/// release's hash; a language whose subtitle is on another origin serves an empty document, and an install
+/// off `SUBTITLE_ORIGINS` is refused up front.
+#[tokio::test]
+async fn subtitles_are_webvtt_renditions_from_den_subtitles() {
+    let origin = origin().await;
+    let state = test_state(&origin, 2, Duration::from_secs(600));
+    let cookie = login(&state, "phone-key").await;
+    let body = format!(
+        r#"{{"imdb":"tt0000001","subtitles":"{origin}/subs","subtitleLanguages":["en-GB","fi","en"]}}"#
+    );
+    let r = call(&state, "POST", "/remux/session", Some(&cookie), &body).await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let j = r.json();
+    assert_eq!(
+        j["subtitles"],
+        serde_json::json!([{"language": "en", "name": "English"}, {"language": "fi", "name": "Finnish"}])
+    );
+    let base = j["playlist"].as_str().unwrap().trim_end_matches("master.m3u8").to_string();
+
+    let master = call(&state, "GET", &format!("{base}master.m3u8"), None, "").await.text();
+    assert!(master.contains("LANGUAGE=\"fi\"") && master.contains("SUBTITLES=\"subs\""), "{master}");
+    let pl = call(&state, "GET", &format!("{base}sub0.m3u8"), None, "").await;
+    assert_eq!(pl.status, StatusCode::OK);
+    assert!(pl.text().contains("sub0.vtt"), "{}", pl.text());
+    let en = call(&state, "GET", &format!("{base}sub0.vtt"), None, "").await;
+    assert_eq!(en.headers["content-type"], "text/vtt; charset=utf-8");
+    assert_eq!(en.headers["access-control-allow-origin"], "*");
+    assert!(en.text().contains("X-TIMESTAMP-MAP=MPEGTS:0") && en.text().contains("Hello"), "{}", en.text());
+    let fi = call(&state, "GET", &format!("{base}sub1.vtt"), None, "").await.text();
+    assert_eq!(fi, crate::subs::EMPTY, "the Finnish subtitle is on a refused origin");
+    assert_eq!(call(&state, "GET", &format!("{base}sub2.vtt"), None, "").await.status, StatusCode::NOT_FOUND);
+    state.end_all("test").await;
+
+    let off = r#"{"imdb":"tt0000001","subtitles":"http://169.254.169.254/subs","subtitleLanguages":["en"]}"#;
+    let r = call(&state, "POST", "/remux/session", Some(&cookie), off).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    assert_eq!(r.json()["error"], "bad_subtitles");
+}
+
+/// A player without HEVC gets an HEVC-only title through the GPU alone: refused while transcoding is
+/// off, then one transcode at a time, given back when its session ends. Creating a session starts no
+/// ffmpeg, so no GPU is needed here.
+#[tokio::test]
+async fn hevc_for_a_player_without_it_takes_the_one_transcode() {
+    let origin = origin().await;
+    let state = test_state(&origin, 2, Duration::from_secs(600));
+    let h264_only = r#"{"imdb":"tt0000002","videoCodecs":["h264"]}"#;
+    let phone = login(&state, "phone-key").await;
+    let r = call(&state, "POST", "/remux/session", Some(&phone), h264_only).await;
+    assert_eq!(r.status, StatusCode::SERVICE_UNAVAILABLE, "{}", r.text());
+    assert_eq!(r.json()["error"], "transcode_unavailable");
+
+    state.transcode_ok.store(true, Relaxed);
+    let r = call(&state, "POST", "/remux/session", Some(&phone), h264_only).await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let j = r.json();
+    assert_eq!(j["video"], serde_json::json!({"codec": "h264", "transcoded": true}));
+    let master = call(&state, "GET", j["playlist"].as_str().unwrap(), None, "").await.text();
+    assert!(master.contains("CODECS=\"avc1.640029,mp4a.40.2\""), "{master}");
+
+    let laptop = login(&state, "laptop-key").await;
+    let r = call(&state, "POST", "/remux/session", Some(&laptop), h264_only).await;
+    assert_eq!(r.json()["error"], "transcode_unavailable", "MAX_TRANSCODES is 1");
+    let r = call(&state, "POST", "/remux/session", Some(&laptop), r#"{"imdb":"tt0000002"}"#).await;
+    assert_eq!(r.json()["video"], serde_json::json!({"codec": "hevc", "transcoded": false}), "copied");
+
+    state.end_session(j["sid"].as_str().unwrap(), "test").await;
+    let r = call(&state, "POST", "/remux/session", Some(&laptop), h264_only).await;
+    assert_eq!(r.status, StatusCode::CREATED, "the ended session gave its transcode back: {}", r.text());
+    state.end_all("test").await;
 }
 
 /// An episode lists from scout's series route, through the full install URL a library holds (no key

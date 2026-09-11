@@ -51,8 +51,21 @@ pub fn seg_index(file: &str) -> Option<usize> {
     (!n.is_empty() && n.bytes().all(|c| c.is_ascii_digit()) && n.len() < 8).then(|| n.parse().ok())?
 }
 
+/// `sub<N>.m3u8` or `sub<N>.vtt`: the rendition and whether it is the document.
+pub fn sub_file(file: &str) -> Option<(usize, bool)> {
+    let rest = file.strip_prefix("sub")?;
+    let (n, vtt) = match rest.strip_suffix(".vtt") {
+        Some(n) => (n, true),
+        None => (rest.strip_suffix(".m3u8")?, false),
+    };
+    let n = (n.len() == 1).then(|| n.parse::<usize>().ok())??;
+    (n < crate::subs::MAX_LANGUAGES).then_some((n, vtt))
+}
+
 pub fn is_session_file(file: &str) -> bool {
-    matches!(file, "master.m3u8" | "media.m3u8" | "init.mp4") || seg_index(file).is_some()
+    matches!(file, "master.m3u8" | "media.m3u8" | "init.mp4")
+        || seg_index(file).is_some()
+        || sub_file(file).is_some()
 }
 
 pub struct Release {
@@ -88,6 +101,8 @@ pub struct Inner {
     /// The debrid link ffmpeg reads — scout's play URL, resolved — and whether it has been re-fetched.
     input: String,
     reresolved: bool,
+    /// This session's hold on the GPU; given back when it ends.
+    transcode: Option<crate::state::TranscodeSlot>,
 }
 
 pub struct Session {
@@ -99,6 +114,12 @@ pub struct Session {
     pub dir: PathBuf,
     pub release: Release,
     pub info: MediaInfo,
+    /// The audio track played, counting audio tracks only.
+    pub audio: usize,
+    /// Subtitle renditions, when the browser asked for any.
+    pub subs: Option<crate::subs::Subs>,
+    /// The HEVC is transcoded to H.264 on the GPU, for a player that cannot take it.
+    pub transcoded: bool,
     pub segments: Vec<Segment>,
     pub master: String,
     pub media: String,
@@ -261,6 +282,22 @@ impl Session {
         (kfs.first().copied().unwrap_or(0.0), None)
     }
 
+    /// What a job does with the video: a copy, or this session's transcode.
+    fn video(&self, st: &AppState) -> job::Video {
+        match self.transcoded {
+            true => {
+                let (width, height) = transcode_size(self.info.width, self.info.height);
+                job::Video::Transcode {
+                    device: st.cfg.vaapi_device.to_string_lossy().into_owned(),
+                    width,
+                    height,
+                    tonemap: self.info.hdr,
+                }
+            }
+            false => job::Video::Copy { hevc: self.info.video == VideoCodec::Hevc },
+        }
+    }
+
     /// Make sure a job is heading for segment `n`: leave a running job that will reach it soon, start
     /// one at `n` otherwise. `Err` when the source has failed too often to try again.
     fn ensure_job(&self, i: &mut Inner, n: usize, st: &AppState) -> Result<(), ()> {
@@ -285,8 +322,7 @@ impl Session {
         i.next_job += 1;
         let dir = self.dir.join(format!("j{id}"));
         let input = i.input.clone();
-        let video = job::Video::Copy { hevc: self.info.video == VideoCodec::Hevc };
-        let spec = Spec { input: &input, seek, video, audio: 0, dir: &dir };
+        let spec = Spec { input: &input, seek, video: self.video(st), audio: self.audio, dir: &dir };
         match Job::spawn(&st.cfg.ffmpeg, id, start, &spec) {
             Ok(new) => {
                 if let Some(old) = i.job.replace(new) {
@@ -434,6 +470,111 @@ impl Session {
         }
     }
 
+    /// Rendition `n`'s playlist.
+    pub fn subtitle_playlist(&self, n: usize) -> String {
+        playlist::subtitle_media(self.info.duration, n)
+    }
+
+    /// Rendition `n`'s WebVTT: the first subtitle in its language that den-subtitles offers and serves,
+    /// made once and kept; an empty document when there is none.
+    pub async fn subtitle(&self, st: &AppState, n: usize) -> String {
+        use crate::subs;
+        let Some(sb) = self.subs.as_ref().filter(|s| n < s.langs.len()) else { return subs::EMPTY.into() };
+        let mut cache = sb.cache.lock().await;
+        if let Some(Some(doc)) = cache.docs.get(n) {
+            return doc.clone();
+        }
+        if cache.list.is_none() {
+            cache.list = Some(self.list_subtitles(st, sb).await);
+        }
+        let want = &sb.langs[n];
+        let offered: Vec<String> = cache
+            .list
+            .iter()
+            .flatten()
+            .filter(|e| crate::lang::canonical(&e.lang) == *want)
+            .map(|e| e.url.clone())
+            .take(3)
+            .collect();
+        let mut doc = None;
+        for url in offered {
+            if let Some(d) = self.fetch_subtitle(st, sb, &url).await {
+                doc = Some(d);
+                break;
+            }
+        }
+        let doc = doc.unwrap_or_else(|| subs::EMPTY.into());
+        if cache.docs.len() <= n {
+            cache.docs.resize(n + 1, None);
+        }
+        cache.docs[n] = Some(doc.clone());
+        doc
+    }
+
+    /// den-subtitles' list for this title, with the release's hash, size and filename as its hints.
+    async fn list_subtitles(&self, st: &AppState, sb: &crate::subs::Subs) -> Vec<crate::subs::Entry> {
+        use crate::subs;
+        let size = self.release.size;
+        // The hash's second half is the file's last 64 KiB: one ranged read, only now that it is wanted.
+        let hash = match (size, sb.head_sum) {
+            (Some(size), Some(head)) if size >= subs::HASH_CHUNK => {
+                let input = self.lock().input.clone();
+                crate::probe::read_range(&st.http, &input, size - subs::HASH_CHUNK, subs::HASH_CHUNK)
+                    .await
+                    .ok()
+                    .filter(|t| t.len() as u64 == subs::HASH_CHUNK)
+                    .map(|tail| subs::movie_hash(size, head, subs::chunk_sum(&tail)))
+            }
+            _ => None,
+        };
+        let Some(url) = subs::list_url(&sb.base, &self.imdb, hash.as_deref(), size, &self.release.filename)
+        else {
+            return Vec::new();
+        };
+        let secrets = [sb.base.as_str()];
+        let listed = async {
+            let resp = st.scout_http.get(&url).send().await.map_err(|e| e.without_url().to_string())?;
+            if !resp.status().is_success() {
+                return Err(format!("den-subtitles answered {}", resp.status().as_u16()));
+            }
+            crate::probe::read_capped(resp, subs::MAX_LIST).await.map(|b| subs::parse_list(&b))
+        };
+        listed.await.unwrap_or_else(|e| {
+            crate::log_limited("subtitles_list", || {
+                format!("session {}: subtitles: {}", self.short(), crate::redact::scrub(&e, &secrets))
+            });
+            Vec::new()
+        })
+    }
+
+    /// One subtitle as HLS WebVTT, if it is on an allowed origin and is WebVTT.
+    async fn fetch_subtitle(&self, st: &AppState, sb: &crate::subs::Subs, url: &str) -> Option<String> {
+        use crate::subs;
+        let vtt = subs::vtt_url(url);
+        if !subs::on_origin(&vtt, &st.cfg.subtitle_origins) {
+            crate::log_limited("subtitle_origin", || {
+                format!("session {}: skipped a subtitle not on SUBTITLE_ORIGINS", self.short())
+            });
+            return None;
+        }
+        let fetched = async {
+            let resp = st.scout_http.get(&vtt).send().await.map_err(|e| e.without_url().to_string())?;
+            if !resp.status().is_success() {
+                return Err(format!("a subtitle answered {}", resp.status().as_u16()));
+            }
+            crate::probe::read_capped(resp, subs::MAX_SUBTITLE).await
+        };
+        match fetched.await {
+            Ok(body) => subs::for_hls(&body),
+            Err(e) => {
+                crate::log_limited("subtitle_fetch", || {
+                    format!("session {}: {}", self.short(), crate::redact::scrub(&e, &[sb.base.as_str()]))
+                });
+                None
+            }
+        }
+    }
+
     /// Stop the job, reap it, and delete the session's scratch. `false` if it had already ended.
     pub async fn end(&self, st: &AppState) -> bool {
         let job = {
@@ -445,6 +586,8 @@ impl Session {
             st.scratch_bytes.fetch_sub(i.bytes, Relaxed);
             i.bytes = 0;
             i.gops.clear();
+            // Now rather than when the last handle on the session drops: the next session may want it.
+            i.transcode = None;
             i.job.take()
         };
         if let Some(j) = job {
@@ -533,20 +676,47 @@ async fn open(
     Ok((r, info))
 }
 
-/// `POST /remux/session`: pick and probe a release of `imdb` (scout's title id, `tt…:<s>:<e>` for an
-/// episode), and set up its session.
-///
-/// `scout` is the primary path: the scout install from the web app's library (full, or scope=availability),
-/// accepted only on a `SCOUT_ORIGINS` origin and presented with `REMUX_SCOUT_KEY`. Without it this service's own
-/// `SCOUT_INSTALL_URL` is used, which is how the MVP can be driven by hand.
-pub async fn create(
-    st: &Arc<AppState>,
-    browser: String,
-    imdb: &str,
-    filename: Option<&str>,
-    scout: Option<&str>,
-) -> Result<Arc<Session>, ApiError> {
-    let base = match scout {
+/// What a browser asked for in `POST /remux/session`.
+pub struct Want<'a> {
+    /// Scout's title id: `tt…`, or `tt…:<season>:<episode>` for an episode.
+    pub id: &'a str,
+    /// The release to prefer, when it is playable here.
+    pub filename: Option<&'a str>,
+    /// The scout install from the web app's library (full, or scope=availability), accepted only on a
+    /// `SCOUT_ORIGINS` origin and presented with `REMUX_SCOUT_KEY`. Without it this service's own
+    /// `SCOUT_INSTALL_URL` is used, which is how it can be driven by hand.
+    pub scout: Option<&'a str>,
+    /// Audio languages, most wanted first.
+    pub audio: &'a [String],
+    /// One audio track by index, overriding `audio` — from an earlier session's `audioTracks`, with that
+    /// session's `filename`.
+    pub audio_track: Option<usize>,
+    /// den-subtitles' install from the web app's library, accepted only on a `SUBTITLE_ORIGINS` origin.
+    pub subtitles: Option<&'a str>,
+    /// Subtitle languages to offer as renditions, most wanted first.
+    pub subtitle_languages: &'a [String],
+    /// The video codecs the player takes (`h264`, `hevc`); empty is both. Without HEVC, H.264 releases
+    /// are tried first and an HEVC one is transcoded on the GPU.
+    pub video_codecs: &'a [String],
+}
+
+/// A transcode's output size: the source's, fitted inside `TRANSCODE_WIDTH` × `TRANSCODE_HEIGHT` with its
+/// aspect kept (a 2.4:1 4K film becomes 1920 × 800 — 1080 lines of it would be wider than level 4.1
+/// allows), never scaled up, both even. 0 × 0 when the source's is unknown.
+fn transcode_size(w: u32, h: u32) -> (u32, u32) {
+    if w == 0 || h == 0 {
+        return (0, 0);
+    }
+    let scale =
+        (job::TRANSCODE_WIDTH as f64 / w as f64).min(job::TRANSCODE_HEIGHT as f64 / h as f64).min(1.0);
+    let even = |x: u32| ((x as f64 * scale).round() as u32 & !1).max(2);
+    (even(w), even(h))
+}
+
+/// `POST /remux/session`: pick and probe a release, choose its audio track, and set up its session.
+pub async fn create(st: &Arc<AppState>, browser: String, want: &Want<'_>) -> Result<Arc<Session>, ApiError> {
+    let imdb = want.id;
+    let base = match want.scout {
         Some(url) => scout::validate_scoped(url, &st.cfg.scout_origins).map_err(|why| {
             api(StatusCode::BAD_REQUEST, "bad_scout", format!("The scout URL was refused: {why}."))
         })?,
@@ -559,6 +729,25 @@ pub async fn create(
         })?,
     };
     let source = scout::ScoutSource { base, key: st.cfg.scout_key.clone() };
+    // Checked before any work: a bad install is the browser's mistake, not a reason to probe a release.
+    let mut sub_langs: Vec<String> = Vec::new();
+    for l in want.subtitle_languages.iter().map(|l| crate::lang::canonical(l)) {
+        if !l.is_empty() && !sub_langs.contains(&l) && sub_langs.len() < crate::subs::MAX_LANGUAGES {
+            sub_langs.push(l);
+        }
+    }
+    let sub_base = match want.subtitles {
+        Some(url) if !sub_langs.is_empty() => {
+            Some(scout::validate_scoped(url, &st.cfg.subtitle_origins).map_err(|why| {
+                api(
+                    StatusCode::BAD_REQUEST,
+                    "bad_subtitles",
+                    format!("The subtitles URL was refused: {why}."),
+                )
+            })?)
+        }
+        _ => None,
+    };
     // A browser starting another title is done with the one it was watching; making it wait out the
     // idle timer for its own old session would turn every change of mind into a 429.
     let mine: Vec<String> =
@@ -578,7 +767,7 @@ pub async fn create(
         crate::log_limited("scout_list", || format!("scout: {}", crate::redact::scrub(&e, &secrets)));
         api(StatusCode::BAD_GATEWAY, "scout_unavailable", "Could not list releases.")
     })?;
-    let candidates = scout::candidates(&list, filename);
+    let mut candidates = scout::candidates(&list, want.filename);
     if candidates.is_empty() {
         return Err(api(
             StatusCode::NOT_FOUND,
@@ -586,11 +775,34 @@ pub async fn create(
             "No cached release in a codec this service can remux.",
         ));
     }
+    let takes_hevc = want.video_codecs.is_empty()
+        || want
+            .video_codecs
+            .iter()
+            .any(|c| matches!(c.to_ascii_lowercase().as_str(), "hevc" | "h265" | "hvc1" | "hev1"));
+    if !takes_hevc {
+        scout::h264_first(&mut candidates);
+    }
     let mut chosen = None;
+    let mut no_transcode = false;
     for c in candidates.iter().take(MAX_TRIES) {
         match open(st, &source, c).await {
+            // HEVC for a player without it: only on the GPU, and only while a transcode is free.
+            Ok((r, info)) if info.video == VideoCodec::Hevc && !takes_hevc => match st.reserve_transcode() {
+                Some(slot) => {
+                    chosen = Some((c, (r, info), Some(slot)));
+                    break;
+                }
+                None => {
+                    no_transcode = true;
+                    eprintln!(
+                        "session: {imdb} skipped \"{}\": HEVC, and no transcode free",
+                        c.attributes.label
+                    );
+                }
+            },
             Ok(found) => {
-                chosen = Some((c, found));
+                chosen = Some((c, found, None));
                 break;
             }
             Err(why) => eprintln!(
@@ -600,8 +812,26 @@ pub async fn create(
             ),
         }
     }
-    let Some((c, (resolved, info))) = chosen else {
+    let Some((c, (resolved, info), transcode)) = chosen else {
+        if no_transcode {
+            return Err(api(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "transcode_unavailable",
+                "This player takes no HEVC, and the GPU transcode is off or in use; try again when the other session ends.",
+            ));
+        }
         return Err(api(StatusCode::NOT_FOUND, "no_playable_release", "No cached release could be opened."));
+    };
+    let audio = match want.audio_track {
+        Some(n) if n < info.audio.len() => n,
+        Some(_) => {
+            return Err(api(
+                StatusCode::BAD_REQUEST,
+                "bad_audio_track",
+                format!("This release has {} audio tracks.", info.audio.len()),
+            ))
+        }
+        None => crate::lang::pick_audio(&info.audio, want.audio),
     };
 
     let sid = crate::auth::random_id();
@@ -629,8 +859,26 @@ pub async fn create(
     });
     let size = resolved.size.or(c.attributes.size_bytes);
     let (peak, avg) = playlist::bandwidth(size, info.duration);
+    let (codecs, resolution, (peak, avg)) = match transcode {
+        Some(_) => (
+            job::TRANSCODE_CODECS.to_string(),
+            transcode_size(info.width, info.height),
+            (job::TRANSCODE_PEAK + 192_000, job::TRANSCODE_BITRATE),
+        ),
+        None => (codecs, (info.width, info.height), (peak, avg)),
+    };
+    let subs = sub_base.map(|base| crate::subs::Subs {
+        base,
+        langs: sub_langs,
+        head_sum: resolved.head.get(..crate::subs::HASH_CHUNK as usize).map(crate::subs::chunk_sum),
+        cache: Default::default(),
+    });
+    let renditions: Vec<(String, String)> = subs
+        .as_ref()
+        .map(|s| s.langs.iter().map(|l| (l.clone(), crate::lang::name(l))).collect())
+        .unwrap_or_default();
     let session = Arc::new(Session {
-        master: playlist::master(&codecs, peak, avg, Some((info.width, info.height))),
+        master: playlist::master(&codecs, peak, avg, Some(resolution), &renditions),
         media: playlist::media(&segments),
         sid: sid.clone(),
         sig,
@@ -643,6 +891,9 @@ pub async fn create(
         play_url: c.url.clone(),
         source,
         info,
+        audio,
+        subs,
+        transcoded: transcode.is_some(),
         inner: Mutex::new(Inner {
             job: None,
             next_job: 0,
@@ -656,20 +907,24 @@ pub async fn create(
             failures: 0,
             input: resolved.url,
             reresolved: false,
+            transcode,
         }),
         wake: Notify::new(),
     });
     st.insert_session(session.clone());
     st.sessions_started.fetch_add(1, Relaxed);
     eprintln!(
-        "session {}: {imdb} \"{}\" ({}, {:?}, {:.0}s, {} keyframes, {} segments)",
+        "session {}: {imdb} \"{}\" ({}, {:?}{}, {:.0}s, {} keyframes, {} segments, audio {} {})",
         session.short(),
         session.release.label,
         session.info.container,
         session.info.video,
+        if session.transcoded { " → H.264 on the GPU" } else { "" },
         session.info.duration,
         session.info.keyframes.len(),
-        session.segments.len()
+        session.segments.len(),
+        session.audio,
+        session.info.audio[session.audio].language.as_deref().unwrap_or("und"),
     );
     tokio::spawn(supervise(st.clone(), session.clone()));
     Ok(session)
@@ -745,6 +1000,17 @@ mod tests {
         let gops = [gop(1, 0, 24.0, 3.5), gop(1, 1, 27.5, 2.46)];
         assert_eq!(ready_chain(&gops, &[], last, false), None, "still running: more may come");
         assert_eq!(ready_chain(&gops, &[1], last, false), Some(vec![0, 1]));
+    }
+
+    #[test]
+    fn a_transcode_comes_down_to_1080p_with_its_aspect() {
+        assert_eq!(transcode_size(3840, 2160), (1920, 1080));
+        assert_eq!(transcode_size(3840, 1600), (1920, 800), "a wide film is fitted to the width");
+        assert_eq!(transcode_size(4096, 2160), (1920, 1012));
+        assert_eq!(transcode_size(1440, 1080), (1440, 1080));
+        assert_eq!(transcode_size(1280, 720), (1280, 720), "never scaled up");
+        assert_eq!(transcode_size(1920, 803), (1920, 802), "both even");
+        assert_eq!(transcode_size(0, 0), (0, 0));
     }
 
     #[test]

@@ -46,13 +46,33 @@ pub fn seek_for(k: f64) -> Option<f64> {
 const CA_BUNDLE: &str = "/etc/ssl/certs/ca-certificates.crt";
 const STDERR_TAIL: usize = 2048;
 
-/// What happens to the video. Only a copy today. A hardware transcode (VAAPI/QSV: HEVC → H.264 for old
-/// Chromecasts, a lower bitrate for remote viewing) would be a second variant here: its encoder flags
-/// plus `-force_key_frames` at the playlist's segment starts, so the output keyframes stay where the
-/// playlist already says they are and the GOP joining in the session is unchanged.
+/// What happens to the video.
 pub enum Video {
-    Copy { hevc: bool },
+    Copy {
+        hevc: bool,
+    },
+    /// Decoded, scaled (and tone-mapped, for HDR) on the GPU and encoded to H.264 there, over VAAPI — for
+    /// a player that cannot take the release's HEVC. `-force_key_frames source` puts an output keyframe on
+    /// every source keyframe, so the GOPs, and the playlist cut on them, are the ones a copy would make.
+    Transcode {
+        device: String,
+        /// The output size, inside `TRANSCODE_WIDTH` × `TRANSCODE_HEIGHT`; 0 × 0 when the source's is
+        /// unknown, which leaves ffmpeg to scale it to 1080 lines.
+        width: u32,
+        height: u32,
+        tonemap: bool,
+    },
 }
+
+/// A transcode's H.264: High, level 4.1 — what every H.264 player takes, up to 1920 × 1080.
+pub const TRANSCODE_CODECS: &str = "avc1.640029";
+pub const TRANSCODE_WIDTH: u32 = 1920;
+pub const TRANSCODE_HEIGHT: u32 = 1080;
+pub const TRANSCODE_BITRATE: u64 = 8_000_000;
+/// The rate cap, as the master playlist's BANDWIDTH counts it and as ffmpeg is told it.
+pub const TRANSCODE_PEAK: u64 = 12_000_000;
+const TRANSCODE_MAXRATE: &str = "12M";
+const TRANSCODE_BUFSIZE: &str = "16M";
 
 pub struct Spec<'a> {
     pub input: &'a str,
@@ -89,19 +109,40 @@ pub fn args(spec: &Spec<'_>, ca_file: Option<&str>) -> Vec<String> {
     // One thread for the audio decoder, the filter graph and the AAC encoder: the video is copied, and
     // stereo AAC keeps one core far from busy.
     a.extend(s(&["-threads", "1", "-copyts", "-start_at_zero", "-noaccurate_seek"]));
+    if let Video::Transcode { device, .. } = &spec.video {
+        // Decoded frames stay on the GPU for the scaler and encoder.
+        a.extend(s(&["-hwaccel", "vaapi", "-hwaccel_device", device, "-hwaccel_output_format", "vaapi"]));
+    }
     if let Some(ss) = spec.seek {
         a.extend(["-ss".to_string(), format!("{ss:.6}")]);
     }
     a.extend(s(&["-i", spec.input, "-map", "0:V:0"]));
     a.push("-map".into());
     a.push(format!("0:a:{}", spec.audio));
-    match spec.video {
+    match &spec.video {
         Video::Copy { hevc } => {
             a.extend(s(&["-c:v", "copy"]));
-            if hevc {
+            if *hevc {
                 // Safari plays HEVC in fMP4 only under the hvc1 tag, not hev1.
                 a.extend(s(&["-tag:v", "hvc1"]));
             }
+        }
+        Video::Transcode { width, height, tonemap, .. } => {
+            let size = match width {
+                0 => format!("w=-2:h={TRANSCODE_HEIGHT}"),
+                w => format!("w={w}:h={height}"),
+            };
+            let scale = format!("scale_vaapi={size}:format=nv12");
+            let vf = match tonemap {
+                true => format!("tonemap_vaapi=format=nv12:t=bt709:m=bt709:p=bt709,{scale}"),
+                false => scale,
+            };
+            a.extend(["-vf".to_string(), vf]);
+            a.extend(s(&["-c:v", "h264_vaapi", "-profile:v", "high", "-level:v", "4.1"]));
+            let rate = format!("{}", TRANSCODE_BITRATE);
+            a.extend(s(&["-b:v", &rate, "-maxrate", TRANSCODE_MAXRATE, "-bufsize", TRANSCODE_BUFSIZE]));
+            // Keyframes where the source has them, and no others the encoder would add on its own.
+            a.extend(s(&["-force_key_frames", "source", "-g", "1000"]));
         }
     }
     a.extend(s(&["-c:a", "aac", "-ac", "2", "-b:a", "192k", "-threads", "1", "-filter_threads", "1"]));
@@ -335,6 +376,44 @@ mod tests {
             assert!(joined.contains(want), "missing `{want}` in: {joined}");
         }
         assert!(a.iter().position(|x| x == "-ss") < a.iter().position(|x| x == "-i"), "-ss is an input seek");
+    }
+
+    #[test]
+    fn a_transcode_stays_on_the_gpu_and_keeps_the_source_keyframes() {
+        let spec = Spec {
+            input: "/f.mkv",
+            seek: seek_for(13.0),
+            video: Video::Transcode {
+                device: "/dev/dri/renderD128".into(),
+                width: 1920,
+                height: 800,
+                tonemap: true,
+            },
+            audio: 0,
+            dir: Path::new("/d"),
+        };
+        let a = args(&spec, None);
+        let joined = a.join(" ");
+        for want in [
+            "-hwaccel vaapi -hwaccel_device /dev/dri/renderD128 -hwaccel_output_format vaapi -ss 13.135000 -i /f.mkv",
+            "-vf tonemap_vaapi=format=nv12:t=bt709:m=bt709:p=bt709,scale_vaapi=w=1920:h=800:format=nv12",
+            "-c:v h264_vaapi -profile:v high -level:v 4.1 -b:v 8000000 -maxrate 12M",
+            "-force_key_frames source",
+            "-f hls -hls_time 0",
+        ] {
+            assert!(joined.contains(want), "missing `{want}` in: {joined}");
+        }
+        assert!(!joined.contains("-tag:v") && !joined.contains("-c:v copy"));
+        let sdr = Spec {
+            video: Video::Transcode { device: "/d".into(), width: 1280, height: 720, tonemap: false },
+            ..spec
+        };
+        assert!(args(&sdr, None).join(" ").contains("-vf scale_vaapi=w=1280:h=720:format=nv12 "));
+        let unknown = Spec {
+            video: Video::Transcode { device: "/d".into(), width: 0, height: 0, tonemap: false },
+            ..sdr
+        };
+        assert!(args(&unknown, None).join(" ").contains("-vf scale_vaapi=w=-2:h=1080:format=nv12 "));
     }
 
     #[test]
