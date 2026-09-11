@@ -85,6 +85,9 @@ pub struct Inner {
     ended: bool,
     bytes: u64,
     failures: u32,
+    /// The debrid link ffmpeg reads — scout's play URL, resolved — and whether it has been re-fetched.
+    input: String,
+    reresolved: bool,
 }
 
 pub struct Session {
@@ -99,10 +102,10 @@ pub struct Session {
     pub segments: Vec<Segment>,
     pub master: String,
     pub media: String,
-    /// The debrid link scout's play URL led to, and the play URL itself for when that link stops
-    /// working mid-session.
-    input: String,
-    fallback_input: String,
+    /// Scout's play URL for the release and the scout it came from, for fetching a fresh debrid link
+    /// when the one ffmpeg reads stops working mid-session. Both are secrets.
+    play_url: String,
+    source: scout::ScoutSource,
     inner: Mutex<Inner>,
     wake: Notify,
 }
@@ -190,7 +193,7 @@ impl Session {
 
     /// Take what the job has finished since the last look: its exit, and the GOPs in its playlist.
     fn refresh(&self, i: &mut Inner, st: &AppState) {
-        let Inner { job, gops, finished, init, bytes, failures, .. } = i;
+        let Inner { job, gops, finished, init, bytes, failures, input, .. } = i;
         let Some(job) = job.as_mut() else { return };
         let newly_exited = job.exit.is_none() && job.poll_exit().is_some();
         // After the exit check, so everything written before the exit is read.
@@ -223,11 +226,7 @@ impl Session {
                 }
                 if let Some(tail) = job.take_stderr() {
                     let (sid, start) = (self.short().to_string(), job.start);
-                    let secrets = [
-                        self.input.clone(),
-                        self.fallback_input.clone(),
-                        st.cfg.scout_install_url.clone().unwrap_or_default(),
-                    ];
+                    let secrets = [input.clone(), self.play_url.clone(), self.source.base.clone()];
                     tokio::spawn(async move {
                         let tail = tail.await.unwrap_or_default();
                         let refs: Vec<&str> = secrets.iter().map(String::as_str).collect();
@@ -274,6 +273,10 @@ impl Session {
         if keep {
             return Ok(());
         }
+        // A run failed without output: the next one waits for `reresolve_if_needed` to fetch a fresh link.
+        if i.failures > 0 && !i.reresolved {
+            return Ok(());
+        }
         if i.failures >= MAX_FAILURES {
             return Err(());
         }
@@ -281,10 +284,9 @@ impl Session {
         let id = i.next_job;
         i.next_job += 1;
         let dir = self.dir.join(format!("j{id}"));
-        // After a run that produced nothing, go back through scout: the debrid link may have expired.
-        let input = if i.failures > 0 { &self.fallback_input } else { &self.input };
+        let input = i.input.clone();
         let video = job::Video::Copy { hevc: self.info.video == VideoCodec::Hevc };
-        let spec = Spec { input, seek, video, audio: 0, dir: &dir };
+        let spec = Spec { input: &input, seek, video, audio: 0, dir: &dir };
         match Job::spawn(&st.cfg.ffmpeg, id, start, &spec) {
             Ok(new) => {
                 if let Some(old) = i.job.replace(new) {
@@ -340,9 +342,31 @@ impl Session {
         st.scratch_bytes.fetch_sub(freed, Relaxed);
     }
 
+    /// After a run that produced nothing, fetch a fresh link through scout, once: a debrid link can
+    /// expire inside a long session. Done here rather than by handing ffmpeg scout's play URL, because
+    /// following scout's redirect is where the service key has to be kept away from the debrid.
+    async fn reresolve_if_needed(&self, st: &AppState) {
+        {
+            let mut i = self.lock();
+            if i.ended || i.failures == 0 || i.reresolved {
+                return;
+            }
+            i.reresolved = true;
+        }
+        match scout::resolve(&st.scout_http, &self.play_url, &self.source).await {
+            Ok(r) => self.lock().input = r.url,
+            Err(e) => eprintln!(
+                "session {}: re-resolving the release failed: {}",
+                self.short(),
+                crate::redact::scrub(&e, &[&self.source.base])
+            ),
+        }
+    }
+
     pub async fn serve_segment(&self, st: &AppState, n: usize, head: bool) -> Response<Body> {
         let deadline = Instant::now() + SEGMENT_WAIT;
         loop {
+            self.reresolve_if_needed(st).await;
             let paths = {
                 let mut i = self.lock();
                 if i.ended {
@@ -380,6 +404,7 @@ impl Session {
     pub async fn serve_init(&self, st: &AppState, head: bool) -> Response<Body> {
         let deadline = Instant::now() + SEGMENT_WAIT;
         loop {
+            self.reresolve_if_needed(st).await;
             let init = {
                 let mut i = self.lock();
                 if i.ended {
@@ -490,8 +515,12 @@ fn source_failed() -> Response<Body> {
 }
 
 /// Try one candidate: follow its play URL, read the head, and probe it.
-async fn open(st: &AppState, s: &scout::Stream) -> Result<(scout::Resolved, MediaInfo), String> {
-    let r = scout::resolve(&st.http, &s.url).await?;
+async fn open(
+    st: &AppState,
+    src: &scout::ScoutSource,
+    s: &scout::Stream,
+) -> Result<(scout::Resolved, MediaInfo), String> {
+    let r = scout::resolve(&st.scout_http, &s.url, src).await?;
     let info = crate::probe::probe(&Source::Http { client: &st.http, url: &r.url }, &r.head)
         .await
         .map_err(|e| e.to_string())?;
@@ -505,19 +534,30 @@ async fn open(st: &AppState, s: &scout::Stream) -> Result<(scout::Resolved, Medi
 }
 
 /// `POST /remux/session`: pick and probe a release of `imdb`, and set up its session.
+///
+/// `scout` is the primary path: the scope=availability scout install the web app holds, accepted only
+/// on a `SCOUT_ORIGINS` origin and presented with `REMUX_SCOUT_KEY`. Without it this service's own
+/// `SCOUT_INSTALL_URL` is used, which is how the MVP can be driven by hand.
 pub async fn create(
     st: &Arc<AppState>,
     browser: String,
     imdb: &str,
     filename: Option<&str>,
+    scout: Option<&str>,
 ) -> Result<Arc<Session>, ApiError> {
-    let Some(install) = st.cfg.scout_install_url.clone() else {
-        return Err(api(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "scout_unconfigured",
-            "SCOUT_INSTALL_URL is not set.",
-        ));
+    let base = match scout {
+        Some(url) => scout::validate_scoped(url, &st.cfg.scout_origins).map_err(|why| {
+            api(StatusCode::BAD_REQUEST, "bad_scout", format!("The scout URL was refused: {why}."))
+        })?,
+        None => st.cfg.scout_install_url.clone().ok_or_else(|| {
+            api(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "scout_unconfigured",
+                "No scout URL in the request, and no SCOUT_INSTALL_URL.",
+            )
+        })?,
     };
+    let source = scout::ScoutSource { base, key: st.cfg.scout_key.clone() };
     // A browser starting another title is done with the one it was watching; making it wait out the
     // idle timer for its own old session would turn every change of mind into a 429.
     let mine: Vec<String> =
@@ -532,22 +572,8 @@ pub async fn create(
             format!("{} sessions are already playing.", st.cfg.max_sessions),
         ));
     };
-    let secrets = [install.as_str()];
-    let list = async {
-        let resp = st
-            .http
-            .get(scout::stream_list_url(&install, imdb))
-            .send()
-            .await
-            .map_err(|e| e.without_url().to_string())?;
-        if !resp.status().is_success() {
-            return Err(format!("scout answered {}", resp.status().as_u16()));
-        }
-        let body = crate::probe::read_capped(resp, 8 << 20).await?;
-        scout::parse(&body)
-    }
-    .await
-    .map_err(|e| {
+    let secrets = [source.base.as_str()];
+    let list = scout::list(&st.scout_http, &source, imdb).await.map_err(|e| {
         crate::log_limited("scout_list", || format!("scout: {}", crate::redact::scrub(&e, &secrets)));
         api(StatusCode::BAD_GATEWAY, "scout_unavailable", "Could not list releases.")
     })?;
@@ -561,7 +587,7 @@ pub async fn create(
     }
     let mut chosen = None;
     for c in candidates.iter().take(MAX_TRIES) {
-        match open(st, c).await {
+        match open(st, &source, c).await {
             Ok(found) => {
                 chosen = Some((c, found));
                 break;
@@ -613,8 +639,8 @@ pub async fn create(
         dir,
         release: Release { label: c.attributes.label.clone(), filename: c.filename().to_string(), size },
         segments,
-        input: resolved.url,
-        fallback_input: c.url.clone(),
+        play_url: c.url.clone(),
+        source,
         info,
         inner: Mutex::new(Inner {
             job: None,
@@ -627,6 +653,8 @@ pub async fn create(
             ended: false,
             bytes: 0,
             failures: 0,
+            input: resolved.url,
+            reresolved: false,
         }),
         wake: Notify::new(),
     });

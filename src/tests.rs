@@ -113,30 +113,39 @@ fn temp_dir() -> PathBuf {
     d
 }
 
-/// A local origin standing in for scout and the debrid: `/cfg/stream/movie/<imdb>.json` lists an
-/// uncached decoy and then the fixture; `/p/<name>` 302s to `/f/<name>`, which serves the fixture with
-/// Range. `/p/slow/<name>` leads to a copy that trickles out, for a job that is still running when the
-/// test wants it to be.
+/// A local origin standing in for scout and the debrid: `/<config>/stream/movie/<imdb>.json` lists an
+/// uncached decoy and then the fixture; `/p/<name>` 302s to `/f/<name>` on a second port — another
+/// origin, as a debrid always is — which serves the fixture with Range. `/p/slow/<name>` leads to a copy
+/// that trickles out, for a job that is still running when the test wants it to be. Config `cfg` is an
+/// ordinary install; config `SCOPED` behaves as den-scout's scope=availability config.
 async fn origin() -> String {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        loop {
-            let Ok((stream, _)) = listener.accept().await else { continue };
-            tokio::spawn(async move {
-                let service = hyper::service::service_fn(move |req| async move {
-                    Ok::<_, Infallible>(origin_handle(addr, req).await)
+    let scout = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let files = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (sa, fa) = (scout.local_addr().unwrap(), files.local_addr().unwrap());
+    for listener in [scout, files] {
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else { continue };
+                tokio::spawn(async move {
+                    let service = hyper::service::service_fn(move |req| async move {
+                        Ok::<_, Infallible>(origin_handle(sa, fa, req).await)
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
+                        .await;
                 });
-                let _ = hyper::server::conn::http1::Builder::new()
-                    .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
-                    .await;
-            });
-        }
-    });
-    format!("http://{addr}")
+            }
+        });
+    }
+    format!("http://{sa}")
 }
 
 type OriginBody = http_body_util::combinators::BoxBody<Bytes, Infallible>;
+
+/// The fake scout's scope=availability config segment ("scoped", base64url) and the service key it
+/// asks for.
+const SCOPED: &str = "c2NvcGVk";
+const SCOUT_KEY: &str = "test-scout-key";
 
 fn origin_full(status: u16, body: impl Into<Bytes>) -> Response<OriginBody> {
     Response::builder().status(status).body(Full::new(body.into()).boxed()).unwrap()
@@ -144,10 +153,29 @@ fn origin_full(status: u16, body: impl Into<Bytes>) -> Response<OriginBody> {
 
 async fn origin_handle(
     addr: std::net::SocketAddr,
+    files: std::net::SocketAddr,
     req: Request<hyper::body::Incoming>,
 ) -> Response<OriginBody> {
     let path = req.uri().path().to_string();
-    if let Some(imdb) = path.strip_prefix("/cfg/stream/movie/").and_then(|p| p.strip_suffix(".json")) {
+    let keyed = req.headers().get("x-den-remux-key").and_then(|v| v.to_str().ok()) == Some(SCOUT_KEY);
+    // The key is for scout alone: the file host — the debrid, here — must never be sent it.
+    if path.starts_with("/f/") && req.headers().contains_key("x-den-remux-key") {
+        return origin_full(400, "the service key reached the file host");
+    }
+    let listing = path
+        .strip_suffix(".json")
+        .and_then(|p| p.strip_prefix('/'))
+        .and_then(|p| p.split_once("/stream/movie/"));
+    if let Some((config, imdb)) = listing {
+        // den-scout's contract for a scope=availability config: it lists only for the service key.
+        let scoped = config == SCOPED;
+        if scoped && !keyed {
+            return origin_full(403, r#"{"error":"key_required"}"#);
+        }
+        if !scoped && config != "cfg" {
+            return origin_full(400, r#"{"error":"bad_config"}"#);
+        }
+        let p = if scoped { "p/s" } else { "p" };
         let file = match imdb {
             "tt0000001" => "h264.mkv",
             "tt0000002" => "hevc.mkv",
@@ -156,17 +184,23 @@ async fn origin_handle(
             _ => return origin_full(200, r#"{"streams":[]}"#),
         };
         let body = serde_json::json!({"streams": [
-            {"title": "decoy.mkv", "url": format!("http://{addr}/p/missing.mkv"),
+            {"title": "decoy.mkv", "url": format!("http://{addr}/{p}/missing.mkv"),
              "attributes": {"codec": "h264", "cached": false, "label": "uncached"}, "behaviorHints": {"filename": "decoy.mkv"}},
-            {"title": file, "url": format!("http://{addr}/p/{file}"),
+            {"title": file, "url": format!("http://{addr}/{p}/{file}"),
              "attributes": {"cached": true, "label": format!("fixture {file}")}, "behaviorHints": {"filename": file}}
         ]});
         return origin_full(200, body.to_string());
     }
     if let Some(rest) = path.strip_prefix("/p/") {
+        // A scoped config's ticket plays only for the service key, too.
+        let rest = match rest.strip_prefix("s/") {
+            Some(_) if !keyed => return origin_full(403, r#"{"error":"key_required"}"#),
+            Some(r) => r,
+            None => rest,
+        };
         return Response::builder()
             .status(302)
-            .header("location", format!("/f/{rest}"))
+            .header("location", format!("http://{files}/f/{rest}"))
             .body(Full::new(Bytes::new()).boxed())
             .unwrap();
     }
@@ -214,9 +248,15 @@ async fn origin_handle(
 }
 
 fn test_state(origin: &str, max_sessions: usize, idle: Duration) -> Arc<AppState> {
+    state_with(origin, max_sessions, idle, Some(SCOUT_KEY))
+}
+
+fn state_with(origin: &str, max_sessions: usize, idle: Duration, scout_key: Option<&str>) -> Arc<AppState> {
     let dir = temp_dir();
     let state = AppState::new(Config {
         port: 0,
+        scout_origins: vec![origin.to_string()],
+        scout_key: scout_key.map(String::from),
         scout_install_url: Some(format!("{origin}/cfg")),
         browser_key_hashes: vec![crate::auth::sha256(b"phone-key"), crate::auth::sha256(b"laptop-key")],
         url_key: b"integration-test-key".to_vec(),
@@ -305,11 +345,16 @@ fn extinfs(media: &str) -> Vec<f64> {
 /// The whole path for one fixture: log in, create a session against the fake scout, fetch the
 /// playlists, then fetch segments out of order so the job has to restart — first mid-file, then
 /// behind itself, then at zero — and check every segment with ffprobe.
-async fn end_to_end(imdb: &str, fixture_name: &str, codec_prefix: &str) {
+async fn end_to_end(imdb: &str, fixture_name: &str, codec_prefix: &str, scoped: bool) {
     let origin = origin().await;
     let state = test_state(&origin, 2, Duration::from_secs(600));
     let cookie = login(&state, "phone-key").await;
-    let r = call(&state, "POST", "/remux/session", Some(&cookie), &format!(r#"{{"imdb":"{imdb}"}}"#)).await;
+    // The scoped scout URL is the primary path; without one the server's own install is the fallback.
+    let body = match scoped {
+        true => format!(r#"{{"imdb":"{imdb}","scout":"{origin}/{SCOPED}"}}"#),
+        false => format!(r#"{{"imdb":"{imdb}"}}"#),
+    };
+    let r = call(&state, "POST", "/remux/session", Some(&cookie), &body).await;
     assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
     let created = r.json();
     let playlist = created["playlist"].as_str().unwrap().to_string();
@@ -427,19 +472,19 @@ async fn end_to_end(imdb: &str, fixture_name: &str, codec_prefix: &str) {
 #[tokio::test]
 #[ignore]
 async fn h264_matroska_end_to_end() {
-    end_to_end("tt0000001", "h264.mkv", "avc1.64").await;
+    end_to_end("tt0000001", "h264.mkv", "avc1.64", true).await;
 }
 
 #[tokio::test]
 #[ignore]
 async fn hevc_matroska_end_to_end() {
-    end_to_end("tt0000002", "hevc.mkv", "hvc1.1.6.L").await;
+    end_to_end("tt0000002", "hevc.mkv", "hvc1.1.6.L", false).await;
 }
 
 #[tokio::test]
 #[ignore]
 async fn mp4_end_to_end() {
-    end_to_end("tt0000003", "h264.mp4", "avc1.64").await;
+    end_to_end("tt0000003", "h264.mp4", "avc1.64", true).await;
 }
 
 #[tokio::test]
@@ -493,6 +538,39 @@ async fn an_idle_session_is_ended_and_its_ffmpeg_does_not_outlive_it() {
     assert_eq!(unsafe { libc::kill(pid as i32, 0) }, -1, "ffmpeg {pid} outlived its session");
     assert_eq!(call(&state, "GET", &format!("{base}seg1.m4s"), None, "").await.status, StatusCode::GONE);
     assert!(!state.cfg.scratch_dir.join(format!("s-{sid}")).exists());
+}
+
+/// den-scout's contract for a scope=availability config: it lists and plays only for the service key.
+/// den-remux must present the key to scout — and only to scout: the fake file host fails any request
+/// that carries it, so a session that probes at all proves the key stayed behind at the redirect. No
+/// ffmpeg needed: creating a session resolves and probes, and starts nothing.
+#[tokio::test]
+async fn a_scoped_scout_gets_the_service_key_and_nothing_else_does() {
+    let origin = origin().await;
+    let scoped = |scout: &str| format!(r#"{{"imdb":"tt0000001","scout":"{scout}"}}"#);
+    let good = format!("{origin}/{SCOPED}");
+
+    let state = test_state(&origin, 2, Duration::from_secs(600));
+    let cookie = login(&state, "phone-key").await;
+    let r = call(&state, "POST", "/remux/session", Some(&cookie), &scoped(&good)).await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    assert_eq!(r.json()["release"]["filename"], "h264.mkv");
+    // Anything but an allowed origin and one config segment is refused before a request is made.
+    let refused =
+        ["http://169.254.169.254/latest".to_string(), format!("{good}/stream"), format!("{good}?x=1")];
+    for bad in &refused {
+        let r = call(&state, "POST", "/remux/session", Some(&cookie), &scoped(bad)).await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "{bad}");
+        assert_eq!(r.json()["error"], "bad_scout");
+    }
+    state.end_all("test").await;
+
+    // Without the key the scoped config will not list, and that is scout being unavailable.
+    let keyless = state_with(&origin, 2, Duration::from_secs(600), None);
+    let cookie = login(&keyless, "phone-key").await;
+    let r = call(&keyless, "POST", "/remux/session", Some(&cookie), &scoped(&good)).await;
+    assert_eq!(r.status, StatusCode::BAD_GATEWAY, "{}", r.text());
+    assert_eq!(r.json()["error"], "scout_unavailable");
 }
 
 #[tokio::test]

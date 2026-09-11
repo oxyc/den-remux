@@ -1,7 +1,8 @@
 //! Runtime configuration, all from the environment.
 //!
-//! Env: PORT, SCOUT_INSTALL_URL, BROWSER_KEY_HASHES, REMUX_URL_KEY, MAX_SESSIONS, SESSION_IDLE_SECS,
-//!      SCRATCH_DIR, SCRATCH_MAX_BYTES, FFMPEG_PATH, METRICS_TOKEN, LOG_REQUESTS.
+//! Env: PORT, SCOUT_ORIGINS, REMUX_SCOUT_KEY, SCOUT_INSTALL_URL, BROWSER_KEY_HASHES, REMUX_URL_KEY,
+//!      MAX_SESSIONS, SESSION_IDLE_SECS, SCRATCH_DIR, SCRATCH_MAX_BYTES, FFMPEG_PATH, METRICS_TOKEN,
+//!      LOG_REQUESTS.
 
 use std::env;
 use std::path::PathBuf;
@@ -9,9 +10,15 @@ use std::time::Duration;
 
 pub struct Config {
     pub port: u16,
-    /// `SCOUT_INSTALL_URL` — this service's own den-scout install, sealed config included, with no
-    /// trailing slash. A secret: it lists and plays anything, so it is never logged and never leaves
-    /// the process. `None` leaves the service up but unable to start a session.
+    /// `SCOUT_ORIGINS` — the only origins (`scheme://host[:port]`) a browser's scoped scout URL may point
+    /// at. This list is the SSRF guard on `POST /remux/session {scout}`; empty refuses every such URL.
+    pub scout_origins: Vec<String>,
+    /// `REMUX_SCOUT_KEY` — the service key sent to scout as `X-Den-Remux-Key`. A scope=availability
+    /// scout config lists and plays only for a caller presenting it.
+    pub scout_key: Option<String>,
+    /// `SCOUT_INSTALL_URL` — the fallback when a request names no scout: a den-scout install of this
+    /// service's own, sealed config included, with no trailing slash. A secret: it lists and plays
+    /// anything, so it is never logged and never leaves the process.
     pub scout_install_url: Option<String>,
     /// `BROWSER_KEY_HASHES` — SHA-256 of each browser's key. Only hashes live in the env file, so the
     /// file on the box cannot be replayed as a key.
@@ -64,6 +71,26 @@ pub(crate) fn parse_key_hashes(raw: &str) -> Vec<[u8; 32]> {
         .collect()
 }
 
+/// `SCOUT_ORIGINS`: comma-separated `scheme://host[:port]`, normalised to lower case without a trailing
+/// slash. An entry with a path, query or credentials is said once and skipped: an origin list that
+/// quietly admitted more than it names would not be a guard.
+pub(crate) fn parse_origins(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| {
+            let o = s.trim_end_matches('/').to_ascii_lowercase();
+            let ok = o.split_once("://").is_some_and(|(scheme, host)| {
+                matches!(scheme, "http" | "https") && !host.is_empty() && !host.contains(['/', '?', '#', '@'])
+            });
+            if !ok {
+                eprintln!("warning: SCOUT_ORIGINS entry {s:?} is not scheme://host[:port]; skipping it");
+            }
+            ok.then_some(o)
+        })
+        .collect()
+}
+
 /// Below this the cap cannot hold one window of a 4K session, and every job would sit paused.
 const MIN_SCRATCH_BYTES: u64 = 64 * 1024 * 1024;
 
@@ -81,6 +108,8 @@ impl Config {
         };
         Config {
             port: env_opt("PORT").and_then(|v| v.parse().ok()).unwrap_or(8095),
+            scout_origins: parse_origins(&env_opt("SCOUT_ORIGINS").unwrap_or_default()),
+            scout_key: env_opt("REMUX_SCOUT_KEY"),
             scout_install_url: env_opt("SCOUT_INSTALL_URL").map(|u| u.trim_end_matches('/').to_string()),
             browser_key_hashes: parse_key_hashes(&env_opt("BROWSER_KEY_HASHES").unwrap_or_default()),
             url_key,
@@ -109,6 +138,14 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scout_origins_admit_only_bare_origins() {
+        let o = parse_origins(
+            "http://192.168.86.193:8080/, HTTPS://Scout.lan ,http://x/path,ftp://y,http://u@z,",
+        );
+        assert_eq!(o, ["http://192.168.86.193:8080", "https://scout.lan"]);
+    }
 
     #[test]
     fn log_requests_follows_the_fleet_rule() {

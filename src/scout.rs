@@ -1,9 +1,12 @@
-//! The stream source: this service's own den-scout install.
+//! The stream source: den-scout.
 //!
-//! den-remux holds a scout install of its own, server-side (`SCOUT_INSTALL_URL`), so the browser never
-//! holds a config that can list or play anything — it asks for a title, and gets back a signed session
-//! for one release. Scout's ranking is kept as-is: the first release that is cached on the debrid, in
-//! a codec the browser can take copied, and that probes cleanly, wins.
+//! A session's releases come from a scout install that lists and plays only for this service: the
+//! scope=availability config the web app holds, which scout honours only with `X-Den-Remux-Key` — a
+//! key the browser never has — or, as a fallback, this service's own `SCOUT_INSTALL_URL`. Either way
+//! the browser never holds a config that can play anything by itself, nor a ticket or a debrid link:
+//! it asks for a title and gets back a signed session for one release. Scout's ranking is kept as-is:
+//! the first release that is cached on the debrid, in a codec the browser can take copied, and that
+//! probes cleanly, wins.
 
 use serde::Deserialize;
 
@@ -104,15 +107,102 @@ pub struct Resolved {
     pub size: Option<u64>,
 }
 
+/// The header a scope=availability scout config asks for before it lists or plays.
+pub const KEY_HEADER: &str = "x-den-remux-key";
+
+/// Where a session's releases come from: a scout base URL (config segment included) and the service key
+/// to present to it.
+pub struct ScoutSource {
+    pub base: String,
+    pub key: Option<String>,
+}
+
+impl ScoutSource {
+    /// Is `url` on this scout's origin — the only place the key may be sent?
+    fn is_scout(&self, url: &reqwest::Url) -> bool {
+        reqwest::Url::parse(&self.base).is_ok_and(|b| b.origin() == url.origin())
+    }
+}
+
+/// A scout base URL a browser handed over, accepted only as `<allowed origin>/<config>`: an origin in
+/// `SCOUT_ORIGINS`, exactly one path segment of base64url (den-scout's sealed config alphabet), and no
+/// credentials, query or fragment. This is the SSRF guard — without it a logged-in browser could make
+/// this service fetch any URL on the LAN. Returns the normalised base.
+pub fn validate_scoped(url: &str, origins: &[String]) -> Result<String, &'static str> {
+    if url.len() > 4096 {
+        return Err("too long");
+    }
+    if url.contains(['?', '#']) {
+        return Err("a query or fragment");
+    }
+    let (scheme, rest) = url.split_once("://").ok_or("not an absolute URL")?;
+    let (authority, config) = rest.split_once('/').ok_or("no config segment")?;
+    if authority.contains('@') {
+        return Err("credentials in the URL");
+    }
+    let origin = format!("{}://{}", scheme.to_ascii_lowercase(), authority.to_ascii_lowercase());
+    if !origins.contains(&origin) {
+        return Err("an origin not in SCOUT_ORIGINS");
+    }
+    // One segment only: this also refuses a trailing slash and any further path.
+    if config.is_empty() || !config.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_') {
+        return Err("not a single base64url config segment");
+    }
+    Ok(format!("{origin}/{config}"))
+}
+
+/// The stream list for `imdb`, with the service key. `client` must not follow redirects: one would
+/// carry the key off scout's origin.
+pub async fn list(client: &reqwest::Client, src: &ScoutSource, imdb: &str) -> Result<Vec<Stream>, String> {
+    let mut req = client.get(stream_list_url(&src.base, imdb));
+    if let Some(k) = &src.key {
+        req = req.header(KEY_HEADER, k);
+    }
+    let resp = req.send().await.map_err(|e| e.without_url().to_string())?;
+    if !resp.status().is_success() {
+        return Err(format!("scout answered {}", resp.status().as_u16()));
+    }
+    let body = crate::probe::read_capped(resp, 8 << 20).await?;
+    parse(&body)
+}
+
+/// How many redirects a play URL may take to reach the file. Scout's is one 302; a debrid may add one.
+const MAX_HOPS: usize = 5;
+
 /// Follow a play URL (scout's `/p/<ticket>`, a 302 to the debrid) and read the head of the file in the
 /// same request.
-pub async fn resolve(client: &reqwest::Client, play_url: &str) -> Result<Resolved, String> {
-    let resp = client
-        .get(play_url)
-        .header(reqwest::header::RANGE, format!("bytes=0-{}", HEAD_BYTES - 1))
-        .send()
-        .await
-        .map_err(|e| e.without_url().to_string())?;
+///
+/// Redirects are followed here rather than by the client, because the service key must reach scout
+/// and nothing else: an HTTP client forwards custom headers across a cross-origin redirect, which would
+/// hand `X-Den-Remux-Key` to the debrid's CDN. `client` must not follow redirects itself.
+pub async fn resolve(
+    client: &reqwest::Client,
+    play_url: &str,
+    src: &ScoutSource,
+) -> Result<Resolved, String> {
+    let mut url = reqwest::Url::parse(play_url).map_err(|_| "the play URL does not parse".to_string())?;
+    let mut hops = 0;
+    let resp = loop {
+        let mut req =
+            client.get(url.clone()).header(reqwest::header::RANGE, format!("bytes=0-{}", HEAD_BYTES - 1));
+        if let Some(k) = src.key.as_deref().filter(|_| src.is_scout(&url)) {
+            req = req.header(KEY_HEADER, k);
+        }
+        let resp = req.send().await.map_err(|e| e.without_url().to_string())?;
+        if !resp.status().is_redirection() {
+            break resp;
+        }
+        hops += 1;
+        let next = resp
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|l| url.join(l).ok());
+        match next {
+            Some(n) if hops <= MAX_HOPS => url = n,
+            _ => return Err(format!("the play URL redirected badly ({})", resp.status().as_u16())),
+        }
+    };
     let status = resp.status().as_u16();
     // Scout answers an uncached or failed resolve with JSON, not media.
     let json = resp
@@ -180,6 +270,42 @@ mod tests {
         // Named but uncached: scout's best cached one instead.
         let pick = candidates(&fixture(), Some("Film.2019.1080p.WEB.x264-UNCACHED.mkv"));
         assert_eq!(pick[0].filename(), "Film.2019.2160p.UHD.BluRay.REMUX.HEVC.TrueHD.7.1.mkv");
+    }
+
+    #[test]
+    fn a_scoped_scout_url_must_be_an_allowed_origin_and_one_config_segment() {
+        let allowed = ["http://192.168.86.193:8080".to_string()];
+        let ok = |u: &str| validate_scoped(u, &allowed);
+        assert_eq!(
+            ok("http://192.168.86.193:8080/eyJ2IjoxfQ-_x"),
+            Ok("http://192.168.86.193:8080/eyJ2IjoxfQ-_x".into())
+        );
+        assert_eq!(
+            ok("HTTP://192.168.86.193:8080/abc"),
+            Ok("http://192.168.86.193:8080/abc".into()),
+            "normalised"
+        );
+        for refused in [
+            "http://192.168.86.193:8081/abc",          // another port
+            "https://192.168.86.193:8080/abc",         // another scheme
+            "http://169.254.169.254/abc",              // anywhere else
+            "http://x@192.168.86.193:8080/abc",        // credentials
+            "http://192.168.86.193:8080@evil.lan/abc", // credentials disguising the host
+            "http://192.168.86.193:8080/abc?x=1",      // query
+            "http://192.168.86.193:8080/abc#f",        // fragment
+            "http://192.168.86.193:8080/abc/stream",   // two segments
+            "http://192.168.86.193:8080/abc/",         // trailing slash
+            "http://192.168.86.193:8080/",             // no config
+            "http://192.168.86.193:8080",              // no path at all
+            "http://192.168.86.193:8080/%2e%2e",       // not base64url
+            "192.168.86.193:8080/abc",                 // not absolute
+        ] {
+            assert!(ok(refused).is_err(), "{refused} was accepted");
+        }
+        assert!(
+            validate_scoped("http://192.168.86.193:8080/abc", &[]).is_err(),
+            "no origins, no scoped URLs"
+        );
     }
 
     #[test]

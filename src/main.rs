@@ -1,13 +1,14 @@
 //! den-remux — Den's playback for browsers, AirPlay and Cast receivers.
 //!
 //!   POST /remux/login   {key}               → cookie for creating sessions
-//!   POST /remux/session {imdb, filename?}   → a signed session: /remux/s/<sid>/<sig>/master.m3u8
+//!   POST /remux/session {imdb, filename?, scout?} → a signed session: /remux/s/<sid>/<sig>/master.m3u8
 //!   GET  /remux/s/<sid>/<sig>/…             → HLS (fMP4): master, media, init.mp4, seg<N>.m4s
 //!   DELETE /remux/s/<sid>/<sig>             → end it (410 from then on)
 //!   GET  /health, /metrics
 //!
-//! A release comes from this service's own server-held den-scout install. Its video is copied, its
-//! audio re-encoded to AAC stereo, and it is served as a VOD playlist cut on its own keyframes.
+//! A release comes from den-scout — a scope=availability install named per request and opened with
+//! this service's key, or this service's own install. Its video is copied, its audio re-encoded to
+//! AAC stereo, and it is served as a VOD playlist cut on its own keyframes.
 
 mod auth;
 mod config;
@@ -82,8 +83,13 @@ fn health_verdict(state: &AppState) -> Option<(&'static str, &'static str)> {
         ))
     } else if !state.scratch_ok.load(Relaxed) {
         Some(("scratch_unwritable", "SCRATCH_DIR cannot be written — check the volume and its owner (65532)"))
-    } else if state.cfg.scout_install_url.is_none() {
-        Some(("scout_unconfigured", "set SCOUT_INSTALL_URL to this service's own den-scout install"))
+    } else if state.cfg.scout_install_url.is_none() && state.cfg.scout_origins.is_empty() {
+        Some((
+            "scout_unconfigured",
+            "set SCOUT_ORIGINS and REMUX_SCOUT_KEY (or a fallback SCOUT_INSTALL_URL)",
+        ))
+    } else if !state.cfg.scout_origins.is_empty() && state.cfg.scout_key.is_none() {
+        Some(("scout_key_missing", "set REMUX_SCOUT_KEY, or a scoped scout config refuses to list or play"))
     } else if state.cfg.browser_key_hashes.is_empty() {
         Some(("no_browser_keys", "set BROWSER_KEY_HASHES, or no browser can log in"))
     } else if state.cfg.url_key_ephemeral {
@@ -315,14 +321,15 @@ where
     struct Create {
         imdb: String,
         filename: Option<String>,
+        scout: Option<String>,
     }
     let Some(req) = read_body(body).await.and_then(|b| serde_json::from_slice::<Create>(&b).ok()) else {
-        return bad_request("Expected {\"imdb\": \"tt…\", \"filename\"?: \"…\"}.");
+        return bad_request("Expected {\"imdb\": \"tt…\", \"filename\"?: \"…\", \"scout\"?: \"…\"}.");
     };
     if !scout::is_imdb(&req.imdb) {
         return bad_request("imdb must be a movie's IMDb id, tt followed by digits.");
     }
-    match session::create(state, browser, &req.imdb, req.filename.as_deref()).await {
+    match session::create(state, browser, &req.imdb, req.filename.as_deref(), req.scout.as_deref()).await {
         Ok(s) => httputil::json(
             StatusCode::CREATED,
             &serde_json::json!({
@@ -411,12 +418,15 @@ async fn run(cfg: Config) -> std::io::Result<()> {
     let listener = TcpListener::bind(("0.0.0.0", state.cfg.port)).await?;
     let on = |b: bool| if b { "on" } else { "off" };
     eprintln!(
-        "den-remux {} listening on :{} — metrics={} log_requests={} scout={} browser_keys={} url_key={} \
+        "den-remux {} listening on :{} — metrics={} log_requests={} scout_origins={} scout_key={} scout_install={} \
+         browser_keys={} url_key={} \
          max_sessions={} idle={}s scratch={} scratch_max={} ffmpeg={}",
         env!("CARGO_PKG_VERSION"),
         state.cfg.port,
         on(state.cfg.metrics_token.is_some()),
         on(state.cfg.log_requests),
+        state.cfg.scout_origins.len(),
+        on(state.cfg.scout_key.is_some()),
         on(state.cfg.scout_install_url.is_some()),
         state.cfg.browser_key_hashes.len(),
         if state.cfg.url_key_ephemeral { "ephemeral" } else { "set" },

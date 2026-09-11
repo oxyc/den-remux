@@ -20,6 +20,9 @@ const TOMBSTONES_MAX: usize = 1024;
 pub struct AppState {
     pub cfg: Config,
     pub http: reqwest::Client,
+    /// For requests to scout: follows no redirect, so the service key cannot be carried off scout's
+    /// origin (`scout::resolve` follows them by hand).
+    pub scout_http: reqwest::Client,
     sessions: Mutex<HashMap<String, Arc<Session>>>,
     /// Ended sessions and the expiry their URLs were signed with.
     tombstones: Mutex<HashMap<String, u64>>,
@@ -43,16 +46,20 @@ impl Drop for Slot<'_> {
 
 impl AppState {
     pub fn new(cfg: Config) -> Arc<AppState> {
-        let http = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(10))
-            // Scout may spend its whole scrape timeout on a slow indexer before it answers a list.
-            .timeout(Duration::from_secs(60))
-            .user_agent(concat!("den-remux/", env!("CARGO_PKG_VERSION")))
-            .build()
-            .expect("reqwest client");
+        let client = |redirects: reqwest::redirect::Policy| {
+            reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(10))
+                // Scout may spend its whole scrape timeout on a slow indexer before it answers a list.
+                .timeout(Duration::from_secs(60))
+                .user_agent(concat!("den-remux/", env!("CARGO_PKG_VERSION")))
+                .redirect(redirects)
+                .build()
+                .expect("reqwest client")
+        };
         Arc::new(AppState {
             cfg,
-            http,
+            http: client(reqwest::redirect::Policy::default()),
+            scout_http: client(reqwest::redirect::Policy::none()),
             sessions: Mutex::new(HashMap::new()),
             tombstones: Mutex::new(HashMap::new()),
             creating: AtomicUsize::new(0),
