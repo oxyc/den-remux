@@ -401,12 +401,13 @@ where
         subtitle_languages: Vec<String>,
         #[serde(default)]
         video_codecs: Vec<String>,
+        playable: Option<session::Playable>,
     }
     let Some(req) = read_body(body).await.and_then(|b| serde_json::from_slice::<Create>(&b).ok()) else {
         return bad_request(
             "Expected {\"imdb\": \"tt…\", \"season\"?: n, \"episode\"?: n, \"filename\"?: \"…\", \"scout\"?: \"…\", \
              \"audio\"?: [\"en\", …], \"audioTrack\"?: n, \"subtitles\"?: \"…\", \"subtitleLanguages\"?: [\"en\", …], \
-             \"videoCodecs\"?: [\"h264\", \"hevc\"]}.",
+             \"videoCodecs\"?: [\"h264\", \"hevc\"], \"playable\"?: {\"h264\", \"hevcMain\", \"hevcMain10\", \"hdr\"}}.",
         );
     };
     // A logged-in browser, or — with no cookie — whoever holds the scout install the request names: that
@@ -444,6 +445,7 @@ where
         subtitles: req.subtitles.as_deref(),
         subtitle_languages: &req.subtitle_languages,
         video_codecs: &req.video_codecs,
+        playable: req.playable.as_ref(),
     };
     match session::create(state, admission, &want).await {
         Ok(s) => httputil::json(

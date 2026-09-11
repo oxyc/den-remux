@@ -710,6 +710,54 @@ pub struct Want<'a> {
     /// The video codecs the player takes (`h264`, `hevc`); empty is both. Without HEVC, H.264 releases
     /// are tried first and an HEVC one is transcoded on the GPU.
     pub video_codecs: &'a [String],
+    /// What the player decodes, level by level; when given, it decides over `video_codecs`.
+    pub playable: Option<&'a Playable>,
+}
+
+/// What the player decodes, as its own tests found (`playable` in `POST /remux/session`): the highest level it
+/// takes of H.264 (`level_idc`), 8-bit and 10-bit HEVC (`general_level_idc`, level × 30), 0 for none, and whether
+/// it decodes PQ HDR. An HEVC release beyond it is transcoded on the GPU; an H.264 one is passed over.
+#[derive(serde::Deserialize, Clone, Copy, Debug, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct Playable {
+    pub h264: u16,
+    pub hevc_main: u16,
+    pub hevc_main10: u16,
+    pub hdr: bool,
+}
+
+impl Playable {
+    /// Whether the player takes this video as it is. A level the file doesn't name is taken: refusing it would
+    /// refuse every release without a codec record.
+    pub fn takes(&self, info: &crate::probe::MediaInfo) -> bool {
+        let named = info.codecs.as_deref().and_then(crate::probe::profile_level);
+        let fits = |max: u16| max > 0 && named.is_none_or(|(_, level)| level <= max);
+        match info.video {
+            VideoCodec::H264 => fits(self.h264),
+            VideoCodec::Hevc => {
+                let max = match named.map(|(profile, _)| profile) {
+                    Some(1) | None => self.hevc_main.max(self.hevc_main10),
+                    Some(2) => self.hevc_main10,
+                    Some(_) => 0,
+                };
+                fits(max) && (!info.hdr || self.hdr)
+            }
+            VideoCodec::Other(_) => false,
+        }
+    }
+
+    fn takes_hevc(&self) -> bool {
+        self.hevc_main > 0 || self.hevc_main10 > 0
+    }
+}
+
+/// Whether the player takes the release's video as it is: by `playable`, else by `videoCodecs`, which can only say
+/// that it takes no HEVC.
+fn plays(want: &Want<'_>, takes_hevc: bool, info: &crate::probe::MediaInfo) -> bool {
+    match want.playable {
+        Some(p) => p.takes(info),
+        None => info.video != VideoCodec::Hevc || takes_hevc,
+    }
 }
 
 /// A transcode's output size: the source's, fitted inside `TRANSCODE_WIDTH` × `TRANSCODE_HEIGHT` with its
@@ -841,6 +889,7 @@ pub async fn create(
             .video_codecs
             .iter()
             .any(|c| matches!(c.to_ascii_lowercase().as_str(), "hevc" | "h265" | "hvc1" | "hev1"));
+    let takes_hevc = want.playable.map_or(takes_hevc, Playable::takes_hevc);
     if !takes_hevc {
         scout::h264_first(&mut candidates);
     }
@@ -855,20 +904,28 @@ pub async fn create(
                 c.attributes.label,
                 info.dolby_vision.map(|dv| dv.to_string()).unwrap_or_default()
             ),
-            // HEVC for a player without it: only on the GPU, and only while a transcode is free.
-            Ok((r, info)) if info.video == VideoCodec::Hevc && !takes_hevc => match st.reserve_transcode() {
-                Some(slot) => {
-                    chosen = Some((c, (r, info), Some(slot)));
-                    break;
+            // HEVC the player can't take as it is: only on the GPU, and only while a transcode is free.
+            Ok((r, info)) if info.video == VideoCodec::Hevc && !plays(want, takes_hevc, &info) => {
+                match st.reserve_transcode() {
+                    Some(slot) => {
+                        chosen = Some((c, (r, info), Some(slot)));
+                        break;
+                    }
+                    None => {
+                        no_transcode = true;
+                        eprintln!(
+                            "session: {imdb} skipped \"{}\": HEVC it can't play, and no transcode free",
+                            c.attributes.label
+                        );
+                    }
                 }
-                None => {
-                    no_transcode = true;
-                    eprintln!(
-                        "session: {imdb} skipped \"{}\": HEVC, and no transcode free",
-                        c.attributes.label
-                    );
-                }
-            },
+            }
+            // H.264 beyond the player: nothing here makes it smaller.
+            Ok((_, info)) if !plays(want, takes_hevc, &info) => eprintln!(
+                "session: {imdb} skipped \"{}\": {} is beyond this player",
+                c.attributes.label,
+                info.codecs.as_deref().unwrap_or("its video")
+            ),
             Ok(found) => {
                 chosen = Some((c, found, None));
                 break;
@@ -1045,6 +1102,37 @@ mod tests {
     }
 
     const SEG: Segment = Segment { start: 8.0, end: 13.0 };
+
+    fn info(video: VideoCodec, codecs: &str, hdr: bool) -> crate::probe::MediaInfo {
+        crate::probe::MediaInfo {
+            container: "matroska",
+            duration: 1.0,
+            video,
+            codecs: Some(codecs.into()),
+            width: 3840,
+            height: 2160,
+            hdr,
+            dolby_vision: None,
+            audio: Vec::new(),
+            keyframes: vec![0.0],
+        }
+    }
+
+    #[test]
+    fn a_player_takes_what_its_levels_and_hdr_allow() {
+        let phone = Playable { h264: 0x33, hevc_main: 153, hevc_main10: 153, hdr: true };
+        let hobbit = info(VideoCodec::Hevc, "hvc1.2.4.L153.B0", true);
+        assert!(phone.takes(&hobbit));
+        assert!(!Playable { hdr: false, ..phone }.takes(&hobbit), "HDR it can't decode is converted");
+        assert!(!Playable { hevc_main10: 0, ..phone }.takes(&hobbit), "8-bit HEVC only");
+        assert!(!Playable { hevc_main10: 123, ..phone }.takes(&hobbit), "1080p at most");
+        let sdr_1080 = info(VideoCodec::Hevc, "hvc1.1.6.L120.90", false);
+        assert!(Playable { hevc_main10: 0, ..phone }.takes(&sdr_1080), "8-bit 1080p");
+        let firefox = Playable { h264: 0x33, ..Playable::default() };
+        assert!(firefox.takes(&info(VideoCodec::H264, "avc1.640029", false)));
+        assert!(!firefox.takes(&hobbit) && !firefox.takes_hevc());
+        assert!(!Playable { h264: 0x29, ..firefox }.takes(&info(VideoCodec::H264, "avc1.640033", false)));
+    }
 
     #[test]
     fn a_segment_is_ready_once_its_gops_cover_it() {

@@ -195,6 +195,25 @@ pub fn avc_codecs(avcc: &[u8]) -> Option<String> {
     (avcc.len() >= 4 && avcc[0] == 1).then(|| format!("avc1.{:02x}{:02x}{:02x}", avcc[1], avcc[2], avcc[3]))
 }
 
+/// The profile and level an RFC 6381 string names: `avc1.640033` is (100, 51), level 5.1 as `level_idc`;
+/// `hvc1.2.4.L153.B0` is (2, 153), Main 10 at level 5.1 as `general_level_idc` (level × 30).
+pub fn profile_level(codecs: &str) -> Option<(u8, u16)> {
+    let mut parts = codecs.split('.');
+    match parts.next()? {
+        "avc1" | "avc3" => {
+            let p = parts.next()?;
+            let byte = |i: usize| u8::from_str_radix(p.get(i..i + 2)?, 16).ok();
+            Some((byte(0)?, byte(4)? as u16))
+        }
+        "hvc1" | "hev1" => {
+            let profile = parts.next()?.trim_start_matches(['A', 'B', 'C']).parse().ok()?;
+            let level = parts.nth(1)?.get(1..)?.parse().ok()?;
+            Some((profile, level))
+        }
+        _ => None,
+    }
+}
+
 /// `hvc1.<space><profile>.<compat>.<tier><level>.<constraints>` from an `hvcC` record, per ISO/IEC
 /// 14496-15 annex E: the compatibility flags bit-reversed in hex, trailing zero constraint bytes
 /// dropped.
@@ -235,6 +254,16 @@ mod tests {
         // High tier.
         let high = [1, 0x22, 0x20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 153];
         assert_eq!(hevc_codecs(&high).as_deref(), Some("hvc1.2.4.H153"));
+    }
+
+    #[test]
+    fn a_codec_string_names_its_profile_and_level() {
+        assert_eq!(profile_level("avc1.640033"), Some((100, 51)));
+        assert_eq!(profile_level("hvc1.2.4.L153.B0"), Some((2, 153)));
+        assert_eq!(profile_level("hvc1.1.6.L93.90"), Some((1, 93)));
+        assert_eq!(profile_level("hev1.A1.60.H120"), Some((1, 120)));
+        assert_eq!(profile_level("mp4a.40.2"), None);
+        assert_eq!(profile_level("hvc1.2"), None);
     }
 
     #[test]

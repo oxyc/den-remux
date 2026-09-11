@@ -17,7 +17,7 @@ This is the MVP ("phase 2") of oxyc/den#11: movies and episodes, cached releases
 ```
 POST   /remux/login                     {key} → 204 + Set-Cookie; 401 bad_key · 429 rate_limited
 POST   /remux/session                   {imdb, season?, episode?, filename?, scout?, audio?, audioTrack?,
-                                         subtitles?, subtitleLanguages?, videoCodecs?} (a full scout install,
+                                         subtitles?, subtitleLanguages?, videoCodecs?, playable?} (a full scout install,
                                          or the cookie) → 201
                                         {sid, playlist, release:{label,filename,size}, duration, expiresAt,
                                          video:{codec,transcoded}, audioTrack, audioTracks, subtitles}
@@ -58,6 +58,11 @@ anything else                           404 {"error":"not_found"}
   Chromecast); empty is H.264 and HEVC. Without HEVC, H.264 releases are tried first, and an HEVC-only
   title is transcoded to H.264 on the GPU (Hardware transcode, below) — or refused with
   `transcode_unavailable` while transcoding is off or in use.
+- **What the player decodes.** `playable` — `{h264, hevcMain, hevcMain10, hdr}`, the highest level it takes of
+  H.264 (`level_idc`, 0x33 is 5.1) and of 8-bit and 10-bit HEVC (level × 30, 153 is 5.1), 0 for none, and whether
+  it decodes PQ HDR — decides over `videoCodecs` when given. A release is probed first and its own codec string
+  compared: an HEVC one beyond the player (10-bit, 4K, or HDR it can't decode) is transcoded, an H.264 one passed
+  over.
 
 `/remux/s/…` responses carry `Access-Control-Allow-Origin: *`, allow `Range` and expose
 `Content-Range`/`Content-Length` — a Cast receiver's page is on Google's origin. Playlists are
@@ -239,7 +244,7 @@ dependabot cannot bump it, so bump both lines by hand.
 
 ### Hardware transcode
 
-For a player without HEVC (`videoCodecs` without it), an HEVC release is decoded, scaled and — HDR10 or
+For a player without HEVC, or without the HEVC a release needs (`playable`), an HEVC release is decoded, scaled and — HDR10 or
 HLG — tone-mapped on the box's UHD 630, and encoded to H.264 High 4.1 there (VAAPI, the `h264_vaapi`
 encoder), fitted inside 1920 × 1080 at 8 Mbit/s (12 max). `-force_key_frames source` puts an output
 keyframe on every source keyframe, so the GOPs, the playlist and the joining are exactly a copy's; the
