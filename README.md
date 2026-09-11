@@ -64,6 +64,11 @@ anything else                           404 {"error":"not_found"}
   decides over `videoCodecs` when given. A release is probed first and its own codec string
   compared: an HEVC one beyond the player (10-bit, 4K, or HDR it can't decode) is transcoded, an H.264 one passed
   over.
+- **Which release.** Scout ranks for a TV, best first; here it is re-ranked for a phone or a laptop, often over
+  the tailnet: 1080p before 720p or unnamed before 4K, and within each a web release before a remux and one
+  without Dolby Vision before one with (scout's order holds within each). Of the first three that probe, the
+  first that plays as it is wins; one that plays only converted is the last resort. A named `filename` (another
+  audio track of the release playing) goes first and is kept, converted if need be.
 
 `/remux/s/…` responses carry `Access-Control-Allow-Origin: *`, allow `Range` and expose
 `Content-Range`/`Content-Length` — a Cast receiver's page is on Google's origin. Playlists are

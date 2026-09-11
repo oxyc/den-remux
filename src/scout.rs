@@ -3,9 +3,9 @@
 //! A session's releases come from the scout install the web app names — its library's full install URL,
 //! or, for a logged-in browser, a scope=availability one that scout honours only with `X-Den-Remux-Key` —
 //! or, as a fallback, this service's own `SCOUT_INSTALL_URL`. The browser never gets a ticket or a debrid link: it asks for a
-//! title and gets back a signed session for one release. Scout's ranking is kept as-is:
-//! the first release that is cached on the debrid, in a codec the browser can take copied, and that
-//! probes cleanly, wins.
+//! title and gets back a signed session for one release. Scout's ranking is re-ranked for a phone
+//! (`phone_first`), and the first release that is cached on the debrid, probes cleanly and plays in the browser
+//! as it is wins; one it can only have converted is the last resort.
 
 use serde::Deserialize;
 
@@ -99,9 +99,10 @@ fn remuxable(s: &Stream) -> bool {
 }
 
 /// The releases worth trying, in the order to try them: the one the browser named first when it is
-/// playable here, then scout's order.
+/// playable here, then scout's order as `phone_first` ranks it.
 pub fn candidates(streams: &[Stream], filename: Option<&str>) -> Vec<Stream> {
     let mut out: Vec<Stream> = streams.iter().filter(|s| remuxable(s)).cloned().collect();
+    phone_first(&mut out);
     if let Some(want) = filename {
         if let Some(i) = out.iter().position(|s| s.filename() == want) {
             let chosen = out.remove(i);
@@ -109,6 +110,24 @@ pub fn candidates(streams: &[Stream], filename: Option<&str>) -> Vec<Stream> {
         }
     }
     out
+}
+
+/// Scout ranks for a TV, best first. Playback here is a phone's or a laptop's, often over the tailnet from outside
+/// the house, so a 1080p release comes before a 720p or unnamed one and those before 4K, and within each a web
+/// release before a remux and one without Dolby Vision before one with: smaller, and far more often in a form a
+/// browser plays as it is, where a UHD Blu-ray remux is High tier HEVC it can only have converted. Stable, so
+/// scout's order holds within each.
+pub fn phone_first(c: &mut [Stream]) {
+    c.sort_by_key(|s| {
+        let text = format!("{} {}", s.attributes.label, s.filename()).to_ascii_lowercase();
+        let has = |words: &[&str]| words.iter().any(|w| text.contains(w));
+        let resolution = match () {
+            _ if has(&["2160p", "4k", "uhd"]) => 2,
+            _ if has(&["1080p"]) => 0,
+            _ => 1,
+        };
+        (resolution, has(&["remux"]), has(&["dolby vision", "dovi", ".dv.", " dv "]))
+    });
 }
 
 /// For a player that cannot take HEVC: H.264 releases first, then those scout named no codec for, then
@@ -298,11 +317,44 @@ mod tests {
         assert_eq!(
             names,
             [
-                "Film.2019.2160p.UHD.BluRay.REMUX.HEVC.TrueHD.7.1.mkv",
                 "Film.2019.1080p.WEB-DL.DDP5.1.H.264.mkv",
                 "Film.2019.1080p.BluRay.mkv",
+                "Film.2019.2160p.UHD.BluRay.REMUX.HEVC.TrueHD.7.1.mkv",
             ],
-            "scout's order, minus uncached, cache-unknown, AV1, XviD, AVI and 3D"
+            "scout's order ranked for a phone, minus uncached, cache-unknown, AV1, XviD, AVI and 3D"
+        );
+    }
+
+    #[test]
+    fn a_phone_gets_1080p_before_4k_and_web_before_remux_or_dolby_vision() {
+        let stream = |label: &str| Stream {
+            title: String::new(),
+            url: String::new(),
+            attributes: Attributes { label: label.into(), ..Attributes::default() },
+            hints: Hints::default(),
+        };
+        let mut c: Vec<Stream> = [
+            "4K • REMUX • Dolby Vision • Atmos • 75 GB",
+            "4K • WEB-DL • 18 GB",
+            "1080p • REMUX • 30 GB",
+            "1080p • WEB-DL • Dolby Vision • 6 GB",
+            "720p • WEB-DL • 2 GB",
+            "1080p • WEB-DL • 4 GB",
+        ]
+        .map(stream)
+        .to_vec();
+        phone_first(&mut c);
+        let labels: Vec<&str> = c.iter().map(|s| s.attributes.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            [
+                "1080p • WEB-DL • 4 GB",
+                "1080p • WEB-DL • Dolby Vision • 6 GB",
+                "1080p • REMUX • 30 GB",
+                "720p • WEB-DL • 2 GB",
+                "4K • WEB-DL • 18 GB",
+                "4K • REMUX • Dolby Vision • Atmos • 75 GB",
+            ]
         );
     }
 
@@ -319,8 +371,11 @@ mod tests {
         let pick = candidates(&fixture(), Some("Film.2019.1080p.BluRay.mkv"));
         assert_eq!(pick[0].filename(), "Film.2019.1080p.BluRay.mkv");
         assert_eq!(pick.len(), 3, "the others stay as fallbacks");
-        // Named but uncached: scout's best cached one instead.
+        // Named but uncached: the best cached one for a phone instead.
         let pick = candidates(&fixture(), Some("Film.2019.1080p.WEB.x264-UNCACHED.mkv"));
+        assert_eq!(pick[0].filename(), "Film.2019.1080p.WEB-DL.DDP5.1.H.264.mkv");
+        // Named 4K: it still goes first, ahead of the ranking.
+        let pick = candidates(&fixture(), Some("Film.2019.2160p.UHD.BluRay.REMUX.HEVC.TrueHD.7.1.mkv"));
         assert_eq!(pick[0].filename(), "Film.2019.2160p.UHD.BluRay.REMUX.HEVC.TrueHD.7.1.mkv");
     }
 

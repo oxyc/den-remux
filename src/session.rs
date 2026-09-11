@@ -899,6 +899,8 @@ pub async fn create(
     }
     let mut chosen = None;
     let mut no_transcode = false;
+    // The first release that plays only converted: the last resort, taken once nothing tried plays as it is.
+    let mut fallback = None;
     for c in candidates.iter().take(MAX_TRIES) {
         match open(st, &source, c).await {
             // Dolby Vision profile 5 has no base layer to fall back to: stripped or transcoded, its picture is
@@ -908,20 +910,21 @@ pub async fn create(
                 c.attributes.label,
                 info.dolby_vision.map(|dv| dv.to_string()).unwrap_or_default()
             ),
-            // HEVC the player can't take as it is: only on the GPU, and only while a transcode is free.
+            // HEVC the player can't take as it is plays only converted on the GPU: kept as the last resort while
+            // the rest are looked through for one that plays untouched — unless the player named this release
+            // (another audio track of it), which it keeps.
             Ok((r, info)) if info.video == VideoCodec::Hevc && !plays(want, takes_hevc, &info) => {
-                match st.reserve_transcode() {
-                    Some(slot) => {
-                        chosen = Some((c, (r, info), Some(slot)));
-                        break;
-                    }
-                    None => {
-                        no_transcode = true;
-                        eprintln!(
-                            "session: {imdb} skipped \"{}\": HEVC it can't play, and no transcode free",
-                            c.attributes.label
-                        );
-                    }
+                eprintln!(
+                    "session: {imdb} \"{}\" ({}) plays here only converted",
+                    c.attributes.label,
+                    info.codecs.as_deref().unwrap_or("HEVC")
+                );
+                let named = want.filename == Some(c.filename());
+                if fallback.is_none() {
+                    fallback = Some((c, (r, info)));
+                }
+                if named {
+                    break;
                 }
             }
             // H.264 beyond the player: nothing here makes it smaller.
@@ -939,6 +942,20 @@ pub async fn create(
                 c.attributes.label,
                 crate::redact::scrub(&why, &secrets)
             ),
+        }
+    }
+    if chosen.is_none() {
+        if let Some((c, found)) = fallback {
+            match st.reserve_transcode() {
+                Some(slot) => chosen = Some((c, found, Some(slot))),
+                None => {
+                    no_transcode = true;
+                    eprintln!(
+                        "session: {imdb} skipped \"{}\": it needs converting, and no transcode is free",
+                        c.attributes.label
+                    );
+                }
+            }
         }
     }
     let Some((c, (resolved, info), transcode)) = chosen else {
