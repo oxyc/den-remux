@@ -147,11 +147,10 @@ pub fn args(spec: &Spec<'_>, ca_file: Option<&str>) -> Vec<String> {
                 false => scale,
             };
             a.extend(["-vf".to_string(), vf]);
+            // The output says it is SDR because `tonemap_vaapi` says so on every frame it makes. Naming the
+            // colours here as well (`-colorspace bt709` and its two) instead breaks the graph — "Error
+            // reinitializing filters!", and the encoder never opens.
             a.extend(s(&["-c:v", "h264_vaapi", "-profile:v", "high", "-level:v", "4.1"]));
-            // Say plainly that what comes out is SDR. H.264 tagged BT.2020 and PQ is HDR H.264, which Apple's
-            // decoders don't have and refuse outright — the tone-mapped picture would otherwise keep the source's
-            // tags where ffmpeg copies them from the input stream.
-            a.extend(s(&["-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709"]));
             let rate = format!("{}", TRANSCODE_BITRATE);
             a.extend(s(&["-b:v", &rate, "-maxrate", TRANSCODE_MAXRATE, "-bufsize", TRANSCODE_BUFSIZE]));
             // Keyframes where the source has them, and no others the encoder would add on its own.
@@ -417,9 +416,7 @@ mod tests {
         for want in [
             "-hwaccel vaapi -hwaccel_device /dev/dri/renderD128 -hwaccel_output_format vaapi -ss 13.135000 -i /f.mkv",
             "-vf tonemap_vaapi=format=nv12:t=bt709:m=bt709:p=bt709,scale_vaapi=w=1920:h=800:format=nv12",
-            "-c:v h264_vaapi -profile:v high -level:v 4.1",
-            "-colorspace bt709 -color_primaries bt709 -color_trc bt709",
-            "-b:v 8000000 -maxrate 12M",
+            "-c:v h264_vaapi -profile:v high -level:v 4.1 -b:v 8000000 -maxrate 12M",
             "-force_key_frames source",
             "-f hls -hls_time 0",
         ] {
