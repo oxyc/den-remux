@@ -295,7 +295,7 @@ impl Session {
                     device: st.cfg.vaapi_device.to_string_lossy().into_owned(),
                     width,
                     height,
-                    tonemap: self.info.hdr,
+                    tonemap: tonemaps(&self.info),
                 }
             }
             false => job::Video::Copy {
@@ -764,6 +764,13 @@ impl Playable {
     }
 }
 
+/// Whether a transcode of this release has to tone-map it to SDR. The container's transfer says so where it is
+/// written down — a UHD Blu-ray remux often leaves Matroska's Colour element out — and Dolby Vision says so too:
+/// its base layer is HDR10 or HLG, except profile 8.2's, which is already SDR.
+fn tonemaps(info: &crate::probe::MediaInfo) -> bool {
+    info.hdr || info.dolby_vision.is_some_and(|dv| dv.compat != 2)
+}
+
 /// Whether the player takes the release's video as it is: by `playable`, else by `videoCodecs`, which can only say
 /// that it takes no HEVC.
 fn plays(want: &Want<'_>, takes_hevc: bool, info: &crate::probe::MediaInfo) -> bool {
@@ -1112,7 +1119,12 @@ pub async fn create(
         session.info.video,
         codecs,
         dv.unwrap_or_default(),
-        if session.transcoded { " → H.264 on the GPU" } else { "" },
+        match (session.transcoded, tonemaps(&session.info)) {
+            (true, true) => " → H.264 SDR on the GPU",
+            (true, false) => " → H.264 on the GPU",
+            (false, true) => ", HDR",
+            (false, false) => "",
+        },
         session.info.duration,
         session.info.keyframes.len(),
         session.segments.len(),

@@ -255,9 +255,11 @@ dependabot cannot bump it, so bump both lines by hand.
 
 ### Hardware transcode
 
-For a player without HEVC, or without the HEVC a release needs (`playable`), an HEVC release is decoded, scaled and — HDR10 or
-HLG — tone-mapped on the box's UHD 630, and encoded to H.264 High 4.1 there (VAAPI, the `h264_vaapi`
-encoder), fitted inside 1920 × 1080 at 8 Mbit/s (12 max). `-force_key_frames source` puts an output
+For a player without HEVC, or without the HEVC a release needs (`playable`), an HEVC release is decoded, scaled
+and — HDR10, HLG or Dolby Vision — tone-mapped on the box's UHD 630, and encoded to H.264 High 4.1 there (VAAPI,
+the `h264_vaapi` encoder), fitted inside 1920 × 1080 at 8 Mbit/s (12 max), tagged BT.709: H.264 tagged BT.2020
+and PQ is HDR H.264, which Apple's decoders refuse. A UHD Blu-ray remux often leaves Matroska's Colour element
+out, so Dolby Vision counts as HDR too — its base layer is HDR10 or HLG, except profile 8.2's, already SDR. `-force_key_frames source` puts an output
 keyframe on every source keyframe, so the GOPs, the playlist and the joining are exactly a copy's; the
 audio and subtitles are unchanged.
 
