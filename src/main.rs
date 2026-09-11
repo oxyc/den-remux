@@ -1,0 +1,552 @@
+//! den-remux — Den's playback for browsers, AirPlay and Cast receivers.
+//!
+//!   POST /remux/login   {key}               → cookie for creating sessions
+//!   POST /remux/session {imdb, filename?}   → a signed session: /remux/s/<sid>/<sig>/master.m3u8
+//!   GET  /remux/s/<sid>/<sig>/…             → HLS (fMP4): master, media, init.mp4, seg<N>.m4s
+//!   DELETE /remux/s/<sid>/<sig>             → end it (410 from then on)
+//!   GET  /health, /metrics
+//!
+//! A release comes from this service's own server-held den-scout install. Its video is copied, its
+//! audio re-encoded to AAC stereo, and it is served as a VOD playlist cut on its own keyframes.
+
+mod auth;
+mod config;
+mod httputil;
+mod job;
+mod playlist;
+mod probe;
+mod redact;
+mod scout;
+mod session;
+mod state;
+
+#[cfg(test)]
+mod tests;
+
+use std::convert::Infallible;
+use std::future::Future;
+use std::sync::atomic::Ordering::Relaxed;
+use std::sync::Arc;
+use std::time::Duration;
+
+use bytes::Bytes;
+use http_body_util::BodyExt;
+use hyper::service::service_fn;
+use hyper::{Method, Request, Response, StatusCode};
+use hyper_util::rt::{TokioIo, TokioTimer};
+use hyper_util::server::graceful::GracefulShutdown;
+use serde::Deserialize;
+use tokio::net::TcpListener;
+
+use crate::config::Config;
+use crate::httputil::Body;
+use crate::state::{unix_now, AppState};
+
+/// How often one failure condition may write a line.
+const LOG_EVERY: Duration = Duration::from_secs(60);
+
+/// Log a failure at most once per `LOG_EVERY` per `condition`, saying how many were held back — the
+/// log is for state changes, and in an outage every request fails the same way. den-reel's helper.
+pub fn log_limited(condition: &str, line: impl FnOnce() -> String) {
+    static SEEN: std::sync::Mutex<Vec<(String, std::time::Instant, u32)>> = std::sync::Mutex::new(Vec::new());
+    let now = std::time::Instant::now();
+    let held = {
+        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        match seen.iter_mut().find(|(c, _, _)| c == condition) {
+            Some((_, at, held)) if now.duration_since(*at) < LOG_EVERY => {
+                *held += 1;
+                return;
+            }
+            Some((_, at, held)) => {
+                *at = now;
+                std::mem::take(held)
+            }
+            None => {
+                seen.push((condition.to_string(), now, 0));
+                0
+            }
+        }
+    };
+    match held {
+        0 => eprintln!("{}", line()),
+        n => eprintln!("{} ({n} more like it since the last line)", line()),
+    }
+}
+
+/// The /health verdict: `None` when ok, else the first reason sessions cannot work and what to do.
+fn health_verdict(state: &AppState) -> Option<(&'static str, &'static str)> {
+    if !state.ffmpeg_ok.load(Relaxed) {
+        Some((
+            "ffmpeg_unavailable",
+            "ffmpeg is missing or lacks matroska/mov/hls/aac/https — check FFMPEG_PATH and the image",
+        ))
+    } else if !state.scratch_ok.load(Relaxed) {
+        Some(("scratch_unwritable", "SCRATCH_DIR cannot be written — check the volume and its owner (65532)"))
+    } else if state.cfg.scout_install_url.is_none() {
+        Some(("scout_unconfigured", "set SCOUT_INSTALL_URL to this service's own den-scout install"))
+    } else if state.cfg.browser_key_hashes.is_empty() {
+        Some(("no_browser_keys", "set BROWSER_KEY_HASHES, or no browser can log in"))
+    } else if state.cfg.url_key_ephemeral {
+        Some(("url_key_ephemeral", "set REMUX_URL_KEY, or every restart logs the browsers out"))
+    } else {
+        None
+    }
+}
+
+fn health_body(state: &AppState) -> serde_json::Value {
+    match health_verdict(state) {
+        Some((reason, detail)) => {
+            serde_json::json!({"status": "degraded", "reason": reason, "detail": detail})
+        }
+        None => serde_json::json!({"status": "ok"}),
+    }
+}
+
+/// Only with a configured token presented as `Authorization: Bearer <token>`, compared in constant
+/// time — how every Den addon gates it.
+fn metrics_authorized(state: &AppState, headers: &hyper::HeaderMap) -> bool {
+    use subtle::ConstantTimeEq;
+    let Some(token) = state.cfg.metrics_token.as_deref() else { return false };
+    let presented = headers
+        .get(hyper::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(str::trim);
+    presented.is_some_and(|p| p.as_bytes().ct_eq(token.as_bytes()).into())
+}
+
+/// Prometheus text, by hand. Every number is an atomic or a map length; nothing walks the disk.
+fn metrics_body(state: &AppState) -> String {
+    use std::fmt::Write;
+    let mut b = String::with_capacity(2048);
+    let mut metric = |name: &str, kind: &str, help: &str, labels: &str, v: u64| {
+        let _ = writeln!(b, "# HELP {name} {help}\n# TYPE {name} {kind}\n{name}{labels} {v}");
+    };
+    metric(
+        "remux_build_info",
+        "gauge",
+        "The running build.",
+        concat!("{version=\"", env!("CARGO_PKG_VERSION"), "\"}"),
+        1,
+    );
+    metric("remux_sessions", "gauge", "Sessions playing now.", "", state.sessions().len() as u64);
+    metric("remux_sessions_max", "gauge", "MAX_SESSIONS.", "", state.cfg.max_sessions as u64);
+    metric(
+        "remux_ffmpeg_running",
+        "gauge",
+        "ffmpeg processes alive (running or paused).",
+        "",
+        job::live_groups() as u64,
+    );
+    metric(
+        "remux_scratch_bytes",
+        "gauge",
+        "Bytes of GOP files on the scratch volume.",
+        "",
+        state.scratch_bytes.load(Relaxed),
+    );
+    metric("remux_scratch_max_bytes", "gauge", "SCRATCH_MAX_BYTES.", "", state.cfg.scratch_max_bytes);
+    metric(
+        "remux_sessions_started_total",
+        "counter",
+        "Sessions created since start.",
+        "",
+        state.sessions_started.load(Relaxed),
+    );
+    metric(
+        "remux_ffmpeg_runs_total",
+        "counter",
+        "ffmpeg runs started since start, restarts included.",
+        "",
+        state.jobs_started.load(Relaxed),
+    );
+    b
+}
+
+/// The CORS a receiver needs on a session's files: any origin (a Cast receiver's is Google's), and
+/// `Range` allowed with `Content-Range` readable.
+fn add_cors(resp: &mut Response<Body>) {
+    use hyper::header::HeaderValue;
+    let h = resp.headers_mut();
+    h.insert("access-control-allow-origin", HeaderValue::from_static("*"));
+    h.insert("access-control-allow-methods", HeaderValue::from_static("GET, HEAD, DELETE, OPTIONS"));
+    h.insert("access-control-allow-headers", HeaderValue::from_static("Range, X-Request-Id"));
+    h.insert("access-control-expose-headers", HeaderValue::from_static("Content-Range, Content-Length"));
+    h.insert("access-control-max-age", HeaderValue::from_static("86400"));
+}
+
+pub async fn handle_request<B>(state: Arc<AppState>, req: Request<B>) -> Response<Body>
+where
+    B: hyper::body::Body<Data = Bytes> + Send + 'static,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    let start = std::time::Instant::now();
+    let (parts, body) = req.into_parts();
+    let mut resp = route(&state, &parts, body).await;
+    // Only the session files are readable cross-origin. Login and session creation are same-origin
+    // (the web app), and a wildcard there would invite every site to try.
+    if parts.uri.path().starts_with("/remux/s/") {
+        add_cors(&mut resp);
+    }
+    if state.cfg.log_requests {
+        let mut line = format!(
+            "{} {} {} {}ms",
+            parts.method,
+            redact::path(parts.uri.path()),
+            resp.status().as_u16(),
+            start.elapsed().as_millis()
+        );
+        if let Some(rid) = redact::request_id(&parts.headers) {
+            line.push_str(" rid=");
+            line.push_str(&rid);
+        }
+        eprintln!("{line}");
+    }
+    resp
+}
+
+fn method_not_allowed(allow: &str) -> Response<Body> {
+    httputil::json(
+        StatusCode::METHOD_NOT_ALLOWED,
+        &serde_json::json!({"error": "method_not_allowed"}),
+        &[("allow", allow)],
+    )
+}
+
+async fn route<B>(state: &Arc<AppState>, parts: &hyper::http::request::Parts, body: B) -> Response<Body>
+where
+    B: hyper::body::Body<Data = Bytes> + Send + 'static,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    let path = parts.uri.path();
+    let get = matches!(parts.method, Method::GET | Method::HEAD);
+    match path {
+        "/health" if get => httputil::json(StatusCode::OK, &health_body(state), &[]),
+        "/metrics" if get => {
+            if !metrics_authorized(state, &parts.headers) {
+                return httputil::not_found();
+            }
+            let body = metrics_body(state);
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "text/plain; version=0.0.4; charset=utf-8")
+                .header("content-length", body.len())
+                .header("cache-control", "no-store")
+                .body(httputil::full(body))
+                .unwrap()
+        }
+        "/health" | "/metrics" => method_not_allowed("GET, HEAD"),
+        "/remux/login" if parts.method == Method::POST => login(state, body).await,
+        "/remux/session" if parts.method == Method::POST => create_session(state, parts, body).await,
+        "/remux/login" | "/remux/session" => method_not_allowed("POST"),
+        _ => match path.strip_prefix("/remux/s/") {
+            Some(rest) => session_route(state, parts, rest).await,
+            None => httputil::not_found(),
+        },
+    }
+}
+
+/// A small JSON request body; `None` if it is larger than any real request.
+async fn read_body<B>(body: B) -> Option<Bytes>
+where
+    B: hyper::body::Body<Data = Bytes> + Send + 'static,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    http_body_util::Limited::new(body, 4096).collect().await.ok().map(|c| c.to_bytes())
+}
+
+fn bad_request(detail: &str) -> Response<Body> {
+    httputil::error(StatusCode::BAD_REQUEST, "bad_request", detail)
+}
+
+async fn login<B>(state: &AppState, body: B) -> Response<Body>
+where
+    B: hyper::body::Body<Data = Bytes> + Send + 'static,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    #[derive(Deserialize)]
+    struct Login {
+        key: String,
+    }
+    let Some(parsed) = read_body(body).await.and_then(|b| serde_json::from_slice::<Login>(&b).ok()) else {
+        return bad_request("Expected {\"key\": \"…\"}.");
+    };
+    let Some(browser) = auth::browser_for_key(&state.cfg.browser_key_hashes, parsed.key.trim()) else {
+        log_limited("login_refused", || {
+            "login: refused a key that matches no BROWSER_KEY_HASHES entry".to_string()
+        });
+        return httputil::error(
+            StatusCode::UNAUTHORIZED,
+            "bad_key",
+            "That key is not one of this server's browsers.",
+        );
+    };
+    let value = auth::cookie_value(&state.cfg.url_key, &browser, unix_now() + auth::COOKIE_TTL_SECS);
+    Response::builder()
+        .status(StatusCode::NO_CONTENT)
+        .header("set-cookie", auth::set_cookie(&value))
+        .header("cache-control", "no-store")
+        .body(httputil::full(""))
+        .unwrap()
+}
+
+async fn create_session<B>(
+    state: &Arc<AppState>,
+    parts: &hyper::http::request::Parts,
+    body: B,
+) -> Response<Body>
+where
+    B: hyper::body::Body<Data = Bytes> + Send + 'static,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    let cookies: Vec<&str> =
+        parts.headers.get_all(hyper::header::COOKIE).iter().filter_map(|v| v.to_str().ok()).collect();
+    let cookie = cookies.join("; ");
+    let Some(browser) =
+        auth::cookie_browser(&state.cfg.url_key, &state.cfg.browser_key_hashes, Some(&cookie), unix_now())
+    else {
+        return httputil::error(
+            StatusCode::UNAUTHORIZED,
+            "not_logged_in",
+            "Log in with this browser's key first.",
+        );
+    };
+    #[derive(Deserialize)]
+    struct Create {
+        imdb: String,
+        filename: Option<String>,
+    }
+    let Some(req) = read_body(body).await.and_then(|b| serde_json::from_slice::<Create>(&b).ok()) else {
+        return bad_request("Expected {\"imdb\": \"tt…\", \"filename\"?: \"…\"}.");
+    };
+    if !scout::is_imdb(&req.imdb) {
+        return bad_request("imdb must be a movie's IMDb id, tt followed by digits.");
+    }
+    match session::create(state, browser, &req.imdb, req.filename.as_deref()).await {
+        Ok(s) => httputil::json(
+            StatusCode::CREATED,
+            &serde_json::json!({
+                "sid": s.sid,
+                "playlist": format!("/remux/s/{}/{}/master.m3u8", s.sid, s.sig),
+                "release": {"label": s.release.label, "filename": s.release.filename, "size": s.release.size},
+                "duration": s.info.duration,
+                "expiresAt": s.exp,
+            }),
+            &[],
+        ),
+        Err(e) => httputil::error(e.status, e.code, &e.detail),
+    }
+}
+
+async fn session_route(
+    state: &Arc<AppState>,
+    parts: &hyper::http::request::Parts,
+    rest: &str,
+) -> Response<Body> {
+    let mut it = rest.splitn(3, '/');
+    let (sid, sig, file) = (it.next().unwrap_or(""), it.next().unwrap_or(""), it.next());
+    if !auth::is_id(sid) || !auth::is_id(sig) {
+        return httputil::not_found();
+    }
+    if parts.method == Method::OPTIONS {
+        return Response::builder().status(StatusCode::NO_CONTENT).body(httputil::full("")).unwrap();
+    }
+    let key = &state.cfg.url_key;
+    let Some(s) = state.session(sid) else {
+        // An ended session answers 410 — but only to someone holding its URL; to anyone else it is as
+        // absent as a session that never existed.
+        return match state.tombstone(sid) {
+            Some(exp) if auth::url_sig_ok(key, sid, exp, sig) => session::gone(),
+            _ => httputil::not_found(),
+        };
+    };
+    if !auth::url_sig_ok(key, sid, s.exp, sig) {
+        return httputil::not_found();
+    }
+    if unix_now() >= s.exp {
+        state.end_session(sid, "expired").await;
+        return session::gone();
+    }
+    let head = parts.method == Method::HEAD;
+    match (&parts.method, file) {
+        (&Method::DELETE, None | Some("")) => {
+            state.end_session(sid, "deleted").await;
+            Response::builder().status(StatusCode::NO_CONTENT).body(httputil::full("")).unwrap()
+        }
+        (&Method::GET | &Method::HEAD, Some(f)) => {
+            let resp = match f {
+                "master.m3u8" | "media.m3u8" => {
+                    s.touch();
+                    let text = if f == "master.m3u8" { s.master.clone() } else { s.media.clone() };
+                    httputil::text("application/vnd.apple.mpegurl", text)
+                }
+                "init.mp4" => s.serve_init(state, head).await,
+                _ => match session::seg_index(f).filter(|n| *n < s.segments.len()) {
+                    Some(n) => s.serve_segment(state, n, head).await,
+                    None => httputil::not_found(),
+                },
+            };
+            if head {
+                let (p, _) = resp.into_parts();
+                return Response::from_parts(p, httputil::full(""));
+            }
+            resp
+        }
+        _ => method_not_allowed("GET, HEAD, DELETE, OPTIONS"),
+    }
+}
+
+async fn run(cfg: Config) -> std::io::Result<()> {
+    let state = AppState::new(cfg);
+    state::sweep_scratch(&state.cfg.scratch_dir);
+    state.scratch_ok.store(state::check_scratch(&state.cfg.scratch_dir), Relaxed);
+    state.ffmpeg_ok.store(state::check_ffmpeg(&state.cfg.ffmpeg).await, Relaxed);
+    if let Some((reason, detail)) = health_verdict(&state) {
+        eprintln!("health: degraded ({reason}) — {detail}");
+    }
+
+    // Registered before the listener binds: until the handlers exist SIGTERM keeps its default
+    // disposition, and a stop in that window would kill the process outright (den-reel's lesson).
+    let shutdown = shutdown_signal();
+    let listener = TcpListener::bind(("0.0.0.0", state.cfg.port)).await?;
+    let on = |b: bool| if b { "on" } else { "off" };
+    eprintln!(
+        "den-remux {} listening on :{} — metrics={} log_requests={} scout={} browser_keys={} url_key={} \
+         max_sessions={} idle={}s scratch={} scratch_max={} ffmpeg={}",
+        env!("CARGO_PKG_VERSION"),
+        state.cfg.port,
+        on(state.cfg.metrics_token.is_some()),
+        on(state.cfg.log_requests),
+        on(state.cfg.scout_install_url.is_some()),
+        state.cfg.browser_key_hashes.len(),
+        if state.cfg.url_key_ephemeral { "ephemeral" } else { "set" },
+        state.cfg.max_sessions,
+        state.cfg.session_idle.as_secs(),
+        state.cfg.scratch_dir.display(),
+        state.cfg.scratch_max_bytes,
+        if state.ffmpeg_ok.load(Relaxed) { "ok" } else { "missing" },
+    );
+
+    let drained = serve_until(listener, state.clone(), shutdown, DRAIN_GRACE, HEADER_READ_TIMEOUT).await;
+
+    // Ending each session kills and reaps its ffmpeg and deletes its scratch; the registry catches
+    // anything that slipped between them.
+    state.end_all("shutdown").await;
+    let killed = job::kill_live_groups();
+    if killed > 0 {
+        eprintln!("shutdown: killed {killed} ffmpeg process group(s)");
+    }
+    if drained {
+        eprintln!("shut down cleanly");
+    }
+    Ok(())
+}
+
+/// How long in-flight requests get to finish after SIGTERM: under podman's default 10 s stop timeout.
+const DRAIN_GRACE: Duration = Duration::from_secs(8);
+
+/// How long a client may take to send a request head.
+const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Serve until `shutdown` resolves, then let in-flight requests finish for at most `grace`; `true`
+/// when they all did.
+async fn serve_until(
+    listener: TcpListener,
+    state: Arc<AppState>,
+    shutdown: impl Future<Output = ()>,
+    grace: Duration,
+    header_timeout: Duration,
+) -> bool {
+    let graceful = GracefulShutdown::new();
+    tokio::pin!(shutdown);
+    loop {
+        let (stream, _) = tokio::select! {
+            accepted = listener.accept() => match accepted {
+                Ok(pair) => pair,
+                Err(e) => {
+                    log_limited("accept", || format!("accept: {e}"));
+                    // The listener stays readable while the process is out of descriptors; back off
+                    // rather than spin the one runtime thread.
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+            },
+            _ = &mut shutdown => break,
+        };
+        let state = state.clone();
+        let service = service_fn(move |req| {
+            let state = state.clone();
+            async move { Ok::<_, Infallible>(handle_request(state, req).await) }
+        });
+        let conn = hyper::server::conn::http1::Builder::new()
+            .timer(TokioTimer::new())
+            .header_read_timeout(header_timeout)
+            .serve_connection(TokioIo::new(stream), service);
+        let conn = graceful.watch(conn);
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+    }
+    drop(listener);
+    tokio::select! {
+        _ = graceful.shutdown() => true,
+        _ = tokio::time::sleep(grace) => {
+            eprintln!("drain deadline ({grace:?}) reached with requests still in flight");
+            false
+        }
+    }
+}
+
+/// Resolves on SIGTERM (a redeploy) or SIGINT (a terminal); a second signal exits at once.
+fn shutdown_signal() -> impl Future<Output = ()> {
+    use tokio::signal::unix::{signal, SignalKind};
+    let term = signal(SignalKind::terminate());
+    let int = signal(SignalKind::interrupt());
+    async move {
+        tokio::select! {
+            _ = wait_for(term, "SIGTERM") => {}
+            _ = wait_for(int, "SIGINT") => {}
+        }
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = quietly(signal(SignalKind::terminate())) => {}
+                _ = quietly(signal(SignalKind::interrupt())) => {}
+            }
+            eprintln!("second signal — exiting without finishing the drain");
+            job::kill_live_groups();
+            std::process::exit(0);
+        });
+    }
+}
+
+async fn wait_for(registered: std::io::Result<tokio::signal::unix::Signal>, name: &str) {
+    match registered {
+        Ok(mut sig) => {
+            sig.recv().await;
+            eprintln!("{name} — draining in-flight requests");
+        }
+        Err(e) => {
+            eprintln!("{name} handler unavailable ({e}); it will be a hard kill");
+            std::future::pending::<()>().await
+        }
+    }
+}
+
+async fn quietly(registered: std::io::Result<tokio::signal::unix::Signal>) {
+    match registered {
+        Ok(mut sig) => {
+            sig.recv().await;
+        }
+        Err(_) => std::future::pending::<()>().await,
+    }
+}
+
+fn main() {
+    let cfg = Config::from_env();
+    // current_thread: one runtime thread keeps idle RAM low; the heavy lifting is in ffmpeg.
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("tokio runtime");
+    if let Err(e) = rt.block_on(run(cfg)) {
+        eprintln!("fatal: {e}");
+        std::process::exit(1);
+    }
+}

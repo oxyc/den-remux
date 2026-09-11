@@ -1,0 +1,130 @@
+//! Runtime configuration, all from the environment.
+//!
+//! Env: PORT, SCOUT_INSTALL_URL, BROWSER_KEY_HASHES, REMUX_URL_KEY, MAX_SESSIONS, SESSION_IDLE_SECS,
+//!      SCRATCH_DIR, SCRATCH_MAX_BYTES, FFMPEG_PATH, METRICS_TOKEN, LOG_REQUESTS.
+
+use std::env;
+use std::path::PathBuf;
+use std::time::Duration;
+
+pub struct Config {
+    pub port: u16,
+    /// `SCOUT_INSTALL_URL` — this service's own den-scout install, sealed config included, with no
+    /// trailing slash. A secret: it lists and plays anything, so it is never logged and never leaves
+    /// the process. `None` leaves the service up but unable to start a session.
+    pub scout_install_url: Option<String>,
+    /// `BROWSER_KEY_HASHES` — SHA-256 of each browser's key. Only hashes live in the env file, so the
+    /// file on the box cannot be replayed as a key.
+    pub browser_key_hashes: Vec<[u8; 32]>,
+    /// MAC key for the cookie and the session URLs, derived from `REMUX_URL_KEY`. Rotating it logs
+    /// every browser out and kills every session URL at once.
+    pub url_key: Vec<u8>,
+    /// No `REMUX_URL_KEY` was set, so `url_key` is random for this process: every restart logs the
+    /// browsers out. Reported by /health.
+    pub url_key_ephemeral: bool,
+    pub max_sessions: usize,
+    pub session_idle: Duration,
+    pub scratch_dir: PathBuf,
+    pub scratch_max_bytes: u64,
+    pub ffmpeg: String,
+    /// `METRICS_TOKEN` — the bearer token `/metrics` requires. `None` turns the endpoint off (404).
+    pub metrics_token: Option<String>,
+    /// `LOG_REQUESTS` — one stderr line per response when set (anything but empty or `0`).
+    pub log_requests: bool,
+}
+
+fn env_opt(key: &str) -> Option<String> {
+    match env::var(key) {
+        Ok(v) if !v.trim().is_empty() => Some(v.trim().to_string()),
+        _ => None,
+    }
+}
+
+/// `LOG_REQUESTS`: off when unset, empty, or exactly `0`; on for any other value — the rule every Den
+/// addon reads it by.
+pub(crate) fn log_requests_on(v: Option<&str>) -> bool {
+    v.is_some_and(|v| !v.is_empty() && v != "0")
+}
+
+/// `BROWSER_KEY_HASHES`: comma-separated 64-character hex digests. A malformed entry is said once and
+/// skipped rather than failing the boot — the other browsers should keep working.
+pub(crate) fn parse_key_hashes(raw: &str) -> Vec<[u8; 32]> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| {
+            let parsed = crate::auth::parse_hex32(s);
+            if parsed.is_none() {
+                eprintln!(
+                    "warning: BROWSER_KEY_HASHES has an entry that is not 64 hex characters; skipping it"
+                );
+            }
+            parsed
+        })
+        .collect()
+}
+
+/// Below this the cap cannot hold one window of a 4K session, and every job would sit paused.
+const MIN_SCRATCH_BYTES: u64 = 64 * 1024 * 1024;
+
+impl Config {
+    pub fn from_env() -> Config {
+        let (url_key, url_key_ephemeral) = match env_opt("REMUX_URL_KEY") {
+            // Hashed, so any length the operator typed is a valid key of a fixed size.
+            Some(k) => (crate::auth::sha256(k.as_bytes()).to_vec(), false),
+            None => {
+                eprintln!(
+                    "warning: REMUX_URL_KEY is unset — using a random key, so every restart logs the browsers out"
+                );
+                (crate::auth::random_bytes::<32>().to_vec(), true)
+            }
+        };
+        Config {
+            port: env_opt("PORT").and_then(|v| v.parse().ok()).unwrap_or(8095),
+            scout_install_url: env_opt("SCOUT_INSTALL_URL").map(|u| u.trim_end_matches('/').to_string()),
+            browser_key_hashes: parse_key_hashes(&env_opt("BROWSER_KEY_HASHES").unwrap_or_default()),
+            url_key,
+            url_key_ephemeral,
+            max_sessions: env_opt("MAX_SESSIONS")
+                .and_then(|v| v.parse().ok())
+                .filter(|n| *n >= 1)
+                .unwrap_or(2),
+            // Floored: an idle window shorter than a player's pause-and-resume would kill sessions
+            // that are merely paused.
+            session_idle: Duration::from_secs(
+                env_opt("SESSION_IDLE_SECS").and_then(|v| v.parse().ok()).filter(|s| *s >= 30).unwrap_or(600),
+            ),
+            scratch_dir: env_opt("SCRATCH_DIR").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/cache")),
+            scratch_max_bytes: env_opt("SCRATCH_MAX_BYTES")
+                .and_then(|v| v.parse().ok())
+                .filter(|b| *b >= MIN_SCRATCH_BYTES)
+                .unwrap_or(1024 * 1024 * 1024),
+            ffmpeg: env_opt("FFMPEG_PATH").unwrap_or_else(|| "ffmpeg".to_string()),
+            metrics_token: env_opt("METRICS_TOKEN"),
+            log_requests: log_requests_on(env::var("LOG_REQUESTS").ok().as_deref()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn log_requests_follows_the_fleet_rule() {
+        assert!(!log_requests_on(None));
+        assert!(!log_requests_on(Some("")));
+        assert!(!log_requests_on(Some("0")));
+        assert!(log_requests_on(Some("1")));
+        assert!(log_requests_on(Some("true")));
+    }
+
+    #[test]
+    fn a_bad_key_hash_is_skipped_not_fatal() {
+        let good = "a".repeat(64);
+        let parsed = parse_key_hashes(&format!("{good}, nothex, ,{}", "B".repeat(64)));
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0], [0xaa; 32]);
+        assert_eq!(parsed[1], [0xbb; 32]);
+    }
+}

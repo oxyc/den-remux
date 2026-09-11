@@ -1,0 +1,194 @@
+//! What a release actually is, read from the file over HTTP Range: duration, tracks, codec strings,
+//! and the keyframe index the playlist is cut from.
+//!
+//! The index is what makes a seek cheap. Matroska keeps it in `Cues`, found through the `SeekHead` —
+//! one ranged read for a two-hour film, the approach of Jellyfin's `MatroskaKeyframeExtractor`. MP4
+//! keeps it in `stss` plus `stts`/`ctts`, inside a `moov` that is at the front or, without faststart,
+//! after the media data.
+//!
+//! Hand-written parsers rather than ffprobe, for the same reasons den-scout gives: the structures
+//! needed are small, and ffprobe would be another binary parsing untrusted bytes before we have
+//! decided to trust the file at all.
+
+pub mod mkv;
+pub mod mp4;
+
+use std::fmt;
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum VideoCodec {
+    H264,
+    Hevc,
+    Other(String),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct AudioTrack {
+    /// The container's own name for it: a Matroska `A_…` codec id, or an MP4 sample-entry fourcc.
+    pub codec: String,
+    pub language: Option<String>,
+    pub channels: u32,
+}
+
+#[derive(Clone, Debug)]
+pub struct MediaInfo {
+    pub container: &'static str,
+    pub duration: f64,
+    pub video: VideoCodec,
+    /// The RFC 6381 string for the copied video — `avc1.640028`, `hvc1.2.4.L150.B0` — from the codec
+    /// configuration record. `None` when the file carries none.
+    pub codecs: Option<String>,
+    pub width: u32,
+    pub height: u32,
+    pub audio: Vec<AudioTrack>,
+    /// Keyframe presentation times in seconds, ascending — the timeline ffmpeg reports with
+    /// `-copyts -start_at_zero`, which is the one the segments are cut on.
+    pub keyframes: Vec<f64>,
+}
+
+#[derive(Debug)]
+pub enum ProbeError {
+    /// A file we understand but will not play: another container, codec or layout.
+    Unsupported(String),
+    /// The bytes ran out before a structure did.
+    Truncated(&'static str),
+    /// The read itself failed. The text has had its URL removed.
+    Fetch(String),
+}
+
+impl fmt::Display for ProbeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ProbeError::Unsupported(why) => write!(f, "unsupported: {why}"),
+            ProbeError::Truncated(what) => write!(f, "truncated {what}"),
+            ProbeError::Fetch(why) => write!(f, "read failed: {why}"),
+        }
+    }
+}
+
+/// The largest single structure we will read: a `moov` or `Cues` for a long film is a few MB, and
+/// anything claiming far more is a broken or hostile file, not one to buffer.
+pub const MAX_ELEMENT: u64 = 64 << 20;
+
+/// Where the bytes come from: the release over HTTP, or a buffer in tests.
+pub enum Source<'a> {
+    Http {
+        client: &'a reqwest::Client,
+        url: &'a str,
+    },
+    #[cfg(test)]
+    Mem(&'a [u8]),
+}
+
+impl Source<'_> {
+    /// `len` bytes from `start`, or fewer at the end of the file.
+    pub async fn read(&self, start: u64, len: u64) -> Result<Vec<u8>, ProbeError> {
+        match self {
+            #[cfg(test)]
+            Source::Mem(b) => {
+                let s = start.min(b.len() as u64) as usize;
+                let e = start.saturating_add(len).min(b.len() as u64) as usize;
+                Ok(b[s..e].to_vec())
+            }
+            Source::Http { client, url } => {
+                read_range(client, url, start, len).await.map_err(ProbeError::Fetch)
+            }
+        }
+    }
+}
+
+/// One ranged GET. A 200 is accepted only for a read from the start, because a server that ignores
+/// Range is sending the whole file and the first bytes are all that is wanted.
+pub async fn read_range(
+    client: &reqwest::Client,
+    url: &str,
+    start: u64,
+    len: u64,
+) -> Result<Vec<u8>, String> {
+    let end = start + len.max(1) - 1;
+    let resp = client
+        .get(url)
+        .header(reqwest::header::RANGE, format!("bytes={start}-{end}"))
+        .send()
+        .await
+        .map_err(|e| e.without_url().to_string())?;
+    let status = resp.status().as_u16();
+    if !(status == 206 || (status == 200 && start == 0)) {
+        return Err(format!("a range read answered {status}"));
+    }
+    read_capped(resp, len).await
+}
+
+/// At most `cap` bytes of a body, stopping as soon as that many arrived — never the rest of a 60 GB
+/// remux behind a server that answered 200.
+pub async fn read_capped(mut resp: reqwest::Response, cap: u64) -> Result<Vec<u8>, String> {
+    let cap = cap as usize;
+    let mut out = Vec::new();
+    while let Some(chunk) = resp.chunk().await.map_err(|e| e.without_url().to_string())? {
+        let room = cap - out.len();
+        out.extend_from_slice(&chunk[..chunk.len().min(room)]);
+        if out.len() >= cap {
+            break;
+        }
+    }
+    Ok(out)
+}
+
+/// Probe a file whose first bytes are `head`, dispatching on its magic rather than its name.
+pub async fn probe(src: &Source<'_>, head: &[u8]) -> Result<MediaInfo, ProbeError> {
+    if head.starts_with(&[0x1A, 0x45, 0xDF, 0xA3]) {
+        return mkv::probe(src, head).await;
+    }
+    if head.len() >= 8 && matches!(&head[4..8], b"ftyp" | b"moov" | b"free" | b"mdat" | b"wide" | b"skip") {
+        return mp4::probe(src, head).await;
+    }
+    Err(ProbeError::Unsupported("neither Matroska nor MP4".into()))
+}
+
+/// `avc1.PPCCLL` from an `avcC` record: profile, constraint flags, level.
+pub fn avc_codecs(avcc: &[u8]) -> Option<String> {
+    (avcc.len() >= 4 && avcc[0] == 1).then(|| format!("avc1.{:02x}{:02x}{:02x}", avcc[1], avcc[2], avcc[3]))
+}
+
+/// `hvc1.<space><profile>.<compat>.<tier><level>.<constraints>` from an `hvcC` record, per ISO/IEC
+/// 14496-15 annex E: the compatibility flags bit-reversed in hex, trailing zero constraint bytes
+/// dropped.
+pub fn hevc_codecs(hvcc: &[u8]) -> Option<String> {
+    if hvcc.len() < 13 {
+        return None;
+    }
+    let space = ["", "A", "B", "C"][(hvcc[1] >> 6) as usize];
+    let tier = if hvcc[1] & 0x20 != 0 { 'H' } else { 'L' };
+    let profile = hvcc[1] & 0x1f;
+    let compat = u32::from_be_bytes([hvcc[2], hvcc[3], hvcc[4], hvcc[5]]).reverse_bits();
+    let level = hvcc[12];
+    let mut constraints = hvcc[6..12].to_vec();
+    while constraints.last() == Some(&0) {
+        constraints.pop();
+    }
+    let mut s = format!("hvc1.{space}{profile}.{compat:X}.{tier}{level}");
+    for c in constraints {
+        s.push_str(&format!(".{c:X}"));
+    }
+    Some(s)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn codec_strings_follow_rfc_6381() {
+        assert_eq!(avc_codecs(&[1, 0x64, 0x00, 0x28, 0xff]).as_deref(), Some("avc1.640028"));
+        assert_eq!(avc_codecs(&[0, 0x64, 0, 0x28]), None, "not an avcC record");
+        // Main 10, level 5.0 (150), progressive-source + frame-only constraints: the Apple spec example.
+        let main10 = [1, 0x02, 0x20, 0, 0, 0, 0xB0, 0, 0, 0, 0, 0, 150];
+        assert_eq!(hevc_codecs(&main10).as_deref(), Some("hvc1.2.4.L150.B0"));
+        // Main, level 3.1 (93), compatible with Main and Main 10.
+        let main = [1, 0x01, 0x60, 0, 0, 0, 0x90, 0, 0, 0, 0, 0, 93];
+        assert_eq!(hevc_codecs(&main).as_deref(), Some("hvc1.1.6.L93.90"));
+        // High tier.
+        let high = [1, 0x22, 0x20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 153];
+        assert_eq!(hevc_codecs(&high).as_deref(), Some("hvc1.2.4.H153"));
+    }
+}

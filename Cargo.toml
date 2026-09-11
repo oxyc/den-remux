@@ -1,0 +1,50 @@
+[package]
+name = "den-remux"
+version = "0.1.0"
+edition = "2021"
+description = "Den's browser playback: a server-held scout install, keyframe-cut HLS (fMP4) with the video copied and the audio re-encoded to AAC stereo"
+publish = false
+license = "MIT"
+
+[[bin]]
+name = "den-remux"
+path = "src/main.rs"
+
+[dependencies]
+# Single-threaded async runtime: the process only routes requests and watches ffmpeg, which does the
+# actual work in its own process. current_thread keeps the resident thread count (and RAM) minimal.
+tokio = { version = "1", features = ["rt", "macros", "net", "process", "fs", "io-util", "time", "sync", "signal"] }
+hyper = { version = "1", features = ["server", "http1"] }
+# server-graceful: stop accepting on SIGTERM and let in-flight requests finish (see serve_until).
+hyper-util = { version = "0.1", features = ["tokio", "http1", "server-graceful"] }
+http-body-util = "0.1"
+bytes = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# rustls with bundled webpki roots (ring, not aws-lc): no OpenSSL, no system CA store for our own
+# requests, and it links statically on musl.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+tokio-util = { version = "0.7", features = ["io"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+# HMAC-SHA256 for the browser cookie and the per-session URL signature; SHA-256 for the browser keys;
+# a constant-time compare for all three.
+hmac = "0.12"
+sha2 = "0.10"
+subtle = "2"
+base64 = "0.22"
+getrandom = "0.3"
+
+# killpg / SIGSTOP / SIGCONT on the ffmpeg process group.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros", "net", "process", "fs", "io-util", "time", "sync", "signal", "test-util"] }
+
+# The same release profile as den-reel: fast codegen, fat LTO, one codegen unit, stripped. panic=unwind
+# (the default) so a panic in one request unwinds that connection rather than the whole server.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true

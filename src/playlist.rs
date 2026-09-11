@@ -1,0 +1,144 @@
+//! The HLS playlists: a VOD media playlist whose segments start on the file's real keyframes, and a
+//! one-variant master.
+//!
+//! Cut points are "the first keyframe at or after n × target" — Jellyfin's approach for copied video.
+//! With the video copied, a segment can only begin on a keyframe, and a playlist that promised any
+//! other boundary would be lying about where each segment starts.
+
+pub const TARGET_SECS: f64 = 6.0;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Segment {
+    pub start: f64,
+    pub end: f64,
+}
+
+/// Segment boundaries from the keyframe times (seconds, ascending). The first segment starts at 0
+/// whatever the first keyframe says; the last runs to `duration`.
+///
+/// After a cut the next target is the first multiple of `target` past that cut, not the previous
+/// target plus one: a file with a keyframe only every 20 s would otherwise owe several targets at
+/// once and cut a run of one-GOP segments to catch up.
+pub fn segments(keyframes: &[f64], duration: f64, target: f64) -> Vec<Segment> {
+    let mut cuts = vec![0.0];
+    let mut next = target;
+    for &k in keyframes {
+        if k <= 0.0 || k >= duration {
+            continue;
+        }
+        if k + 1e-9 >= next {
+            cuts.push(k);
+            next = ((k / target).floor() + 1.0) * target;
+        }
+    }
+    cuts.iter()
+        .enumerate()
+        .map(|(i, &start)| Segment { start, end: cuts.get(i + 1).copied().unwrap_or(duration) })
+        .collect()
+}
+
+/// The media playlist. VOD, so the player knows the whole timeline up front and can seek anywhere
+/// before a single segment exists.
+pub fn media(segs: &[Segment]) -> String {
+    let target = segs.iter().map(|s| s.end - s.start).fold(0.0, f64::max).ceil().max(1.0) as u64;
+    let mut out = format!(
+        "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:{target}\n#EXT-X-MEDIA-SEQUENCE:0\n\
+         #EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-INDEPENDENT-SEGMENTS\n#EXT-X-MAP:URI=\"init.mp4\"\n"
+    );
+    for (i, s) in segs.iter().enumerate() {
+        out.push_str(&format!("#EXTINF:{:.6},\nseg{i}.m4s\n", s.end - s.start));
+    }
+    out.push_str("#EXT-X-ENDLIST\n");
+    out
+}
+
+/// The master playlist: one variant, the copied video plus AAC-LC stereo.
+pub fn master(video_codecs: &str, bandwidth: u64, average: u64, resolution: Option<(u32, u32)>) -> String {
+    let res = resolution.filter(|(w, h)| *w > 0 && *h > 0).map(|(w, h)| format!(",RESOLUTION={w}x{h}"));
+    format!(
+        "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-INDEPENDENT-SEGMENTS\n\
+         #EXT-X-STREAM-INF:BANDWIDTH={bandwidth},AVERAGE-BANDWIDTH={average},CODECS=\"{video_codecs},mp4a.40.2\"{}\n\
+         media.m3u8\n",
+        res.unwrap_or_default()
+    )
+}
+
+/// BANDWIDTH and AVERAGE-BANDWIDTH from the file's size and duration. The average is honest; the peak
+/// is a guess (a quarter over, plus the AAC we add), because nothing short of reading the whole file
+/// says what the busiest segment carries. `None` size assumes a 1080p WEB-DL.
+pub fn bandwidth(size: Option<u64>, duration: f64) -> (u64, u64) {
+    let avg = match size {
+        Some(s) if duration > 0.0 => (s as f64 * 8.0 / duration) as u64,
+        _ => 8_000_000,
+    };
+    (avg + avg / 4 + 192_000, avg)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// h264.mkv's keyframes, as ffprobe reports them (testdata/README.md).
+    const KF: [f64; 11] = [0.0, 2.5, 5.0, 8.0, 10.5, 13.0, 16.0, 19.5, 22.0, 24.0, 27.5];
+
+    #[test]
+    fn cuts_land_on_the_first_keyframe_at_or_after_each_target() {
+        let segs = segments(&KF, 30.021, TARGET_SECS);
+        let starts: Vec<f64> = segs.iter().map(|s| s.start).collect();
+        // 6 → 8, then 12 → 13, 18 → 19.5, 24 → 24; 30 is past the last keyframe.
+        assert_eq!(starts, [0.0, 8.0, 13.0, 19.5, 24.0]);
+        assert_eq!(segs.last().unwrap().end, 30.021);
+        for w in segs.windows(2) {
+            assert_eq!(w[0].end, w[1].start, "no gap and no overlap");
+        }
+        for s in &segs[1..] {
+            assert!(KF.contains(&s.start), "every boundary but the first is a real keyframe");
+        }
+    }
+
+    #[test]
+    fn sparse_keyframes_do_not_cause_a_run_of_catch_up_cuts() {
+        let segs = segments(&[0.0, 20.0, 21.0, 22.0, 26.0], 40.0, 6.0);
+        let starts: Vec<f64> = segs.iter().map(|s| s.start).collect();
+        assert_eq!(starts, [0.0, 20.0, 26.0], "21 and 22 are not owed a target");
+    }
+
+    #[test]
+    fn a_file_whose_first_keyframe_is_late_still_starts_at_zero() {
+        let segs = segments(&[0.5, 7.0], 10.0, 6.0);
+        assert_eq!(segs[0].start, 0.0);
+        assert_eq!(segs[1].start, 7.0);
+    }
+
+    #[test]
+    fn the_media_playlist_sums_to_the_duration() {
+        let segs = segments(&KF, 30.021, TARGET_SECS);
+        let m = media(&segs);
+        let total: f64 = m
+            .lines()
+            .filter_map(|l| l.strip_prefix("#EXTINF:"))
+            .map(|v| v.trim_end_matches(',').parse::<f64>().unwrap())
+            .sum();
+        assert!((total - 30.021).abs() < 1e-5, "EXTINF sums to {total}");
+        assert!(m.contains("#EXT-X-PLAYLIST-TYPE:VOD"));
+        assert!(m.contains("#EXT-X-MAP:URI=\"init.mp4\""));
+        assert!(m.trim_end().ends_with("#EXT-X-ENDLIST"));
+        // The longest segment is the first, 0 → 8 (no keyframe between 6 and 8); the target covers it.
+        assert!(m.contains("#EXT-X-TARGETDURATION:8\n"), "{m}");
+        assert_eq!(m.matches(".m4s").count(), segs.len());
+        assert!(m.contains("seg0.m4s") && m.contains("seg4.m4s"));
+    }
+
+    #[test]
+    fn the_master_names_both_codecs() {
+        let (peak, avg) = bandwidth(Some(3_750_000), 30.0);
+        assert_eq!(avg, 1_000_000);
+        assert!(peak > avg);
+        let m = master("hvc1.1.6.L93.B0", peak, avg, Some((320, 180)));
+        assert!(m.contains("CODECS=\"hvc1.1.6.L93.B0,mp4a.40.2\""), "{m}");
+        assert!(m.contains("RESOLUTION=320x180"));
+        assert!(m.contains(&format!("BANDWIDTH={peak},AVERAGE-BANDWIDTH={avg}")));
+        assert!(m.ends_with("media.m3u8\n"));
+        assert!(!master("avc1.64001e", 1, 1, None).contains("RESOLUTION"));
+    }
+}

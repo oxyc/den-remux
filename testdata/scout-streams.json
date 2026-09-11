@@ -1,0 +1,60 @@
+{
+  "streams": [
+    {
+      "name": "Den Scout",
+      "title": "Film.2019.1080p.WEB.x264-UNCACHED.mkv",
+      "url": "http://scout.test/p/ticket-uncached",
+      "attributes": {"resolution": "1080p", "codec": "h264", "cached": false, "sizeBytes": 4000000000, "label": "1080p WEB"},
+      "behaviorHints": {"bingeGroup": "x", "notWebReady": true, "filename": "Film.2019.1080p.WEB.x264-UNCACHED.mkv"}
+    },
+    {
+      "name": "Den Scout",
+      "title": "Film.2019.2160p.UHD.BluRay.REMUX.HEVC.TrueHD.7.1.mkv",
+      "url": "http://scout.test/p/ticket-remux",
+      "attributes": {"resolution": "2160p", "codec": "hevc", "cached": true, "sizeBytes": 58000000000, "label": "4K REMUX", "dolbyVision": false},
+      "behaviorHints": {"bingeGroup": "x", "notWebReady": true, "filename": "Film.2019.2160p.UHD.BluRay.REMUX.HEVC.TrueHD.7.1.mkv"}
+    },
+    {
+      "name": "Den Scout",
+      "title": "Film.2019.2160p.WEB-DL.AV1.mkv",
+      "url": "http://scout.test/p/ticket-av1",
+      "attributes": {"resolution": "2160p", "codec": "av1", "cached": true, "sizeBytes": 9000000000, "label": "4K AV1"},
+      "behaviorHints": {"bingeGroup": "x", "notWebReady": true, "filename": "Film.2019.2160p.WEB-DL.AV1.mkv"}
+    },
+    {
+      "name": "Den Scout",
+      "title": "Film.2019.1080p.WEB-DL.DDP5.1.H.264.mkv",
+      "url": "http://scout.test/p/ticket-web",
+      "attributes": {"resolution": "1080p", "codec": "h264", "cached": true, "sizeBytes": 6000000000, "label": "1080p WEB-DL"},
+      "behaviorHints": {"bingeGroup": "x", "notWebReady": true, "filename": "Film.2019.1080p.WEB-DL.DDP5.1.H.264.mkv"}
+    },
+    {
+      "name": "Den Scout",
+      "title": "Film.2019.1080p.3D.HSBS.BluRay.x264.mkv",
+      "url": "http://scout.test/p/ticket-3d",
+      "attributes": {"resolution": "1080p", "codec": "h264", "cached": true, "threeD": true, "label": "1080p 3D"},
+      "behaviorHints": {"bingeGroup": "x", "notWebReady": true, "filename": "Film.2019.1080p.3D.HSBS.BluRay.x264.mkv"}
+    },
+    {
+      "name": "Den Scout",
+      "title": "Film.2019.720p.BluRay.XviD.avi",
+      "url": "http://scout.test/p/ticket-xvid",
+      "attributes": {"resolution": "720p", "codec": null, "cached": true, "label": "720p"},
+      "behaviorHints": {"bingeGroup": "x", "notWebReady": true, "filename": "Film.2019.720p.BluRay.XviD.avi"}
+    },
+    {
+      "name": "Den Scout",
+      "title": "Film.2019.1080p.HDTV.mkv",
+      "url": "http://scout.test/p/ticket-unknown",
+      "attributes": {"resolution": "1080p", "codec": null, "label": "1080p HDTV"},
+      "behaviorHints": {"bingeGroup": "x", "notWebReady": true, "filename": "Film.2019.1080p.HDTV.mkv"}
+    },
+    {
+      "name": "Den Scout",
+      "title": "Film.2019.1080p.BluRay.mkv",
+      "url": "http://scout.test/p/ticket-bluray",
+      "attributes": {"resolution": "1080p", "codec": null, "cached": true, "sizeBytes": 12000000000, "label": "1080p BluRay"},
+      "behaviorHints": {"bingeGroup": "x", "notWebReady": true, "filename": "Film.2019.1080p.BluRay.mkv"}
+    }
+  ]
+}
