@@ -60,8 +60,10 @@ anything else                           404 {"error":"not_found"}
   `transcode_unavailable` while transcoding is off or in use.
 - **What the player decodes.** `playable` — `{h264, hevcMain, hevcMain10, hevcHighTier, hdr}`, the highest level
   it takes of H.264 (`level_idc`, 0x33 is 5.1), of 8-bit and 10-bit HEVC (level × 30, 153 is 5.1) and of HEVC's
-  High tier (a UHD Blu-ray remux's, which Apple's decoders refuse), 0 for none, and whether it decodes PQ HDR —
-  decides over `videoCodecs` when given. A release is probed first and its own codec string
+  High tier, 0 for none, and whether it decodes PQ HDR — decides over `videoCodecs` when given. A UHD Blu-ray
+  remux is often High tier, which Apple's decoders refuse whatever their tests say, so the web app reports 0 on
+  them; a player that sends no `hevcHighTier` has it converted. The session's log line says what the player
+  reported. A release is probed first and its own codec string
   compared: an HEVC one beyond the player (10-bit, 4K, or HDR it can't decode) is transcoded, an H.264 one passed
   over.
 - **Which release.** Scout ranks for a TV, best first; here it is re-ranked for a phone or a laptop, often over

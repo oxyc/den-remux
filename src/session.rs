@@ -724,9 +724,18 @@ pub struct Playable {
     pub h264: u16,
     pub hevc_main: u16,
     pub hevc_main10: u16,
-    /// A UHD Blu-ray remux is often High tier, which Apple's decoders don't take at all.
+    /// A UHD Blu-ray remux is often High tier. Apple's decoders refuse it, whatever their tests say, so the web app
+    /// reports 0 there; a player that doesn't send it gets it converted.
     pub hevc_high_tier: u16,
     pub hdr: bool,
+}
+
+impl std::fmt::Display for Playable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let hdr = if self.hdr { ", HDR" } else { "" };
+        let (h264, main, main10, high) = (self.h264, self.hevc_main, self.hevc_main10, self.hevc_high_tier);
+        write!(f, "H.264 L{h264}, HEVC L{main}, 10-bit L{main10}, High tier L{high}{hdr}")
+    }
 }
 
 impl Playable {
@@ -1061,8 +1070,9 @@ pub async fn create(
     st.insert_session(session.clone());
     st.sessions_started.fetch_add(1, Relaxed);
     let dv = session.info.dolby_vision.map(|dv| format!(", {dv} stripped to its base layer"));
+    let player = want.playable.map_or_else(|| "no capability report".to_string(), |p| p.to_string());
     eprintln!(
-        "session {}: {imdb} \"{}\" ({}, {:?} {}{}{}, {:.0}s, {} keyframes, {} segments, audio {} {})",
+        "session {}: {imdb} \"{}\" ({}, {:?} {}{}{}, {:.0}s, {} keyframes, {} segments, audio {} {}; player: {player})",
         session.short(),
         session.release.label,
         session.info.container,
@@ -1146,7 +1156,8 @@ mod tests {
         assert!(phone.takes(&hobbit));
         let bluray = info(VideoCodec::Hevc, "hvc1.2.4.H153.B0", true);
         assert!(!phone.takes(&bluray), "High tier, which an iPhone doesn't decode");
-        assert!(Playable { hevc_high_tier: 153, ..phone }.takes(&bluray));
+        assert!(Playable { hevc_high_tier: 153, ..phone }.takes(&bluray), "an Android phone that does");
+        assert_eq!(phone.to_string(), "H.264 L51, HEVC L153, 10-bit L153, High tier L0, HDR");
         assert!(!Playable { hdr: false, ..phone }.takes(&hobbit), "HDR it can't decode is converted");
         assert!(!Playable { hevc_main10: 0, ..phone }.takes(&hobbit), "8-bit HEVC only");
         assert!(!Playable { hevc_main10: 123, ..phone }.takes(&hobbit), "1080p at most");
