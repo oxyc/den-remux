@@ -54,7 +54,7 @@ struct List {
 
 /// The sum of one end's little-endian u64 words: half of the OpenSubtitles hash.
 pub fn chunk_sum(b: &[u8]) -> u64 {
-    b.chunks_exact(8).fold(0u64, |acc, w| acc.wrapping_add(u64::from_le_bytes(w.try_into().unwrap())))
+    b.as_chunks::<8>().0.iter().fold(0u64, |acc, w| acc.wrapping_add(u64::from_le_bytes(*w)))
 }
 
 /// OpenSubtitles' movie hash: the file size plus both ends' sums, as 16 hex digits.
