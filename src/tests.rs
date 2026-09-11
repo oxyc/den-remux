@@ -165,7 +165,7 @@ async fn origin_handle(
     let listing = path
         .strip_suffix(".json")
         .and_then(|p| p.strip_prefix('/'))
-        .and_then(|p| p.split_once("/stream/movie/"));
+        .and_then(|p| p.split_once("/stream/movie/").or_else(|| p.split_once("/stream/series/")));
     if let Some((config, imdb)) = listing {
         // den-scout's contract for a scope=availability config: it lists only for the service key.
         let scoped = config == SCOPED;
@@ -181,6 +181,7 @@ async fn origin_handle(
             "tt0000002" => "hevc.mkv",
             "tt0000003" => "h264.mp4",
             "tt0000009" => "slow/h264.mkv",
+            "tt0000004:1:2" if path.contains("/stream/series/") => "h264.mkv",
             _ => return origin_full(200, r#"{"streams":[]}"#),
         };
         let body = serde_json::json!({"streams": [
@@ -571,6 +572,24 @@ async fn a_scoped_scout_gets_the_service_key_and_nothing_else_does() {
     let r = call(&keyless, "POST", "/remux/session", Some(&cookie), &scoped(&good)).await;
     assert_eq!(r.status, StatusCode::BAD_GATEWAY, "{}", r.text());
     assert_eq!(r.json()["error"], "scout_unavailable");
+}
+
+/// An episode lists from scout's series route, through the full install URL a library holds (no key
+/// needed); half an episode is refused before scout is asked.
+#[tokio::test]
+async fn an_episode_plays_through_the_librarys_install_url() {
+    let origin = origin().await;
+    let state = state_with(&origin, 2, Duration::from_secs(600), None);
+    let cookie = login(&state, "phone-key").await;
+    let body = format!(r#"{{"imdb":"tt0000004","season":1,"episode":2,"scout":"{origin}/cfg"}}"#);
+    let r = call(&state, "POST", "/remux/session", Some(&cookie), &body).await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    assert_eq!(r.json()["release"]["filename"], "h264.mkv");
+    state.end_all("test").await;
+
+    let half = format!(r#"{{"imdb":"tt0000004","season":1,"scout":"{origin}/cfg"}}"#);
+    let r = call(&state, "POST", "/remux/session", Some(&cookie), &half).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
 }
 
 #[tokio::test]

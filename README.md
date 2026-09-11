@@ -11,13 +11,13 @@ browser ──POST /remux/session {imdb, scout}───►  scout (the library'
 <video> ──GET /remux/s/<sid>/<sig>/seg<N>.m4s─►  ffmpeg: -c:v copy -c:a aac, one fMP4 file per GOP
 ```
 
-This is the MVP ("phase 2") of oxyc/den#11: movies only, cached releases only, AAC stereo, two sessions.
+This is the MVP ("phase 2") of oxyc/den#11: movies and episodes, cached releases only, AAC stereo, two sessions.
 
 ## Routes
 
 ```
 POST   /remux/login                     {key} → 204 + Set-Cookie; 401 bad_key
-POST   /remux/session                   {imdb, filename?, scout?} (cookie) → 201
+POST   /remux/session                   {imdb, season?, episode?, filename?, scout?} (cookie) → 201
                                         {sid, playlist, release:{label,filename,size}, duration, expiresAt}
                                         401 not_logged_in · 400 bad_request/bad_scout
                                         404 no_release/no_playable_release · 429 too_many_sessions
@@ -182,7 +182,7 @@ dependabot cannot bump it, so bump both lines by hand.
 
 ## Limits (MVP)
 
-- **Movies only**, and **cached releases only** (an uncached one would start a debrid download).
+- **Cached releases only** (an uncached one would start a debrid download).
 - **H.264 and HEVC only**, copied. AV1, VP9, MPEG-4 Part 2/XviD and VC-1 would need a video re-encode and are
   skipped. Files without a keyframe index (Matroska with no Cues) are skipped.
 - **Audio is AAC stereo** from the first audio track; no track choice yet.

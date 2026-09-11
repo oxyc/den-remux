@@ -1,10 +1,9 @@
 //! The stream source: den-scout.
 //!
-//! A session's releases come from a scout install that lists and plays only for this service: the
-//! scope=availability config the web app holds, which scout honours only with `X-Den-Remux-Key` — a
-//! key the browser never has — or, as a fallback, this service's own `SCOUT_INSTALL_URL`. Either way
-//! the browser never holds a config that can play anything by itself, nor a ticket or a debrid link:
-//! it asks for a title and gets back a signed session for one release. Scout's ranking is kept as-is:
+//! A session's releases come from the scout install the web app names — its library's full install URL,
+//! or a scope=availability one that scout honours only with `X-Den-Remux-Key` — or, as a fallback, this
+//! service's own `SCOUT_INSTALL_URL`. The browser never gets a ticket or a debrid link: it asks for a
+//! title and gets back a signed session for one release. Scout's ranking is kept as-is:
 //! the first release that is cached on the debrid, in a codec the browser can take copied, and that
 //! probes cleanly, wins.
 
@@ -56,8 +55,17 @@ pub fn is_imdb(id: &str) -> bool {
     id.len() >= 3 && id.len() <= 12 && id.starts_with("tt") && id[2..].bytes().all(|c| c.is_ascii_digit())
 }
 
-pub fn stream_list_url(install: &str, imdb: &str) -> String {
-    format!("{install}/stream/movie/{imdb}.json")
+/// Scout's id for a title: the IMDb id for a movie, `<imdb>:<season>:<episode>` for an episode.
+pub fn title_id(imdb: &str, episode: Option<(u32, u32)>) -> String {
+    match episode {
+        Some((s, e)) => format!("{imdb}:{s}:{e}"),
+        None => imdb.to_string(),
+    }
+}
+
+pub fn stream_list_url(install: &str, id: &str) -> String {
+    let kind = if id.contains(':') { "series" } else { "movie" };
+    format!("{install}/stream/{kind}/{id}.json")
 }
 
 pub fn parse(body: &[u8]) -> Result<Vec<Stream>, String> {
@@ -244,7 +252,17 @@ mod tests {
         assert!(!is_imdb("tt"));
         assert!(!is_imdb("tt01x"));
         assert!(!is_imdb("../etc"));
-        assert!(!is_imdb("tt0111161:1:2"), "movies only");
+        assert!(!is_imdb("tt0111161:1:2"), "an episode comes as season and episode fields");
+    }
+
+    #[test]
+    fn an_episode_lists_from_scouts_series_route() {
+        let base = "http://scout/cfg";
+        assert_eq!(stream_list_url(base, &title_id("tt1", None)), "http://scout/cfg/stream/movie/tt1.json");
+        assert_eq!(
+            stream_list_url(base, &title_id("tt1", Some((2, 5)))),
+            "http://scout/cfg/stream/series/tt1:2:5.json"
+        );
     }
 
     #[test]

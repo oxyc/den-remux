@@ -533,7 +533,8 @@ async fn open(
     Ok((r, info))
 }
 
-/// `POST /remux/session`: pick and probe a release of `imdb`, and set up its session.
+/// `POST /remux/session`: pick and probe a release of `imdb` (scout's title id, `tt…:<s>:<e>` for an
+/// episode), and set up its session.
 ///
 /// `scout` is the primary path: the scout install from the web app's library (full, or scope=availability),
 /// accepted only on a `SCOUT_ORIGINS` origin and presented with `REMUX_SCOUT_KEY`. Without it this service's own

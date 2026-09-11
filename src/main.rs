@@ -1,7 +1,7 @@
 //! den-remux — Den's playback for browsers, AirPlay and Cast receivers.
 //!
 //!   POST /remux/login   {key}               → cookie for creating sessions
-//!   POST /remux/session {imdb, filename?, scout?} → a signed session: /remux/s/<sid>/<sig>/master.m3u8
+//!   POST /remux/session {imdb, season?, episode?, filename?, scout?} → a signed session: /remux/s/<sid>/<sig>/master.m3u8
 //!   GET  /remux/s/<sid>/<sig>/…             → HLS (fMP4): master, media, init.mp4, seg<N>.m4s
 //!   DELETE /remux/s/<sid>/<sig>             → end it (410 from then on)
 //!   GET  /health, /metrics
@@ -320,16 +320,26 @@ where
     #[derive(Deserialize)]
     struct Create {
         imdb: String,
+        season: Option<u32>,
+        episode: Option<u32>,
         filename: Option<String>,
         scout: Option<String>,
     }
     let Some(req) = read_body(body).await.and_then(|b| serde_json::from_slice::<Create>(&b).ok()) else {
-        return bad_request("Expected {\"imdb\": \"tt…\", \"filename\"?: \"…\", \"scout\"?: \"…\"}.");
+        return bad_request(
+            "Expected {\"imdb\": \"tt…\", \"season\"?: n, \"episode\"?: n, \"filename\"?: \"…\", \"scout\"?: \"…\"}.",
+        );
     };
     if !scout::is_imdb(&req.imdb) {
-        return bad_request("imdb must be a movie's IMDb id, tt followed by digits.");
+        return bad_request("imdb must be an IMDb id, tt followed by digits.");
     }
-    match session::create(state, browser, &req.imdb, req.filename.as_deref(), req.scout.as_deref()).await {
+    let episode = match (req.season, req.episode) {
+        (Some(s), Some(e)) => Some((s, e)),
+        (None, None) => None,
+        _ => return bad_request("An episode needs both season and episode."),
+    };
+    let id = scout::title_id(&req.imdb, episode);
+    match session::create(state, browser, &id, req.filename.as_deref(), req.scout.as_deref()).await {
         Ok(s) => httputil::json(
             StatusCode::CREATED,
             &serde_json::json!({
