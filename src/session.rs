@@ -767,7 +767,7 @@ impl Playable {
 /// Whether a transcode of this release has to tone-map it to SDR. The container's transfer says so where it is
 /// written down — a UHD Blu-ray remux often leaves Matroska's Colour element out — and Dolby Vision says so too:
 /// its base layer is HDR10 or HLG, except profile 8.2's, which is already SDR.
-fn tonemaps(info: &crate::probe::MediaInfo) -> bool {
+pub(crate) fn tonemaps(info: &crate::probe::MediaInfo) -> bool {
     info.hdr || info.dolby_vision.is_some_and(|dv| dv.compat != 2)
 }
 
@@ -1192,6 +1192,17 @@ mod tests {
             audio: Vec::new(),
             keyframes: vec![0.0],
         }
+    }
+
+    #[test]
+    fn dolby_vision_counts_as_hdr_unless_its_base_layer_is_sdr() {
+        let mut release = info(VideoCodec::Hevc, "hvc1.2.4.L153.B0", false);
+        assert!(!tonemaps(&release));
+        release.dolby_vision = Some(crate::probe::DolbyVision { profile: 8, compat: 1 });
+        assert!(tonemaps(&release), "a remux often names no transfer in its header");
+        release.dolby_vision = Some(crate::probe::DolbyVision { profile: 8, compat: 2 });
+        assert!(!tonemaps(&release), "profile 8.2's base layer is SDR already");
+        assert!(tonemaps(&info(VideoCodec::Hevc, "hvc1.2.4.L153.B0", true)));
     }
 
     #[test]

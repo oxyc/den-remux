@@ -216,10 +216,9 @@ fn parse_moov(moov: &[u8]) -> Result<MediaInfo, ProbeError> {
         other => (VideoCodec::Other(String::from_utf8_lossy(other).into_owned()), None),
     };
     // `colr` of type `nclx`: primaries, transfer, matrix as u16s.
-    let hdr = config(b"colr")
-        .filter(|c| c.get(0..4) == Some(b"nclx"))
-        .and_then(|c| u16_at(c, 6))
-        .is_some_and(|t| super::is_hdr_transfer(t as u64));
+    let colr = config(b"colr").filter(|c| c.get(0..4) == Some(b"nclx"));
+    let of = |at| colr.and_then(|c| u16_at(c, at)).unwrap_or(0) as u64;
+    let hdr = super::is_hdr(of(6), of(4), of(8));
     if video.timescale == 0 {
         return Err(ProbeError::Truncated("mdhd"));
     }

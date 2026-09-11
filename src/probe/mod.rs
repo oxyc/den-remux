@@ -46,7 +46,7 @@ pub struct MediaInfo {
     pub codecs: Option<String>,
     pub width: u32,
     pub height: u32,
-    /// PQ or HLG transfer (HDR10, HLG): a transcode to SDR H.264 has to tone-map it.
+    /// HDR by what the container says of the colours (`is_hdr`): a conversion to SDR H.264 tone-maps it.
     pub hdr: bool,
     /// The video's Dolby Vision configuration, when it carries one.
     pub dolby_vision: Option<DolbyVision>,
@@ -76,9 +76,12 @@ impl fmt::Display for ProbeError {
     }
 }
 
-/// Is this H.273 transfer characteristic HDR — PQ (16) or HLG (18)?
-pub fn is_hdr_transfer(t: u64) -> bool {
-    matches!(t, 16 | 18)
+/// Is this what a container says of the colours HDR (H.273 code points)? The transfer says so outright — PQ (16)
+/// or HLG (18) — but a muxer often writes none: ffmpeg leaves it to the video stream's own headers, which this
+/// doesn't read. Rec. 2020 primaries (9) or matrix (9) then stand for it: in a release they mean HDR, and SDR is
+/// Rec. 709.
+pub fn is_hdr(transfer: u64, primaries: u64, matrix: u64) -> bool {
+    matches!(transfer, 16 | 18) || primaries == 9 || matrix == 9
 }
 
 /// A Dolby Vision stream's profile, and what its base layer is without it — written `8.1`, `7.6`, as Dolby does.

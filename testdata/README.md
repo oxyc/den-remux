@@ -9,6 +9,7 @@ unevenly, and the B-frames are what trigger ffmpeg's seek back-off (see `src/job
 |---|---|---|---|
 | `h264.mkv` | Matroska Cues via the SeekHead; two audio tracks (AC-3 eng, AAC mono swe) | 0, 2.5, 5, 8, 10.5, 13, 16, 19.5, 22, 24, 27.5 | 30.021 |
 | `hevc.mkv` | HEVC → `hvc1` codec string and `-tag:v hvc1`; E-AC-3 audio | 0, 3, 6.5, 9, 12, 15.5, 18, 21, 24.5, 27 | 30.005 |
+| `hdr10.mkv` | HDR10: Main 10 HEVC, PQ and BT.2020 with mastering metadata — the transfer a conversion tone-maps | 0, 3, 6.5, 9, 12, 15.5, 18, 21, 24.5, 27 | 30.000 |
 | `h264.mp4` | MP4 `stss`/`stts`/`ctts` with an edit list; faststart | 0, 3.5, 6, 9, 11.5, 15, 18, 20.5, 24, 27 | 30.000 |
 | `moov-at-end.mp4` | A `moov` after the `mdat`, found by walking box headers | 0, 2, 5 | 8.0 |
 | `scout-streams.json` | A den-scout stream list: uncached, AV1, XviD/AVI, 3D and cache-unknown releases to skip | — | — |
@@ -31,6 +32,13 @@ ffmpeg -y -f lavfi -i testsrc2=size=320x180:rate=24:duration=30 -f lavfi -i sine
   -x265-params keyint=1000:min-keyint=1000:scenecut=0:bframes=3:open-gop=0:log-level=error \
   -force_key_frames 0,3,6.5,9,12,15.5,18,21,24.5,27 -pix_fmt yuv420p \
   -c:a eac3 -b:a 64k -ac 2 -metadata:s:a:0 language=eng hevc.mkv
+
+ffmpeg -y -f lavfi -i testsrc2=size=320x180:rate=24:duration=30 -f lavfi -i sine=frequency=550:duration=30:sample_rate=48000 \
+  -map 0:v -map 1:a -c:v libx265 -preset fast -crf 36 -forced-idr 1 \
+  -x265-params "keyint=1000:min-keyint=1000:scenecut=0:bframes=3:open-gop=0:log-level=error:hdr-opt=1:repeat-headers=1:colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc:master-display=G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(40000000,50):max-cll=801,188" \
+  -force_key_frames 0,3,6.5,9,12,15.5,18,21,24.5,27 -pix_fmt yuv420p10le \
+  -color_primaries bt2020 -color_trc smpte2084 -colorspace bt2020nc \
+  -c:a eac3 -b:a 64k -ac 2 -metadata:s:a:0 language=eng hdr10.mkv
 
 ffmpeg -y -f lavfi -i testsrc2=size=320x180:rate=24:duration=30 -f lavfi -i sine=frequency=440:duration=30:sample_rate=48000 \
   -map 0:v -map 1:a -c:v libx264 -preset veryfast -crf 36 -bf 3 -g 1000 -keyint_min 1000 -sc_threshold 0 \

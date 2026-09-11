@@ -63,6 +63,17 @@ async fn matroska_cues_match_ffprobes_keyframes() {
 }
 
 #[tokio::test]
+async fn an_hdr10_release_reads_as_hdr_and_is_tone_mapped() {
+    let info = probe_with_head(&fixture("hdr10.mkv"), crate::scout::HEAD_BYTES as usize).await;
+    assert_keyframes(&info.keyframes, &HEVC_MKV_KF);
+    assert_eq!(info.video, VideoCodec::Hevc);
+    assert!(info.codecs.as_deref().is_some_and(|c| c.starts_with("hvc1.2.4.L")), "Main 10: {:?}", info.codecs);
+    assert!(info.hdr, "the PQ transfer");
+    assert!(info.dolby_vision.is_none());
+    assert!(crate::session::tonemaps(&info), "a conversion of it has to tone-map, or it plays nowhere");
+}
+
+#[tokio::test]
 async fn hevc_matroska_gives_an_hvc1_codec_string() {
     let info = probe_with_head(&fixture("hevc.mkv"), crate::scout::HEAD_BYTES as usize).await;
     assert_keyframes(&info.keyframes, &HEVC_MKV_KF);

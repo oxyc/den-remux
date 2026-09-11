@@ -32,6 +32,8 @@ const PIXEL_WIDTH: u32 = 0xB0;
 const PIXEL_HEIGHT: u32 = 0xBA;
 const COLOUR: u32 = 0x55B0;
 const TRANSFER_CHARACTERISTICS: u32 = 0x55BA;
+const PRIMARIES: u32 = 0x55BB;
+const MATRIX_COEFFICIENTS: u32 = 0x55B1;
 const AUDIO: u32 = 0xE1;
 const CHANNELS: u32 = 0x9F;
 const BLOCK_ADDITION_MAPPING: u32 = 0x41E4;
@@ -120,6 +122,8 @@ struct Track {
     width: u32,
     height: u32,
     transfer: u64,
+    primaries: u64,
+    matrix: u64,
     channels: u32,
     dovi: Option<super::DolbyVision>,
 }
@@ -145,10 +149,11 @@ fn parse_tracks(b: &[u8]) -> Vec<Track> {
                     VIDEO => {
                         t.width = child(v, PIXEL_WIDTH).map(uint).unwrap_or(0) as u32;
                         t.height = child(v, PIXEL_HEIGHT).map(uint).unwrap_or(0) as u32;
-                        t.transfer = child(v, COLOUR)
-                            .and_then(|c| child(c, TRANSFER_CHARACTERISTICS))
-                            .map(uint)
-                            .unwrap_or(0);
+                        let colour = child(v, COLOUR);
+                        let of = |id| colour.and_then(|c| child(c, id)).map(uint).unwrap_or(0);
+                        t.transfer = of(TRANSFER_CHARACTERISTICS);
+                        t.primaries = of(PRIMARIES);
+                        t.matrix = of(MATRIX_COEFFICIENTS);
                     }
                     AUDIO => t.channels = child(v, CHANNELS).map(uint).unwrap_or(1) as u32,
                     BLOCK_ADDITION_MAPPING => {
@@ -324,7 +329,7 @@ pub async fn probe(src: &Source<'_>, head: &[u8]) -> Result<MediaInfo, ProbeErro
         codecs,
         width: video.width,
         height: video.height,
-        hdr: super::is_hdr_transfer(video.transfer),
+        hdr: super::is_hdr(video.transfer, video.primaries, video.matrix),
         dolby_vision: video.dovi,
         audio,
         keyframes,
