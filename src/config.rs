@@ -1,6 +1,7 @@
 //! Runtime configuration, all from the environment.
 //!
-//! Env: PORT, SCOUT_ORIGINS, REMUX_SCOUT_KEY, SCOUT_INSTALL_URL, SUBTITLE_ORIGINS, BROWSER_KEY_HASHES, REMUX_URL_KEY,
+//! Env: PORT, SCOUT_ORIGINS, REMUX_SCOUT_KEY, SCOUT_INSTALL_URL, SUBTITLE_ORIGINS, ORIGIN_ALIASES, BROWSER_KEY_HASHES,
+//!      REMUX_URL_KEY,
 //!      MAX_SESSIONS, MAX_SESSIONS_PER_INSTALL, SESSION_IDLE_SECS, SCRATCH_DIR, SCRATCH_MAX_BYTES, FFMPEG_PATH,
 //!      MAX_TRANSCODES, VAAPI_DEVICE, TRUSTED_PROXIES, METRICS_TOKEN, LOG_REQUESTS.
 
@@ -23,6 +24,11 @@ pub struct Config {
     /// `SUBTITLE_ORIGINS` — the only origins a request's den-subtitles install, and the subtitle URLs it
     /// answers with, may be on. Empty turns subtitles off.
     pub subtitle_origins: Vec<String>,
+    /// `ORIGIN_ALIASES` — public origin → LAN origin (`https://d-scout.oxy.fi=http://192.168.86.193:8080,…`).
+    /// scout and den-subtitles are on this box, so an install URL or play URL on a public name is fetched at
+    /// the LAN address: two services on one box must not need the WAN, Cloudflare and the tunnel between
+    /// them, and this service never holds the Access token the public names ask for (oxyc/den#15).
+    pub origin_aliases: Vec<(String, String)>,
     /// `BROWSER_KEY_HASHES` — SHA-256 of each browser's key. Only hashes live in the env file, so the
     /// file on the box cannot be replayed as a key.
     pub browser_key_hashes: Vec<[u8; 32]>,
@@ -120,6 +126,40 @@ pub(crate) fn parse_proxies(raw: &str) -> Vec<std::net::IpAddr> {
         .collect()
 }
 
+/// `ORIGIN_ALIASES`: comma-separated `<public origin>=<LAN origin>` pairs, each side as `parse_origins` reads
+/// it. A malformed pair is said once and skipped.
+pub(crate) fn parse_aliases(raw: &str) -> Vec<(String, String)> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .filter_map(|pair| {
+            let parsed = pair.split_once('=').and_then(|(public, lan)| {
+                let one = |o: &str| parse_origins(o).into_iter().next();
+                Some((one(public)?, one(lan)?))
+            });
+            if parsed.is_none() {
+                eprintln!(
+                    "warning: ORIGIN_ALIASES entry {pair:?} is not <public origin>=<LAN origin>; skipping it"
+                );
+            }
+            parsed
+        })
+        .collect()
+}
+
+/// `url` at its LAN address when it is on a public origin in `aliases`; anything else as it is. The path
+/// and query are kept, so a sealed config segment or a ticket goes along unchanged.
+pub fn local(url: &str, aliases: &[(String, String)]) -> String {
+    for (public, lan) in aliases {
+        if let Some(rest) = url.strip_prefix(public.as_str()) {
+            if rest.is_empty() || rest.starts_with(['/', '?']) {
+                return format!("{lan}{rest}");
+            }
+        }
+    }
+    url.to_string()
+}
+
 /// Below this the cap cannot hold one window of a 4K session, and every job would sit paused.
 const MIN_SCRATCH_BYTES: u64 = 64 * 1024 * 1024;
 
@@ -141,6 +181,7 @@ impl Config {
             scout_key: env_opt("REMUX_SCOUT_KEY"),
             scout_install_url: env_opt("SCOUT_INSTALL_URL").map(|u| u.trim_end_matches('/').to_string()),
             subtitle_origins: parse_origins(&env_opt("SUBTITLE_ORIGINS").unwrap_or_default()),
+            origin_aliases: parse_aliases(&env_opt("ORIGIN_ALIASES").unwrap_or_default()),
             browser_key_hashes: parse_key_hashes(&env_opt("BROWSER_KEY_HASHES").unwrap_or_default()),
             url_key,
             url_key_ephemeral,
@@ -184,6 +225,25 @@ mod tests {
             "http://192.168.86.193:8080/, HTTPS://Scout.lan ,http://x/path,ftp://y,http://u@z,",
         );
         assert_eq!(o, ["http://192.168.86.193:8080", "https://scout.lan"]);
+    }
+
+    #[test]
+    fn a_public_name_is_fetched_at_its_lan_address() {
+        let a = parse_aliases(
+            "https://d-scout.oxy.fi=http://192.168.86.193:8080, HTTPS://D-Subs.oxy.fi/=http://192.168.86.193:8093,junk",
+        );
+        assert_eq!(a.len(), 2, "{a:?}");
+        assert_eq!(local("https://d-scout.oxy.fi/c2VhbGVk", &a), "http://192.168.86.193:8080/c2VhbGVk");
+        assert_eq!(
+            local("https://d-subs.oxy.fi/c/subtitle/9.vtt?lang=fin", &a),
+            "http://192.168.86.193:8093/c/subtitle/9.vtt?lang=fin"
+        );
+        assert_eq!(
+            local("https://d-scout.oxy.fi.evil/x", &a),
+            "https://d-scout.oxy.fi.evil/x",
+            "a longer host is not the name"
+        );
+        assert_eq!(local("https://cdn.debrid/f.mkv", &a), "https://cdn.debrid/f.mkv");
     }
 
     #[test]

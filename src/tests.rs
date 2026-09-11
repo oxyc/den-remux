@@ -279,6 +279,7 @@ fn state_with(origin: &str, max_sessions: usize, idle: Duration, scout_key: Opti
         scout_key: scout_key.map(String::from),
         scout_install_url: Some(format!("{origin}/cfg")),
         subtitle_origins: vec![origin.to_string()],
+        origin_aliases: Vec::new(),
         browser_key_hashes: vec![crate::auth::sha256(b"phone-key"), crate::auth::sha256(b"laptop-key")],
         url_key: b"integration-test-key".to_vec(),
         url_key_ephemeral: false,
@@ -783,6 +784,22 @@ async fn hevc_for_a_player_without_it_takes_the_one_transcode() {
     state.end_session(j["sid"].as_str().unwrap(), "test").await;
     let r = call(&state, "POST", "/remux/session", Some(&laptop), h264_only).await;
     assert_eq!(r.status, StatusCode::CREATED, "the ended session gave its transcode back: {}", r.text());
+    state.end_all("test").await;
+}
+
+/// An install URL on a public name (`ORIGIN_ALIASES`) is fetched at scout's LAN address: the session is
+/// made, though the public name here resolves nowhere at all.
+#[tokio::test]
+async fn a_public_install_url_is_fetched_at_its_lan_address() {
+    let origin = origin().await;
+    let mut state = test_state(&origin, 2, Duration::from_secs(600));
+    let cfg = &mut Arc::get_mut(&mut state).expect("only this test holds the state").cfg;
+    cfg.scout_origins.push("https://d-scout.invalid".into());
+    cfg.origin_aliases = vec![("https://d-scout.invalid".into(), origin.clone())];
+    let cookie = login(&state, "phone-key").await;
+    let body = r#"{"imdb":"tt0000001","scout":"https://d-scout.invalid/cfg"}"#;
+    let r = call(&state, "POST", "/remux/session", Some(&cookie), body).await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
     state.end_all("test").await;
 }
 

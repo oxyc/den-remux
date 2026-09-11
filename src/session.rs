@@ -393,7 +393,8 @@ impl Session {
             }
             i.reresolved = true;
         }
-        match scout::resolve(&st.scout_http, &self.play_url, &self.source).await {
+        let play_url = crate::config::local(&self.play_url, &st.cfg.origin_aliases);
+        match scout::resolve(&st.scout_http, &play_url, &self.source).await {
             Ok(r) => self.lock().input = r.url,
             Err(e) => eprintln!(
                 "session {}: re-resolving the release failed: {}",
@@ -561,6 +562,7 @@ impl Session {
             });
             return None;
         }
+        let vtt = crate::config::local(&vtt, &st.cfg.origin_aliases);
         let fetched = async {
             let resp = st.scout_http.get(&vtt).send().await.map_err(|e| e.without_url().to_string())?;
             if !resp.status().is_success() {
@@ -667,7 +669,9 @@ async fn open(
     src: &scout::ScoutSource,
     s: &scout::Stream,
 ) -> Result<(scout::Resolved, MediaInfo), String> {
-    let r = scout::resolve(&st.scout_http, &s.url, src).await?;
+    // A ticket on scout's public name (d-play) is fetched at its LAN address, like the install it came from.
+    let r =
+        scout::resolve(&st.scout_http, &crate::config::local(&s.url, &st.cfg.origin_aliases), src).await?;
     let info = crate::probe::probe(&Source::Http { client: &st.http, url: &r.url }, &r.head)
         .await
         .map_err(|e| e.to_string())?;
@@ -737,9 +741,14 @@ pub async fn create(
 ) -> Result<Arc<Session>, ApiError> {
     let imdb = want.id;
     let base = match want.scout {
-        Some(url) => scout::validate_scoped(url, &st.cfg.scout_origins).map_err(|why| {
-            api(StatusCode::BAD_REQUEST, "bad_scout", format!("The scout URL was refused: {why}."))
-        })?,
+        // Validated as sent, then fetched at its LAN address when that is a public name: scout is on this
+        // box. The LAN form is also what names the install, whichever name the browser used.
+        Some(url) => crate::config::local(
+            &scout::validate_scoped(url, &st.cfg.scout_origins).map_err(|why| {
+                api(StatusCode::BAD_REQUEST, "bad_scout", format!("The scout URL was refused: {why}."))
+            })?,
+            &st.cfg.origin_aliases,
+        ),
         None => st.cfg.scout_install_url.clone().ok_or_else(|| {
             api(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -762,15 +771,16 @@ pub async fn create(
         }
     }
     let sub_base = match want.subtitles {
-        Some(url) if !sub_langs.is_empty() => {
-            Some(scout::validate_scoped(url, &st.cfg.subtitle_origins).map_err(|why| {
+        Some(url) if !sub_langs.is_empty() => Some(crate::config::local(
+            &scout::validate_scoped(url, &st.cfg.subtitle_origins).map_err(|why| {
                 api(
                     StatusCode::BAD_REQUEST,
                     "bad_subtitles",
                     format!("The subtitles URL was refused: {why}."),
                 )
-            })?)
-        }
+            })?,
+            &st.cfg.origin_aliases,
+        )),
         _ => None,
     };
     // A browser starting another title is done with the one it was watching; making it wait out the

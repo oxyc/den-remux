@@ -1,6 +1,6 @@
 [package]
 name = "den-remux"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 description = "Den's browser playback: the library's scout install, keyframe-cut HLS (fMP4) with the video copied and the audio re-encoded to AAC stereo"
 publish = false
