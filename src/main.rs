@@ -407,7 +407,7 @@ where
         return bad_request(
             "Expected {\"imdb\": \"tt…\", \"season\"?: n, \"episode\"?: n, \"filename\"?: \"…\", \"scout\"?: \"…\", \
              \"audio\"?: [\"en\", …], \"audioTrack\"?: n, \"subtitles\"?: \"…\", \"subtitleLanguages\"?: [\"en\", …], \
-             \"videoCodecs\"?: [\"h264\", \"hevc\"], \"playable\"?: {\"h264\", \"hevcMain\", \"hevcMain10\", \"hdr\"}}.",
+             \"videoCodecs\"?: [\"h264\", \"hevc\"], \"playable\"?: {\"h264\", \"hevcMain\", \"hevcMain10\", \"hevcHighTier\", \"hdr\"}}.",
         );
     };
     // A logged-in browser, or — with no cookie — whoever holds the scout install the request names: that

@@ -715,14 +715,17 @@ pub struct Want<'a> {
 }
 
 /// What the player decodes, as its own tests found (`playable` in `POST /remux/session`): the highest level it
-/// takes of H.264 (`level_idc`), 8-bit and 10-bit HEVC (`general_level_idc`, level × 30), 0 for none, and whether
-/// it decodes PQ HDR. An HEVC release beyond it is transcoded on the GPU; an H.264 one is passed over.
+/// takes of H.264 (`level_idc`), 8-bit and 10-bit HEVC (`general_level_idc`, level × 30) and HEVC's High tier, 0
+/// for none, and whether it decodes PQ HDR. An HEVC release beyond it is transcoded on the GPU; an H.264 one is
+/// passed over.
 #[derive(serde::Deserialize, Clone, Copy, Debug, Default)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Playable {
     pub h264: u16,
     pub hevc_main: u16,
     pub hevc_main10: u16,
+    /// A UHD Blu-ray remux is often High tier, which Apple's decoders don't take at all.
+    pub hevc_high_tier: u16,
     pub hdr: bool,
 }
 
@@ -731,13 +734,14 @@ impl Playable {
     /// refuse every release without a codec record.
     pub fn takes(&self, info: &crate::probe::MediaInfo) -> bool {
         let named = info.codecs.as_deref().and_then(crate::probe::profile_level);
-        let fits = |max: u16| max > 0 && named.is_none_or(|(_, level)| level <= max);
+        let fits = |max: u16| max > 0 && named.is_none_or(|(_, level, _)| level <= max);
         match info.video {
             VideoCodec::H264 => fits(self.h264),
             VideoCodec::Hevc => {
-                let max = match named.map(|(profile, _)| profile) {
-                    Some(1) | None => self.hevc_main.max(self.hevc_main10),
-                    Some(2) => self.hevc_main10,
+                let max = match named {
+                    Some((_, _, true)) => self.hevc_high_tier,
+                    Some((1, _, _)) | None => self.hevc_main.max(self.hevc_main10),
+                    Some((2, _, _)) => self.hevc_main10,
                     Some(_) => 0,
                 };
                 fits(max) && (!info.hdr || self.hdr)
@@ -1120,9 +1124,12 @@ mod tests {
 
     #[test]
     fn a_player_takes_what_its_levels_and_hdr_allow() {
-        let phone = Playable { h264: 0x33, hevc_main: 153, hevc_main10: 153, hdr: true };
+        let phone = Playable { h264: 0x33, hevc_main: 153, hevc_main10: 153, hevc_high_tier: 0, hdr: true };
         let hobbit = info(VideoCodec::Hevc, "hvc1.2.4.L153.B0", true);
         assert!(phone.takes(&hobbit));
+        let bluray = info(VideoCodec::Hevc, "hvc1.2.4.H153.B0", true);
+        assert!(!phone.takes(&bluray), "High tier, which an iPhone doesn't decode");
+        assert!(Playable { hevc_high_tier: 153, ..phone }.takes(&bluray));
         assert!(!Playable { hdr: false, ..phone }.takes(&hobbit), "HDR it can't decode is converted");
         assert!(!Playable { hevc_main10: 0, ..phone }.takes(&hobbit), "8-bit HEVC only");
         assert!(!Playable { hevc_main10: 123, ..phone }.takes(&hobbit), "1080p at most");

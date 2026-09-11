@@ -195,20 +195,22 @@ pub fn avc_codecs(avcc: &[u8]) -> Option<String> {
     (avcc.len() >= 4 && avcc[0] == 1).then(|| format!("avc1.{:02x}{:02x}{:02x}", avcc[1], avcc[2], avcc[3]))
 }
 
-/// The profile and level an RFC 6381 string names: `avc1.640033` is (100, 51), level 5.1 as `level_idc`;
-/// `hvc1.2.4.L153.B0` is (2, 153), Main 10 at level 5.1 as `general_level_idc` (level × 30).
-pub fn profile_level(codecs: &str) -> Option<(u8, u16)> {
+/// The profile, level and tier an RFC 6381 string names: `avc1.640033` is (100, 51, false), level 5.1 as
+/// `level_idc`; `hvc1.2.4.H153.B0` is (2, 153, true), Main 10 at level 5.1 (`general_level_idc`, level × 30) in
+/// HEVC's High tier.
+pub fn profile_level(codecs: &str) -> Option<(u8, u16, bool)> {
     let mut parts = codecs.split('.');
     match parts.next()? {
         "avc1" | "avc3" => {
             let p = parts.next()?;
             let byte = |i: usize| u8::from_str_radix(p.get(i..i + 2)?, 16).ok();
-            Some((byte(0)?, byte(4)? as u16))
+            Some((byte(0)?, byte(4)? as u16, false))
         }
         "hvc1" | "hev1" => {
             let profile = parts.next()?.trim_start_matches(['A', 'B', 'C']).parse().ok()?;
-            let level = parts.nth(1)?.get(1..)?.parse().ok()?;
-            Some((profile, level))
+            let tier_level = parts.nth(1)?;
+            let level = tier_level.get(1..)?.parse().ok()?;
+            Some((profile, level, tier_level.starts_with('H')))
         }
         _ => None,
     }
@@ -258,10 +260,11 @@ mod tests {
 
     #[test]
     fn a_codec_string_names_its_profile_and_level() {
-        assert_eq!(profile_level("avc1.640033"), Some((100, 51)));
-        assert_eq!(profile_level("hvc1.2.4.L153.B0"), Some((2, 153)));
-        assert_eq!(profile_level("hvc1.1.6.L93.90"), Some((1, 93)));
-        assert_eq!(profile_level("hev1.A1.60.H120"), Some((1, 120)));
+        assert_eq!(profile_level("avc1.640033"), Some((100, 51, false)));
+        assert_eq!(profile_level("hvc1.2.4.L153.B0"), Some((2, 153, false)));
+        assert_eq!(profile_level("hvc1.2.4.H153.B0"), Some((2, 153, true)), "a UHD Blu-ray remux's");
+        assert_eq!(profile_level("hvc1.1.6.L93.90"), Some((1, 93, false)));
+        assert_eq!(profile_level("hev1.A1.60.H120"), Some((1, 120, true)));
         assert_eq!(profile_level("mp4a.40.2"), None);
         assert_eq!(profile_level("hvc1.2"), None);
     }
