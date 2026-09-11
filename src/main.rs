@@ -2,6 +2,7 @@
 //!
 //!   POST /remux/login   {key}               → cookie for what needs this service to vouch
 //!   POST /remux/session {imdb, season?, episode?, filename?, scout?} → a signed session: /remux/s/<sid>/<sig>/master.m3u8
+//!   POST /remux/releases {imdb, season?, episode?, scout?} → what a session could play: labels and names, no URLs
 //!   GET  /remux/s/<sid>/<sig>/…             → HLS (fMP4): master, media, init.mp4, seg<N>.m4s
 //!   POST /remux/s/<sid>/<sig>/report {code, message} → the player couldn't play it, into the log
 //!   DELETE /remux/s/<sid>/<sig>             → end it (410 from then on)
@@ -209,7 +210,10 @@ where
     // origins (`WEB_ORIGINS`): a wildcard there would invite every site to try.
     if parts.uri.path().starts_with("/remux/s/") {
         add_cors(&mut resp);
-    } else if matches!(parts.uri.path(), "/remux/login" | "/remux/session" | "/remux/health") {
+    } else if matches!(
+        parts.uri.path(),
+        "/remux/login" | "/remux/session" | "/remux/releases" | "/remux/health"
+    ) {
         if let Some(origin) = web_origin(&state, &parts.headers) {
             resp.headers_mut().insert("access-control-allow-origin", origin);
         }
@@ -284,8 +288,10 @@ where
                 .unwrap()
         }
         "/health" | "/remux/health" | "/metrics" => method_not_allowed("GET, HEAD"),
-        "/remux/login" | "/remux/session" if parts.method == Method::OPTIONS => preflight(),
-        "/remux/login" | "/remux/session"
+        "/remux/login" | "/remux/session" | "/remux/releases" if parts.method == Method::OPTIONS => {
+            preflight()
+        }
+        "/remux/login" | "/remux/session" | "/remux/releases"
             if parts.method == Method::POST && !state.admit(visitor(state, parts)) =>
         {
             httputil::json(
@@ -296,7 +302,8 @@ where
         }
         "/remux/login" if parts.method == Method::POST => login(state, body).await,
         "/remux/session" if parts.method == Method::POST => create_session(state, parts, body).await,
-        "/remux/login" | "/remux/session" => method_not_allowed("POST"),
+        "/remux/releases" if parts.method == Method::POST => list_releases(state, parts, body).await,
+        "/remux/login" | "/remux/session" | "/remux/releases" => method_not_allowed("POST"),
         _ => match path.strip_prefix("/remux/s/") {
             Some(rest) => session_route(state, parts, rest, body).await,
             None => httputil::not_found(),
@@ -371,6 +378,73 @@ where
         .unwrap()
 }
 
+/// The logged-in browser the request's cookie names, if any.
+fn browser_of(state: &AppState, parts: &hyper::http::request::Parts) -> Option<String> {
+    let cookies: Vec<&str> =
+        parts.headers.get_all(hyper::header::COOKIE).iter().filter_map(|v| v.to_str().ok()).collect();
+    let cookie = cookies.join("; ");
+    auth::cookie_browser(&state.cfg.url_key, &state.cfg.browser_key_hashes, Some(&cookie), unix_now())
+}
+
+/// `POST /remux/releases`: what a session for the title could play, admitted as a session is — by the cookie, or
+/// the scout install named.
+async fn list_releases<B>(
+    state: &Arc<AppState>,
+    parts: &hyper::http::request::Parts,
+    body: B,
+) -> Response<Body>
+where
+    B: hyper::body::Body<Data = Bytes> + Send + 'static,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    #[derive(Deserialize)]
+    struct Title {
+        imdb: String,
+        season: Option<u32>,
+        episode: Option<u32>,
+        scout: Option<String>,
+    }
+    let Some(req) = read_body(body).await.and_then(|b| serde_json::from_slice::<Title>(&b).ok()) else {
+        return bad_request(
+            "Expected {\"imdb\": \"tt…\", \"season\"?: n, \"episode\"?: n, \"scout\"?: \"…\"}.",
+        );
+    };
+    let admission = match (browser_of(state, parts), &req.scout) {
+        (Some(b), _) => session::Admission::Browser(b),
+        (None, Some(_)) => session::Admission::Install,
+        (None, None) => {
+            return httputil::error(
+                StatusCode::UNAUTHORIZED,
+                "not_logged_in",
+                "Name a scout install, or log in with this browser's key.",
+            )
+        }
+    };
+    if !scout::is_imdb(&req.imdb) {
+        return bad_request("imdb must be an IMDb id, tt followed by digits.");
+    }
+    let episode = match (req.season, req.episode) {
+        (Some(s), Some(e)) => Some((s, e)),
+        (None, None) => None,
+        _ => return bad_request("An episode needs both season and episode."),
+    };
+    let id = scout::title_id(&req.imdb, episode);
+    match session::releases(state, admission, req.scout.as_deref(), &id).await {
+        Ok(list) => httputil::json(
+            StatusCode::OK,
+            &serde_json::json!({
+                "releases": list.iter().map(|s| serde_json::json!({
+                    "label": s.attributes.label,
+                    "filename": s.filename(),
+                    "size": s.attributes.size_bytes,
+                })).collect::<Vec<_>>(),
+            }),
+            &[],
+        ),
+        Err(e) => httputil::error(e.status, e.code, &e.detail),
+    }
+}
+
 async fn create_session<B>(
     state: &Arc<AppState>,
     parts: &hyper::http::request::Parts,
@@ -380,11 +454,7 @@ where
     B: hyper::body::Body<Data = Bytes> + Send + 'static,
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
-    let cookies: Vec<&str> =
-        parts.headers.get_all(hyper::header::COOKIE).iter().filter_map(|v| v.to_str().ok()).collect();
-    let cookie = cookies.join("; ");
-    let browser =
-        auth::cookie_browser(&state.cfg.url_key, &state.cfg.browser_key_hashes, Some(&cookie), unix_now());
+    let browser = browser_of(state, parts);
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
     struct Create {

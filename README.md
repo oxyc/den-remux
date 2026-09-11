@@ -25,6 +25,9 @@ POST   /remux/session                   {imdb, season?, episode?, filename?, sco
                                         400 bad_request/bad_scout/bad_subtitles/bad_audio_track
                                         404 no_release/no_playable_release · 429 too_many_sessions/rate_limited
                                         502 scout_unavailable · 503 scout_unconfigured/transcode_unavailable
+POST   /remux/releases                  {imdb, season?, episode?, scout?} (a full scout install, or the cookie)
+                                        → 200 {releases:[{label,filename,size}]}: what a session could play, in the
+                                        order it would try them, for a player to name one as `filename`. No URLs
 GET    /remux/s/<sid>/<sig>/master.m3u8 one variant: CODECS "<avc1…|hvc1…>,mp4a.40.2", BANDWIDTH from size/duration
 GET    /remux/s/<sid>/<sig>/media.m3u8  VOD, #EXT-X-MAP init.mp4, segments on real keyframes, #EXT-X-ENDLIST
 GET    /remux/s/<sid>/<sig>/init.mp4

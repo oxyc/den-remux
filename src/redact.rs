@@ -34,7 +34,10 @@ pub fn scrub(text: &str, secrets: &[&str]) -> String {
 /// id shortened and the signature removed, and anything else as `/<unrouted>` — a stray path could be
 /// someone pasting a URL that carries a secret.
 pub fn path(path: &str) -> Cow<'_, str> {
-    if matches!(path, "/health" | "/remux/health" | "/metrics" | "/remux/login" | "/remux/session") {
+    if matches!(
+        path,
+        "/health" | "/remux/health" | "/metrics" | "/remux/login" | "/remux/session" | "/remux/releases"
+    ) {
         return path.into();
     }
     let Some(rest) = path.strip_prefix("/remux/s/") else { return "/<unrouted>".into() };

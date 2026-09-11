@@ -506,6 +506,21 @@ async fn end_to_end(imdb: &str, fixture_name: &str, codec_prefix: &str, scoped: 
 }
 
 #[tokio::test]
+async fn the_releases_list_names_and_labels_never_a_url() {
+    let origin = origin().await;
+    let state = test_state(&origin, 2, Duration::from_secs(60));
+    let body = format!(r#"{{"imdb":"tt0000001","scout":"{origin}/cfg"}}"#);
+    let r = call(&state, "POST", "/remux/releases", None, &body).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let releases = r.json()["releases"].as_array().unwrap().clone();
+    assert_eq!(releases.len(), 1, "the uncached decoy is not one: {}", r.text());
+    assert_eq!(releases[0]["filename"], "h264.mkv");
+    assert!(!r.text().contains("http"), "no URL reaches the browser: {}", r.text());
+    let anonymous = call(&state, "POST", "/remux/releases", None, r#"{"imdb":"tt0000001"}"#).await;
+    assert_eq!(anonymous.status, StatusCode::UNAUTHORIZED, "no cookie and no install");
+}
+
+#[tokio::test]
 #[ignore]
 async fn h264_matroska_end_to_end() {
     end_to_end("tt0000001", "h264.mkv", "avc1.64", true).await;

@@ -797,6 +797,78 @@ pub enum Admission {
     Install,
 }
 
+/// The scout install a request names, or this service's own. Validated as sent, then fetched at its LAN address
+/// when that is a public name: scout is on this box. The LAN form is also what names the install, whichever name
+/// the browser used.
+fn scout_base(st: &AppState, scout: Option<&str>) -> Result<String, ApiError> {
+    match scout {
+        Some(url) => Ok(crate::config::local(
+            &scout::validate_scoped(url, &st.cfg.scout_origins).map_err(|why| {
+                api(StatusCode::BAD_REQUEST, "bad_scout", format!("The scout URL was refused: {why}."))
+            })?,
+            &st.cfg.origin_aliases,
+        )),
+        None => st.cfg.scout_install_url.clone().ok_or_else(|| {
+            api(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "scout_unconfigured",
+                "No scout URL in the request, and no SCOUT_INSTALL_URL.",
+            )
+        }),
+    }
+}
+
+/// Scout's releases for `id`, its refusals put in this API's terms.
+async fn scout_list(
+    st: &AppState,
+    source: &scout::ScoutSource,
+    id: &str,
+    by_install: bool,
+) -> Result<Vec<scout::Stream>, ApiError> {
+    let secrets = [source.base.as_str()];
+    scout::list(&st.scout_http, source, id).await.map_err(|e| match e.status {
+        // Out of scope: an availability-only install, which plays only with den-remux's key — sent for a
+        // logged-in browser alone.
+        Some(403) if by_install => api(
+            StatusCode::UNAUTHORIZED,
+            "not_logged_in",
+            "This scout install can't play on its own; log in with this browser's key.",
+        ),
+        // Scout would not open the install: revoked, out of scope, or not one of its own.
+        Some(status @ (400 | 403)) => {
+            crate::log_limited("scout_refused", || format!("scout: refused the install ({status})"));
+            api(
+                StatusCode::FORBIDDEN,
+                "scout_refused",
+                "Scout refused this install: revoked, or one it can't open.",
+            )
+        }
+        _ => {
+            crate::log_limited("scout_list", || {
+                format!("scout: {}", crate::redact::scrub(&e.detail, &secrets))
+            });
+            api(StatusCode::BAD_GATEWAY, "scout_unavailable", "Could not list releases.")
+        }
+    })
+}
+
+/// `POST /remux/releases`: the releases a session could play, in the order it would try them, so a player can name
+/// one (`filename`). The caller gets their labels, names and sizes — never a URL.
+pub async fn releases(
+    st: &Arc<AppState>,
+    admission: Admission,
+    scout: Option<&str>,
+    id: &str,
+) -> Result<Vec<scout::Stream>, ApiError> {
+    let by_install = matches!(admission, Admission::Install);
+    let key = match admission {
+        Admission::Browser(_) => st.cfg.scout_key.clone(),
+        Admission::Install => None,
+    };
+    let source = scout::ScoutSource { base: scout_base(st, scout)?, key };
+    Ok(scout::candidates(&scout_list(st, &source, id, by_install).await?, None))
+}
+
 /// `POST /remux/session`: pick and probe a release, choose its audio track, and set up its session.
 pub async fn create(
     st: &Arc<AppState>,
@@ -804,23 +876,7 @@ pub async fn create(
     want: &Want<'_>,
 ) -> Result<Arc<Session>, ApiError> {
     let imdb = want.id;
-    let base = match want.scout {
-        // Validated as sent, then fetched at its LAN address when that is a public name: scout is on this
-        // box. The LAN form is also what names the install, whichever name the browser used.
-        Some(url) => crate::config::local(
-            &scout::validate_scoped(url, &st.cfg.scout_origins).map_err(|why| {
-                api(StatusCode::BAD_REQUEST, "bad_scout", format!("The scout URL was refused: {why}."))
-            })?,
-            &st.cfg.origin_aliases,
-        ),
-        None => st.cfg.scout_install_url.clone().ok_or_else(|| {
-            api(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "scout_unconfigured",
-                "No scout URL in the request, and no SCOUT_INSTALL_URL.",
-            )
-        })?,
-    };
+    let base = scout_base(st, want.scout)?;
     let by_install = matches!(admission, Admission::Install);
     let (owner, key, share) = match admission {
         Admission::Browser(b) => (b, st.cfg.scout_key.clone(), 1),
@@ -865,30 +921,7 @@ pub async fn create(
         ));
     };
     let secrets = [source.base.as_str()];
-    let list = scout::list(&st.scout_http, &source, imdb).await.map_err(|e| match e.status {
-        // Out of scope: an availability-only install, which plays only with den-remux's key — sent for a
-        // logged-in browser alone.
-        Some(403) if by_install => api(
-            StatusCode::UNAUTHORIZED,
-            "not_logged_in",
-            "This scout install can't play on its own; log in with this browser's key.",
-        ),
-        // Scout would not open the install: revoked, out of scope, or not one of its own.
-        Some(status @ (400 | 403)) => {
-            crate::log_limited("scout_refused", || format!("scout: refused the install ({status})"));
-            api(
-                StatusCode::FORBIDDEN,
-                "scout_refused",
-                "Scout refused this install: revoked, or one it can't open.",
-            )
-        }
-        _ => {
-            crate::log_limited("scout_list", || {
-                format!("scout: {}", crate::redact::scrub(&e.detail, &secrets))
-            });
-            api(StatusCode::BAD_GATEWAY, "scout_unavailable", "Could not list releases.")
-        }
-    })?;
+    let list = scout_list(st, &source, imdb, by_install).await?;
     let mut candidates = scout::candidates(&list, want.filename);
     if candidates.is_empty() {
         return Err(api(
