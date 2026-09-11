@@ -292,6 +292,7 @@ fn state_with(origin: &str, max_sessions: usize, idle: Duration, scout_key: Opti
         max_transcodes: 1,
         vaapi_device: PathBuf::from("/dev/dri/renderD128"),
         trusted_proxies: vec!["192.168.86.149".parse().unwrap()],
+        web_origins: vec!["https://d.example".into()],
         metrics_token: None,
         log_requests: false,
     });
@@ -650,6 +651,33 @@ async fn an_install_plays_its_share_and_its_oldest_gives_way() {
     let r = call(&state, "POST", "/remux/session", Some(&laptop), r#"{"imdb":"tt0000001"}"#).await;
     assert_eq!(r.json()["error"], "too_many_sessions");
     state.end_all("test").await;
+}
+
+/// The web app on its public name plays from this service's tailnet address, so it logs in and starts sessions
+/// cross-origin: those two routes answer its CORS, and no other origin's.
+#[tokio::test]
+async fn the_web_app_on_another_origin_may_start_sessions() {
+    let state = test_state("http://127.0.0.1:9", 2, Duration::from_secs(600));
+    let send = |method: &str, origin: &str| {
+        let req = Request::builder()
+            .method(method)
+            .uri("/remux/session")
+            .header("origin", origin)
+            .header("access-control-request-method", "POST")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        crate::handle_request(state.clone(), req)
+    };
+    let preflight = send("OPTIONS", "https://d.example").await;
+    assert_eq!(preflight.status(), StatusCode::NO_CONTENT);
+    assert_eq!(preflight.headers()["access-control-allow-origin"], "https://d.example");
+    assert_eq!(preflight.headers()["access-control-allow-headers"], "content-type");
+    let elsewhere = send("OPTIONS", "https://elsewhere.example").await;
+    assert!(elsewhere.headers().get("access-control-allow-origin").is_none());
+    // The answer itself is readable too — here a refusal of the empty body.
+    let post = send("POST", "https://d.example").await;
+    assert_eq!(post.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(post.headers()["access-control-allow-origin"], "https://d.example");
 }
 
 #[tokio::test]

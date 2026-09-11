@@ -204,10 +204,15 @@ where
     let start = std::time::Instant::now();
     let (parts, body) = req.into_parts();
     let mut resp = route(&state, &parts, body).await;
-    // Only the session files are readable cross-origin. Login and session creation are same-origin
-    // (the web app), and a wildcard there would invite every site to try.
+    // The session files are readable from anywhere. Login and session creation answer only the web app's other
+    // origins (`WEB_ORIGINS`): a wildcard there would invite every site to try.
     if parts.uri.path().starts_with("/remux/s/") {
         add_cors(&mut resp);
+    } else if matches!(parts.uri.path(), "/remux/login" | "/remux/session") {
+        if let Some(origin) = web_origin(&state, &parts.headers) {
+            resp.headers_mut().insert("access-control-allow-origin", origin);
+        }
+        resp.headers_mut().append("vary", hyper::header::HeaderValue::from_static("origin"));
     }
     if state.cfg.log_requests {
         let mut line = format!(
@@ -224,6 +229,25 @@ where
         eprintln!("{line}");
     }
     resp
+}
+
+/// The request's `Origin` when it is one of `WEB_ORIGINS`.
+fn web_origin(state: &AppState, headers: &hyper::HeaderMap) -> Option<hyper::header::HeaderValue> {
+    let origin = headers.get(hyper::header::ORIGIN)?;
+    let value = origin.to_str().ok()?.to_ascii_lowercase();
+    state.cfg.web_origins.contains(&value).then(|| origin.clone())
+}
+
+/// A web origin's preflight for login or a session: a JSON POST, remembered for a day. The allow-origin comes
+/// from `handle_request`, and only for `WEB_ORIGINS`.
+fn preflight() -> Response<Body> {
+    Response::builder()
+        .status(StatusCode::NO_CONTENT)
+        .header("access-control-allow-methods", "POST")
+        .header("access-control-allow-headers", "content-type")
+        .header("access-control-max-age", "86400")
+        .body(httputil::full(""))
+        .unwrap()
 }
 
 fn method_not_allowed(allow: &str) -> Response<Body> {
@@ -257,6 +281,7 @@ where
                 .unwrap()
         }
         "/health" | "/metrics" => method_not_allowed("GET, HEAD"),
+        "/remux/login" | "/remux/session" if parts.method == Method::OPTIONS => preflight(),
         "/remux/login" | "/remux/session"
             if parts.method == Method::POST && !state.admit(visitor(state, parts)) =>
         {

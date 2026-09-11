@@ -60,7 +60,8 @@ anything else                           404 {"error":"not_found"}
 `/remux/s/…` responses carry `Access-Control-Allow-Origin: *`, allow `Range` and expose
 `Content-Range`/`Content-Length` — a Cast receiver's page is on Google's origin. Playlists are
 `application/vnd.apple.mpegurl` and `no-store`; `init.mp4` and segments are `video/mp4`. Login and session
-creation get no CORS at all: they are for the Den web app on the same origin.
+creation answer CORS only for `WEB_ORIGINS`: the Den web app on its public name, whose player plays from this
+service's tailnet address because video never goes through the Cloudflare tunnel (oxyc/den#15).
 
 A logged-in browser that creates a session while it already has one ends the old one (it has moved on to
 another title), and an install past `MAX_SESSIONS_PER_INSTALL` ends its oldest, so `MAX_SESSIONS` counts
@@ -198,6 +199,7 @@ Every variable is unprefixed; `.env.example` lists them with their defaults.
 | `MAX_TRANSCODES` | `1` | Sessions transcoding on the GPU at once; `0` turns transcoding off. Copies do not count. |
 | `VAAPI_DEVICE` | `/dev/dri/renderD128` | The GPU's render node. Transcoding is on only when it exists and ffmpeg has the VAAPI encoder and filters (the startup line says `transcode=vaapi(max N)` or `off`). |
 | `TRUSTED_PROXIES` | — | Proxy IPs (comma-separated) whose `X-Forwarded-For` names the visitor, for the limit on logins and new sessions: `tailscale serve`'s host. |
+| `WEB_ORIGINS` | — | Pages on another origin that may log in and start sessions (comma-separated): the Den web app on its public name. Session files are readable from anywhere already. |
 | `METRICS_TOKEN` | — | Turns on `/metrics` behind `Authorization: Bearer <token>`; otherwise it is a 404. |
 | `LOG_REQUESTS` | off | `1` writes `<METHOD> <path> <status> <ms>ms[ rid=<X-Request-Id>]` per response. |
 | `PORT` | `8095` | |

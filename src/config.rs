@@ -3,7 +3,7 @@
 //! Env: PORT, SCOUT_ORIGINS, REMUX_SCOUT_KEY, SCOUT_INSTALL_URL, SUBTITLE_ORIGINS, ORIGIN_ALIASES, BROWSER_KEY_HASHES,
 //!      REMUX_URL_KEY,
 //!      MAX_SESSIONS, MAX_SESSIONS_PER_INSTALL, SESSION_IDLE_SECS, SCRATCH_DIR, SCRATCH_MAX_BYTES, FFMPEG_PATH,
-//!      MAX_TRANSCODES, VAAPI_DEVICE, TRUSTED_PROXIES, METRICS_TOKEN, LOG_REQUESTS.
+//!      MAX_TRANSCODES, VAAPI_DEVICE, TRUSTED_PROXIES, WEB_ORIGINS, METRICS_TOKEN, LOG_REQUESTS.
 
 use std::env;
 use std::path::PathBuf;
@@ -54,6 +54,10 @@ pub struct Config {
     /// `TRUSTED_PROXIES` — proxies (comma-separated IPs) whose `X-Forwarded-For` names the visitor, for the
     /// per-visitor limit on logins and new sessions. `tailscale serve` connects from its host's address.
     pub trusted_proxies: Vec<std::net::IpAddr>,
+    /// `WEB_ORIGINS` — pages on another origin that may log in and start sessions here (comma-separated): the Den
+    /// web app on its public name, whose player plays from this service's tailnet address (oxyc/den#15). Session
+    /// files are readable from anywhere already; these two routes answer CORS for these origins only.
+    pub web_origins: Vec<String>,
     /// `METRICS_TOKEN` — the bearer token `/metrics` requires. `None` turns the endpoint off (404).
     pub metrics_token: Option<String>,
     /// `LOG_REQUESTS` — one stderr line per response when set (anything but empty or `0`).
@@ -209,6 +213,7 @@ impl Config {
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("/dev/dri/renderD128")),
             trusted_proxies: parse_proxies(&env_opt("TRUSTED_PROXIES").unwrap_or_default()),
+            web_origins: parse_origins(&env_opt("WEB_ORIGINS").unwrap_or_default()),
             metrics_token: env_opt("METRICS_TOKEN"),
             log_requests: log_requests_on(env::var("LOG_REQUESTS").ok().as_deref()),
         }
