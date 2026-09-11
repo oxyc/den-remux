@@ -34,6 +34,11 @@ const COLOUR: u32 = 0x55B0;
 const TRANSFER_CHARACTERISTICS: u32 = 0x55BA;
 const AUDIO: u32 = 0xE1;
 const CHANNELS: u32 = 0x9F;
+const BLOCK_ADDITION_MAPPING: u32 = 0x41E4;
+const BLOCK_ADD_ID_TYPE: u32 = 0x41E7;
+const BLOCK_ADD_ID_EXTRA_DATA: u32 = 0x41ED;
+/// The block-addition types that carry a Dolby Vision configuration record.
+const DOVI_TYPES: [&[u8; 4]; 3] = [b"dvcC", b"dvvC", b"dvwC"];
 const CUES: u32 = 0x1C53BB6B;
 const CUE_POINT: u32 = 0xBB;
 const CUE_TIME: u32 = 0xB3;
@@ -116,6 +121,7 @@ struct Track {
     height: u32,
     transfer: u64,
     channels: u32,
+    dovi: Option<super::DolbyVision>,
 }
 
 fn parse_tracks(b: &[u8]) -> Vec<Track> {
@@ -145,6 +151,12 @@ fn parse_tracks(b: &[u8]) -> Vec<Track> {
                             .unwrap_or(0);
                     }
                     AUDIO => t.channels = child(v, CHANNELS).map(uint).unwrap_or(1) as u32,
+                    BLOCK_ADDITION_MAPPING => {
+                        let kind = child(v, BLOCK_ADD_ID_TYPE).map(uint);
+                        if DOVI_TYPES.iter().any(|d| kind == Some(u32::from_be_bytes(**d) as u64)) {
+                            t.dovi = child(v, BLOCK_ADD_ID_EXTRA_DATA).and_then(super::dovi_config);
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -313,6 +325,7 @@ pub async fn probe(src: &Source<'_>, head: &[u8]) -> Result<MediaInfo, ProbeErro
         width: video.width,
         height: video.height,
         hdr: super::is_hdr_transfer(video.transfer),
+        dolby_vision: video.dovi,
         audio,
         keyframes,
     })
@@ -338,5 +351,19 @@ mod tests {
         // pointer, not stop there thinking it found the Cues.
         let seek = [0x4D, 0xBB, 0x8B, 0x53, 0xAB, 0x84, 0x1C, 0x53, 0xBB, 0x6B, 0x53, 0xAC, 0x81, 0x40];
         assert_eq!(parse_seek_head(&seek), vec![(CUES, 0x40)]);
+    }
+
+    #[test]
+    fn a_tracks_dolby_vision_record_is_read_from_its_block_addition_mapping() {
+        let el = |id: &[u8], body: &[u8]| [id, &[0x80 | body.len() as u8], body].concat();
+        let track = |kind: &[u8; 4]| {
+            let record = [1, 0, 8 << 1, (6 << 3) | 0b101, 1 << 4, 0, 0, 0];
+            let mapping = [el(&[0x41, 0xE7], kind), el(&[0x41, 0xED], &record)].concat();
+            let body = [el(&[0xD7], &[1]), el(&[0x83], &[1]), el(&[0x41, 0xE4], &mapping)].concat();
+            el(&[0xAE], &body)
+        };
+        let tracks = parse_tracks(&track(b"dvvC"));
+        assert_eq!(tracks[0].dovi, Some(super::super::DolbyVision { profile: 8, compat: 1 }));
+        assert_eq!(parse_tracks(&track(b"mvcC"))[0].dovi, None, "another block addition");
     }
 }

@@ -3,6 +3,7 @@
 //!   POST /remux/login   {key}               → cookie for what needs this service to vouch
 //!   POST /remux/session {imdb, season?, episode?, filename?, scout?} → a signed session: /remux/s/<sid>/<sig>/master.m3u8
 //!   GET  /remux/s/<sid>/<sig>/…             → HLS (fMP4): master, media, init.mp4, seg<N>.m4s
+//!   POST /remux/s/<sid>/<sig>/report {code, message} → the player couldn't play it, into the log
 //!   DELETE /remux/s/<sid>/<sig>             → end it (410 from then on)
 //!   GET  /health, /metrics
 //!
@@ -185,12 +186,12 @@ fn metrics_body(state: &AppState) -> String {
 }
 
 /// The CORS a receiver needs on a session's files: any origin (a Cast receiver's is Google's), and
-/// `Range` allowed with `Content-Range` readable.
+/// `Range` allowed with `Content-Range` readable. POST is the player's error report.
 fn add_cors(resp: &mut Response<Body>) {
     use hyper::header::HeaderValue;
     let h = resp.headers_mut();
     h.insert("access-control-allow-origin", HeaderValue::from_static("*"));
-    h.insert("access-control-allow-methods", HeaderValue::from_static("GET, HEAD, DELETE, OPTIONS"));
+    h.insert("access-control-allow-methods", HeaderValue::from_static("GET, HEAD, POST, DELETE, OPTIONS"));
     h.insert("access-control-allow-headers", HeaderValue::from_static("Range, X-Request-Id"));
     h.insert("access-control-expose-headers", HeaderValue::from_static("Content-Range, Content-Length"));
     h.insert("access-control-max-age", HeaderValue::from_static("86400"));
@@ -297,7 +298,7 @@ where
         "/remux/session" if parts.method == Method::POST => create_session(state, parts, body).await,
         "/remux/login" | "/remux/session" => method_not_allowed("POST"),
         _ => match path.strip_prefix("/remux/s/") {
-            Some(rest) => session_route(state, parts, rest).await,
+            Some(rest) => session_route(state, parts, rest, body).await,
             None => httputil::not_found(),
         },
     }
@@ -478,11 +479,16 @@ where
     }
 }
 
-async fn session_route(
+async fn session_route<B>(
     state: &Arc<AppState>,
     parts: &hyper::http::request::Parts,
     rest: &str,
-) -> Response<Body> {
+    body: B,
+) -> Response<Body>
+where
+    B: hyper::body::Body<Data = Bytes> + Send + 'static,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
     let mut it = rest.splitn(3, '/');
     let (sid, sig, file) = (it.next().unwrap_or(""), it.next().unwrap_or(""), it.next());
     if !auth::is_id(sid) || !auth::is_id(sig) {
@@ -512,6 +518,27 @@ async fn session_route(
         (&Method::DELETE, None | Some("")) => {
             state.end_session(sid, "deleted").await;
             Response::builder().status(StatusCode::NO_CONTENT).body(httputil::full("")).unwrap()
+        }
+        // The player's verdict when it can't play what it was sent — a browser's MediaError, or hls.js's — which
+        // no server log sees otherwise. Only the holder of the session's signed URL gets here.
+        (&Method::POST, Some("report")) => {
+            #[derive(serde::Deserialize)]
+            struct Report {
+                code: u16,
+                message: String,
+            }
+            match read_body(body).await.and_then(|b| serde_json::from_slice::<Report>(&b).ok()) {
+                Some(r) => {
+                    eprintln!(
+                        "session {}: the player couldn't play it: error {} \"{}\"",
+                        s.short(),
+                        r.code,
+                        redact::player_message(&r.message)
+                    );
+                    Response::builder().status(StatusCode::NO_CONTENT).body(httputil::full("")).unwrap()
+                }
+                None => httputil::error(StatusCode::BAD_REQUEST, "bad_report", "Expected {code, message}."),
+            }
         }
         (&Method::GET | &Method::HEAD, Some(f)) => {
             let resp = match f {
@@ -544,7 +571,7 @@ async fn session_route(
             }
             resp
         }
-        _ => method_not_allowed("GET, HEAD, DELETE, OPTIONS"),
+        _ => method_not_allowed("GET, HEAD, POST, DELETE, OPTIONS"),
     }
 }
 

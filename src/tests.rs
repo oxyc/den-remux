@@ -484,6 +484,14 @@ async fn end_to_end(imdb: &str, fixture_name: &str, codec_prefix: &str, scoped: 
         ffprobe(&["-show_entries", "format=duration", "-of", "csv=p=0"], &whole).trim().parse().unwrap();
     assert!((dur - duration).abs() < 0.2, "joined duration {dur} vs {duration}");
 
+    // A player that can't play it says why, into the log; a report that isn't one is refused.
+    let report = call(&state, "POST", &format!("{base}report"), None, r#"{"code":3,"message":"DECODE"}"#).await;
+    assert_eq!(report.status, StatusCode::NO_CONTENT);
+    assert_eq!(
+        call(&state, "POST", &format!("{base}report"), None, "{}").await.status,
+        StatusCode::BAD_REQUEST
+    );
+
     // Ending it: 204, then 410 for anything under its URL, and its scratch is gone.
     let sid = created["sid"].as_str().unwrap();
     let dir = state.cfg.scratch_dir.join(format!("s-{sid}"));

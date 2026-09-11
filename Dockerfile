@@ -42,6 +42,8 @@ WORKDIR /tmp/ffmpeg-${FFMPEG_VERSION}
 #   parsers    for the codecs the demuxers hand over unparsed
 #   filters    the audio graph -ac 2 builds (resample/downmix, format negotiation, the buffer
 #              endpoints every graph has); scale_vaapi and tonemap_vaapi for a transcode
+#   bsfs       dovi_rpu and filter_units: a copied Dolby Vision stream loses its RPU and enhancement layer
+#              and its configuration record, leaving the HDR10 base layer a browser can play
 #   protocols  file, and http(s) over tcp/tls (OpenSSL); --enable-version3 is what OpenSSL 3 requires
 # ffmpeg's own libraries are linked in statically; OpenSSL, zlib and libva are the system's.
 RUN ./configure \
@@ -58,6 +60,7 @@ RUN ./configure \
       --enable-encoder=aac,h264_vaapi \
       --enable-parser=h264,hevc,aac,ac3,dca,mlp,flac,opus,mpegaudio,vorbis \
       --enable-filter=aresample,aformat,anull,atrim,abuffer,abuffersink,null,trim,buffer,buffersink,format,scale_vaapi,tonemap_vaapi \
+      --enable-bsf=dovi_rpu,filter_units \
       --enable-swresample \
     && make -j"$(nproc)" && make install
 

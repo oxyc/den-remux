@@ -63,7 +63,7 @@ pub fn sub_file(file: &str) -> Option<(usize, bool)> {
 }
 
 pub fn is_session_file(file: &str) -> bool {
-    matches!(file, "master.m3u8" | "media.m3u8" | "init.mp4")
+    matches!(file, "master.m3u8" | "media.m3u8" | "init.mp4" | "report")
         || seg_index(file).is_some()
         || sub_file(file).is_some()
 }
@@ -203,7 +203,7 @@ impl Session {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn short(&self) -> &str {
+    pub fn short(&self) -> &str {
         &self.sid[..6]
     }
 
@@ -298,7 +298,10 @@ impl Session {
                     tonemap: self.info.hdr,
                 }
             }
-            false => job::Video::Copy { hevc: self.info.video == VideoCodec::Hevc },
+            false => job::Video::Copy {
+                hevc: self.info.video == VideoCodec::Hevc,
+                strip_dovi: self.info.dolby_vision.is_some(),
+            },
         }
     }
 
@@ -845,6 +848,13 @@ pub async fn create(
     let mut no_transcode = false;
     for c in candidates.iter().take(MAX_TRIES) {
         match open(st, &source, c).await {
+            // Dolby Vision profile 5 has no base layer to fall back to: stripped or transcoded, its picture is
+            // green and purple.
+            Ok((_, info)) if info.dolby_vision.is_some_and(|dv| !dv.has_fallback()) => eprintln!(
+                "session: {imdb} skipped \"{}\": {} has no picture without Dolby Vision",
+                c.attributes.label,
+                info.dolby_vision.map(|dv| dv.to_string()).unwrap_or_default()
+            ),
             // HEVC for a player without it: only on the GPU, and only while a transcode is free.
             Ok((r, info)) if info.video == VideoCodec::Hevc && !takes_hevc => match st.reserve_transcode() {
                 Some(slot) => {
@@ -972,12 +982,15 @@ pub async fn create(
     });
     st.insert_session(session.clone());
     st.sessions_started.fetch_add(1, Relaxed);
+    let dv = session.info.dolby_vision.map(|dv| format!(", {dv} stripped to its base layer"));
     eprintln!(
-        "session {}: {imdb} \"{}\" ({}, {:?}{}, {:.0}s, {} keyframes, {} segments, audio {} {})",
+        "session {}: {imdb} \"{}\" ({}, {:?} {}{}{}, {:.0}s, {} keyframes, {} segments, audio {} {})",
         session.short(),
         session.release.label,
         session.info.container,
         session.info.video,
+        codecs,
+        dv.unwrap_or_default(),
         if session.transcoded { " → H.264 on the GPU" } else { "" },
         session.info.duration,
         session.info.keyframes.len(),

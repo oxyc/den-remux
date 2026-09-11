@@ -209,7 +209,7 @@ fn parse_moov(moov: &[u8]) -> Result<MediaInfo, ProbeError> {
     let config = |typ: &[u8; 4]| video.entry.get(78..).and_then(|kids| child(kids, typ));
     let (codec, codecs) = match &video.fourcc {
         b"avc1" | b"avc3" => (VideoCodec::H264, config(b"avcC").and_then(super::avc_codecs)),
-        // dvh1/dvhe carry an hvcC base layer; Dolby Vision profile 5 has none a browser can show.
+        // dvh1/dvhe carry an hvcC base layer; `dolby_vision` below says whether it shows on its own.
         b"hvc1" | b"hev1" | b"dvh1" | b"dvhe" => {
             (VideoCodec::Hevc, config(b"hvcC").and_then(super::hevc_codecs))
         }
@@ -256,6 +256,7 @@ fn parse_moov(moov: &[u8]) -> Result<MediaInfo, ProbeError> {
         width: u16_at(video.entry, 24).unwrap_or(0) as u32,
         height: u16_at(video.entry, 26).unwrap_or(0) as u32,
         hdr,
+        dolby_vision: [b"dvcC", b"dvvC", b"dvwC"].into_iter().find_map(config).and_then(super::dovi_config),
         audio,
         keyframes,
     })

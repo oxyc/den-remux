@@ -50,6 +50,13 @@ pub fn path(path: &str) -> Cow<'_, str> {
     format!("/remux/s/{sid}…/<sig>{file}").into()
 }
 
+/// What a player says went wrong (`POST …/report`), as the log may show it: printable ASCII, URLs scrubbed, at most
+/// 160 characters — it is the browser's text, and a line must not be forged or carry a secret.
+pub fn player_message(raw: &str) -> String {
+    let flat: String = raw.chars().map(|c| if c.is_ascii_graphic() { c } else { ' ' }).take(400).collect();
+    scrub(flat.split_whitespace().collect::<Vec<_>>().join(" ").as_str(), &[]).chars().take(160).collect()
+}
+
 /// The caller's `X-Request-Id`, reduced to `[A-Za-z0-9_-]` and 32 characters: it is written into the
 /// log verbatim, so nothing that could forge a line or carry a secret gets through.
 pub fn request_id(headers: &hyper::HeaderMap) -> Option<String> {
@@ -89,6 +96,14 @@ mod tests {
     }
 
     #[test]
+    fn a_players_message_is_one_short_clean_line() {
+        let forged = "PIPELINE_ERROR_DECODE: hvc1\nsession AAAAAA: ended (deleted)\u{7}";
+        assert_eq!(player_message(forged), "PIPELINE_ERROR_DECODE: hvc1 session AAAAAA: ended (deleted)");
+        assert_eq!(player_message("fetch https://cdn.example/t/SECRET failed"), "fetch <url> failed");
+        assert_eq!(player_message(&"x".repeat(500)).len(), 160);
+    }
+
+    #[test]
     fn a_session_path_drops_its_signature() {
         let sid = "AAAAAAAAAAAAAAAAAAAAAA";
         let p = format!("/remux/s/{sid}/SIGSIGSIGSIGSIGSIGSIGS/seg3.m4s");
@@ -96,6 +111,7 @@ mod tests {
         assert_eq!(path(&format!("/remux/s/{sid}/SIG/whatever")), "/remux/s/AAAAAA…/<sig>/<file>");
         assert_eq!(path("/remux/s/not-an-id/x"), "/remux/s/<bad>…/<sig>");
         assert_eq!(path("/remux/session"), "/remux/session");
+        assert_eq!(path(&format!("/remux/s/{sid}/SIG/report")), "/remux/s/AAAAAA…/<sig>/report");
         assert_eq!(path(&format!("{INSTALL}/manifest.json")), "/<unrouted>");
     }
 }

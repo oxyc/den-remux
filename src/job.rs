@@ -50,6 +50,10 @@ const STDERR_TAIL: usize = 2048;
 pub enum Video {
     Copy {
         hevc: bool,
+        /// Drop Dolby Vision — its RPU and enhancement-layer units, and its configuration record, so no `dvcC`
+        /// is written — leaving the base layer: HDR10 (or SDR, HLG), which a browser plays and a profile 7 or
+        /// 8 stream it would refuse is not.
+        strip_dovi: bool,
     },
     /// Decoded, scaled (and tone-mapped, for HDR) on the GPU and encoded to H.264 there, over VAAPI — for
     /// a player that cannot take the release's HEVC. `-force_key_frames source` puts an output keyframe on
@@ -120,11 +124,16 @@ pub fn args(spec: &Spec<'_>, ca_file: Option<&str>) -> Vec<String> {
     a.push("-map".into());
     a.push(format!("0:a:{}", spec.audio));
     match &spec.video {
-        Video::Copy { hevc } => {
+        Video::Copy { hevc, strip_dovi } => {
             a.extend(s(&["-c:v", "copy"]));
             if *hevc {
                 // Safari plays HEVC in fMP4 only under the hvc1 tag, not hev1.
                 a.extend(s(&["-tag:v", "hvc1"]));
+            }
+            if *strip_dovi {
+                // dovi_rpu drops the configuration record (and a frame's last RPU); filter_units every Dolby
+                // Vision unit — 62 the RPU, 63 the enhancement layer, several of which a profile 7 frame carries.
+                a.extend(s(&["-bsf:v", "dovi_rpu=strip=1,filter_units=remove_types=62|63"]));
             }
         }
         Video::Transcode { width, height, tonemap, .. } => {
@@ -357,12 +366,19 @@ mod tests {
         let spec = Spec {
             input: "https://cdn.example/f.mkv",
             seek: seek_for(13.0),
-            video: Video::Copy { hevc: true },
+            video: Video::Copy { hevc: true, strip_dovi: false },
             audio: 1,
             dir,
         };
         let a = args(&spec, Some(CA_BUNDLE));
         let joined = a.join(" ");
+        assert!(!joined.contains("-bsf"), "{joined}");
+        let dovi = Spec { video: Video::Copy { hevc: true, strip_dovi: true }, ..spec };
+        let d = args(&dovi, None).join(" ");
+        assert!(
+            d.contains("-tag:v hvc1 -bsf:v dovi_rpu=strip=1,filter_units=remove_types=62|63 "),
+            "the base layer alone, with no dvcC"
+        );
         for want in [
             "-copyts -start_at_zero -noaccurate_seek -ss 13.135000 -i https://cdn.example/f.mkv",
             "-map 0:V:0 -map 0:a:1 -c:v copy -tag:v hvc1 -c:a aac -ac 2 -b:a 192k",
@@ -422,7 +438,7 @@ mod tests {
         let spec = Spec {
             input: "/tmp/f.mkv",
             seek: None,
-            video: Video::Copy { hevc: false },
+            video: Video::Copy { hevc: false, strip_dovi: false },
             audio: 0,
             dir: Path::new("/d"),
         };

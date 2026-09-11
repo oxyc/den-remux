@@ -48,6 +48,8 @@ pub struct MediaInfo {
     pub height: u32,
     /// PQ or HLG transfer (HDR10, HLG): a transcode to SDR H.264 has to tone-map it.
     pub hdr: bool,
+    /// The video's Dolby Vision configuration, when it carries one.
+    pub dolby_vision: Option<DolbyVision>,
     pub audio: Vec<AudioTrack>,
     /// Keyframe presentation times in seconds, ascending — the timeline ffmpeg reports with
     /// `-copyts -start_at_zero`, which is the one the segments are cut on.
@@ -77,6 +79,36 @@ impl fmt::Display for ProbeError {
 /// Is this H.273 transfer characteristic HDR — PQ (16) or HLG (18)?
 pub fn is_hdr_transfer(t: u64) -> bool {
     matches!(t, 16 | 18)
+}
+
+/// A Dolby Vision stream's profile, and what its base layer is without it — written `8.1`, `7.6`, as Dolby does.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DolbyVision {
+    pub profile: u8,
+    /// The base layer's compatibility id: 0 none (profile 5, whose picture needs the RPU), 1 HDR10, 2 SDR, 4 HLG,
+    /// 6 a UHD Blu-ray's HDR10.
+    pub compat: u8,
+}
+
+impl DolbyVision {
+    /// Whether the base layer shows on its own once the Dolby Vision parts are stripped. Profile 5's doesn't:
+    /// without the RPU its colours come out green and purple.
+    pub fn has_fallback(&self) -> bool {
+        self.compat != 0
+    }
+}
+
+impl fmt::Display for DolbyVision {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Dolby Vision {}.{}", self.profile, self.compat)
+    }
+}
+
+/// A `DOVIDecoderConfigurationRecord` (the `dvcC`/`dvvC` payload, or Matroska's BlockAddIDExtraData): two version
+/// bytes, the profile in the top 7 bits of the third, the compatibility id in the top 4 bits of the fifth.
+pub fn dovi_config(record: &[u8]) -> Option<DolbyVision> {
+    let b = record.get(..5)?;
+    Some(DolbyVision { profile: b[2] >> 1, compat: b[4] >> 4 })
 }
 
 /// The largest single structure we will read: a `moov` or `Cues` for a long film is a few MB, and
@@ -203,5 +235,17 @@ mod tests {
         // High tier.
         let high = [1, 0x22, 0x20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 153];
         assert_eq!(hevc_codecs(&high).as_deref(), Some("hvc1.2.4.H153"));
+    }
+
+    #[test]
+    fn a_dolby_vision_record_names_its_profile_and_base_layer() {
+        // Profile 7 (a UHD Blu-ray's dual layer), level 6, RPU + EL + BL present, compatibility 6.
+        let bluray = dovi_config(&[1, 0, 7 << 1, (6 << 3) | 0b111, 6 << 4, 0, 0, 0]).unwrap();
+        assert_eq!(bluray, DolbyVision { profile: 7, compat: 6 });
+        assert!(bluray.has_fallback());
+        assert_eq!(bluray.to_string(), "Dolby Vision 7.6");
+        let web = dovi_config(&[1, 0, 5 << 1, (6 << 3) | 0b101, 0, 0]).unwrap();
+        assert!(!web.has_fallback(), "profile 5 needs its RPU");
+        assert_eq!(dovi_config(&[1, 0, 16]), None, "truncated");
     }
 }

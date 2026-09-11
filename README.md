@@ -31,6 +31,7 @@ GET    /remux/s/<sid>/<sig>/init.mp4
 GET    /remux/s/<sid>/<sig>/seg<N>.m4s  200 when made (waits up to 20 s), else 503 + Retry-After: 2
 GET    /remux/s/<sid>/<sig>/sub<N>.m3u8 a subtitle rendition: one WebVTT segment spanning the film
 GET    /remux/s/<sid>/<sig>/sub<N>.vtt  text/vtt; an empty document when nothing in that language was found
+POST   /remux/s/<sid>/<sig>/report      {code, message}: the player couldn't play it — logged against the session, 204
 DELETE /remux/s/<sid>/<sig>             204; the session's URLs answer 410 from then on
 GET    /health, /remux/health           200 {status} — ok, or degraded with a reason (Maintenance); the second is
                                         what a client probes under the /remux mount (den-spec routes-v1)
