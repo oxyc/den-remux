@@ -6,7 +6,7 @@ video, re-encodes the audio to AAC stereo, and serves HLS (fMP4) cut on the file
 
 ```
 browser ──POST /remux/login {key}─────────────►  cookie (HttpOnly, SameSite=Strict, Path=/remux)
-browser ──POST /remux/session {imdb, scout}───►  scout (scoped config + X-Den-Remux-Key) → cached H.264/HEVC release
+browser ──POST /remux/session {imdb, scout}───►  scout (the library's install URL) → cached H.264/HEVC release
         ◄──{ playlist: /remux/s/<sid>/<sig>/master.m3u8 }       probe: duration, tracks, keyframe index
 <video> ──GET /remux/s/<sid>/<sig>/seg<N>.m4s─►  ffmpeg: -c:v copy -c:a aac, one fMP4 file per GOP
 ```
@@ -32,8 +32,8 @@ GET    /metrics                         Prometheus text (bearer METRICS_TOKEN; 4
 anything else                           404 {"error":"not_found"}
 ```
 
-`scout` is the web app's scope=availability scout install URL (`http://<scout>:8080/<config>`); without it
-the server's `SCOUT_INSTALL_URL` is used. `filename` prefers that release when it is playable here.
+`scout` is the scout install URL the web app reads from the library's `set:plugins` group
+(`http://<scout>:8080/<config>`); without it the server's `SCOUT_INSTALL_URL` is used. `filename` prefers that release when it is playable here.
 
 `/remux/s/…` responses carry `Access-Control-Allow-Origin: *`, allow `Range` and expose
 `Content-Range`/`Content-Length` — a Cast receiver's page is on Google's origin. Playlists are
@@ -45,12 +45,13 @@ title), so `MAX_SESSIONS` counts browsers watching, not titles clicked.
 
 ## Security model
 
-- **Scout is reached with a key the browser never has.** The primary path: the web app sends its
-  scope=availability scout install URL with each session request. den-scout lets such a config list and
-  play only when the caller presents `X-Den-Remux-Key` (`REMUX_SCOUT_KEY`), so the URL on its own plays
-  nothing for whoever holds it. den-remux accepts the URL only on an origin in `SCOUT_ORIGINS` with
-  exactly one base64url config segment and no credentials, query or fragment — the SSRF guard, without
-  which a logged-in browser could make this service fetch anything on the LAN.
+- **The browser names its own scout install.** Every device in a Den library holds the library's plugin
+  list, scout's full install URL included (one trust level, oxyc/den#12), and the web app sends that URL
+  with each session request. A scope=availability URL works too: den-scout lets it list and play only
+  when the caller presents `X-Den-Remux-Key` (`REMUX_SCOUT_KEY`), so that URL on its own plays nothing.
+  den-remux accepts either only on an origin in `SCOUT_ORIGINS` with exactly one base64url config segment
+  and no credentials, query or fragment — the SSRF guard, without which a logged-in browser could make
+  this service fetch anything on the LAN.
 - **The key reaches scout and nothing else.** An HTTP client forwards custom headers across a
   cross-origin redirect, which would hand the key to the debrid's CDN on scout's 302. den-remux talks to
   scout with a client that follows no redirect and follows play URLs by hand, sending the key only to
@@ -149,7 +150,7 @@ Every variable is unprefixed; `.env.example` lists them with their defaults.
 | Variable | Default | Purpose |
 |---|---|---|
 | `SCOUT_ORIGINS` | — | Origins (`scheme://host[:port]`, comma-separated) a request's `scout` URL may point at. The SSRF guard; empty refuses every `scout` URL. |
-| `REMUX_SCOUT_KEY` | — | **Secret.** Sent to scout (and only to scout's origin) as `X-Den-Remux-Key`; a scope=availability config lists and plays only with it. `/health` says `scout_key_missing` when origins are set without it. |
+| `REMUX_SCOUT_KEY` | — | **Secret.** Sent to scout (and only to scout's origin) as `X-Den-Remux-Key`; a scope=availability config lists and plays only with it (a full install URL doesn't need it). `/health` says `scout_key_missing` when origins are set without it. |
 | `SCOUT_INSTALL_URL` | — | Fallback when a request names no scout: an install of this service's own, sealed config included (`http://<scout>:8080/<config>`). **Secret**; never logged. |
 | `BROWSER_KEY_HASHES` | — | Comma-separated hex SHA-256 of each browser's key. Removing one logs that browser out. |
 | `REMUX_URL_KEY` | random | **Secret.** Signs cookies and session URLs. **Set it**: unset, every restart logs the browsers out (`/health` says `url_key_ephemeral`). Rotating it kills every cookie and session URL. |

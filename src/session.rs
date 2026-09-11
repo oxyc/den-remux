@@ -535,8 +535,8 @@ async fn open(
 
 /// `POST /remux/session`: pick and probe a release of `imdb`, and set up its session.
 ///
-/// `scout` is the primary path: the scope=availability scout install the web app holds, accepted only
-/// on a `SCOUT_ORIGINS` origin and presented with `REMUX_SCOUT_KEY`. Without it this service's own
+/// `scout` is the primary path: the scout install from the web app's library (full, or scope=availability),
+/// accepted only on a `SCOUT_ORIGINS` origin and presented with `REMUX_SCOUT_KEY`. Without it this service's own
 /// `SCOUT_INSTALL_URL` is used, which is how the MVP can be driven by hand.
 pub async fn create(
     st: &Arc<AppState>,
