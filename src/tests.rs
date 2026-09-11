@@ -678,6 +678,18 @@ async fn the_web_app_on_another_origin_may_start_sessions() {
     let post = send("POST", "https://d.example").await;
     assert_eq!(post.status(), StatusCode::BAD_REQUEST);
     assert_eq!(post.headers()["access-control-allow-origin"], "https://d.example");
+    // Its health under the mount path, which the web app probes to find this service (den-spec routes-v1).
+    let health = crate::handle_request(
+        state.clone(),
+        Request::builder()
+            .uri("/remux/health")
+            .header("origin", "https://d.example")
+            .body(Full::new(Bytes::new()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(health.status(), StatusCode::OK);
+    assert_eq!(health.headers()["access-control-allow-origin"], "https://d.example");
 }
 
 #[tokio::test]

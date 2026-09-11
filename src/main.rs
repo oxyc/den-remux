@@ -208,7 +208,7 @@ where
     // origins (`WEB_ORIGINS`): a wildcard there would invite every site to try.
     if parts.uri.path().starts_with("/remux/s/") {
         add_cors(&mut resp);
-    } else if matches!(parts.uri.path(), "/remux/login" | "/remux/session") {
+    } else if matches!(parts.uri.path(), "/remux/login" | "/remux/session" | "/remux/health") {
         if let Some(origin) = web_origin(&state, &parts.headers) {
             resp.headers_mut().insert("access-control-allow-origin", origin);
         }
@@ -266,7 +266,9 @@ where
     let path = parts.uri.path();
     let get = matches!(parts.method, Method::GET | Method::HEAD);
     match path {
-        "/health" if get => httputil::json(StatusCode::OK, &health_body(state), &[]),
+        // `/remux/health` too: under tailscale serve and on the LAN the service is mounted at `/remux`, and clients
+        // probe each route's `<url>/health` (den-spec routes-v1).
+        "/health" | "/remux/health" if get => httputil::json(StatusCode::OK, &health_body(state), &[]),
         "/metrics" if get => {
             if !metrics_authorized(state, &parts.headers) {
                 return httputil::not_found();
@@ -280,7 +282,7 @@ where
                 .body(httputil::full(body))
                 .unwrap()
         }
-        "/health" | "/metrics" => method_not_allowed("GET, HEAD"),
+        "/health" | "/remux/health" | "/metrics" => method_not_allowed("GET, HEAD"),
         "/remux/login" | "/remux/session" if parts.method == Method::OPTIONS => preflight(),
         "/remux/login" | "/remux/session"
             if parts.method == Method::POST && !state.admit(visitor(state, parts)) =>

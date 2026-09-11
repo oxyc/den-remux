@@ -32,7 +32,8 @@ GET    /remux/s/<sid>/<sig>/seg<N>.m4s  200 when made (waits up to 20 s), else 5
 GET    /remux/s/<sid>/<sig>/sub<N>.m3u8 a subtitle rendition: one WebVTT segment spanning the film
 GET    /remux/s/<sid>/<sig>/sub<N>.vtt  text/vtt; an empty document when nothing in that language was found
 DELETE /remux/s/<sid>/<sig>             204; the session's URLs answer 410 from then on
-GET    /health                          200 {status} — ok, or degraded with a reason (Maintenance)
+GET    /health, /remux/health           200 {status} — ok, or degraded with a reason (Maintenance); the second is
+                                        what a client probes under the /remux mount (den-spec routes-v1)
 GET    /metrics                         Prometheus text (bearer METRICS_TOKEN; 404 without it)
 anything else                           404 {"error":"not_found"}
 ```
