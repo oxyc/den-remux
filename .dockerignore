@@ -1,7 +1,7 @@
 .git
 .github
 target
-testdata
+# testdata is in the context for the test stage; the runtime stage never copies it.
 *.md
 !README.md
 cache

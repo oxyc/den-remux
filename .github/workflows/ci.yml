@@ -32,9 +32,26 @@ jobs:
         run: cargo fmt --check
       - name: Clippy
         run: cargo clippy --locked --all-targets -- -D warnings
-      # The #[ignore]d tests run real ffmpeg; they are run locally (README, Tests).
+      # The #[ignore]d tests run real ffmpeg; the e2e job runs them with the image's own.
       - name: Tests
         run: cargo test --locked
+
+  # The #[ignore]d end-to-end tests, in the Dockerfile's test stage: the ffmpeg the image ships, because
+  # another version seeks differently and the segment alignment depends on exactly how it seeks.
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - name: End-to-end tests
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          target: test
+          push: false
+          platforms: linux/amd64
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
   # On a PR (e.g. a dependency bump) — build the image WITHOUT pushing. This is the merge gate for the
   # checksummed ffmpeg source and the static build: a bad checksum or a configure line that no longer
