@@ -4,8 +4,9 @@
 //! names — the credential every Den addon's install URL is — and scout alone decides whether it plays.
 //! A browser may also prove itself once, by posting its key to `/remux/login` (its SHA-256 has to be one
 //! of `BROWSER_KEY_HASHES`), for what needs den-remux to vouch: an availability-only scout install, or
-//! this service's own. What it gets back is a cookie — `HttpOnly`, so script on the page cannot read it —
-//! that authorises one thing: **creating** a session.
+//! this service's own. Login returns an HttpOnly cookie for same-origin clients and a separately signed
+//! bearer token for a web page on another site, where browsers do not send the cookie. Both admit
+//! release listing and session creation; neither grants access to metrics or a session's signed URLs.
 //!
 //! Everything a session serves is under a signed path, `/remux/s/<sid>/<sig>/…`, and the cookie is not
 //! asked for there. A Cast or AirPlay receiver has no cookie, and the signed path is what lets it play
@@ -24,6 +25,9 @@ type HmacSha256 = Hmac<Sha256>;
 pub const COOKIE_NAME: &str = "den_remux";
 /// A browser logs in about once a month.
 pub const COOKIE_TTL_SECS: u64 = 30 * 24 * 60 * 60;
+/// A cross-origin page keeps this only in memory; one browsing day covers a long viewing session.
+pub const BROWSER_TOKEN_TTL_SECS: u64 = 8 * 60 * 60;
+pub const BROWSER_TOKEN_HEADER: &str = "x-den-browser-token";
 /// 16 bytes of MAC, base64url: 22 characters. 128 bits is past guessing, and it keeps the URL short.
 pub const SIG_LEN: usize = 22;
 
@@ -118,7 +122,15 @@ pub fn browser_for_key(hashes: &[[u8; 32]], key: &str) -> Option<String> {
 
 /// `<browser>.<exp>.<mac>`.
 pub fn cookie_value(key: &[u8], browser: &str, exp: u64) -> String {
-    let m = mac(key, "den-remux/cookie", &[browser, &exp.to_string()]);
+    browser_credential(key, "den-remux/cookie", browser, exp)
+}
+
+pub fn browser_token(key: &[u8], browser: &str, exp: u64) -> String {
+    browser_credential(key, "den-remux/browser", browser, exp)
+}
+
+fn browser_credential(key: &[u8], domain: &str, browser: &str, exp: u64) -> String {
+    let m = mac(key, domain, &[browser, &exp.to_string()]);
     format!("{browser}.{exp}.{}", b64(&m[..16]))
 }
 
@@ -134,13 +146,27 @@ pub fn set_cookie(value: &str) -> String {
 /// configured.
 pub fn cookie_browser(key: &[u8], hashes: &[[u8; 32]], header: Option<&str>, now: u64) -> Option<String> {
     let value = header?.split(';').map(str::trim).find_map(|kv| kv.strip_prefix("den_remux="))?;
+    credential_browser(key, hashes, "den-remux/cookie", value, now)
+}
+
+pub fn token_browser(key: &[u8], hashes: &[[u8; 32]], value: &str, now: u64) -> Option<String> {
+    credential_browser(key, hashes, "den-remux/browser", value, now)
+}
+
+fn credential_browser(
+    key: &[u8],
+    hashes: &[[u8; 32]],
+    domain: &str,
+    value: &str,
+    now: u64,
+) -> Option<String> {
     let mut it = value.splitn(3, '.');
     let (browser, exp) = (it.next()?, it.next()?);
     let exp: u64 = exp.parse().ok()?;
     if now >= exp {
         return None;
     }
-    let expected = cookie_value(key, browser, exp);
+    let expected = browser_credential(key, domain, browser, exp);
     if !bool::from(value.as_bytes().ct_eq(expected.as_bytes())) {
         return None;
     }
@@ -203,5 +229,22 @@ mod tests {
         for attr in ["HttpOnly", "Secure", "SameSite=Strict", "Path=/remux"] {
             assert!(set.contains(attr), "{set} lacks {attr}");
         }
+    }
+
+    #[test]
+    fn browser_tokens_expire_revoke_and_cannot_stand_in_for_other_credentials() {
+        let hashes = [sha256(b"phone-key")];
+        let browser = browser_id(&hashes[0]);
+        let token = browser_token(KEY, &browser, 2_000);
+        assert_eq!(token_browser(KEY, &hashes, &token, 1_000), Some(browser.clone()));
+        assert_eq!(token_browser(KEY, &hashes, &token, 2_000), None);
+        assert_eq!(token_browser(KEY, &[], &token, 1_000), None);
+        assert_eq!(token_browser(b"rotated", &hashes, &token, 1_000), None);
+        assert_eq!(token_browser(KEY, &hashes, &token.replace(".2000.", ".9000."), 1_000), None);
+        assert_eq!(token_browser(KEY, &hashes, &cookie_value(KEY, &browser, 2_000), 1_000), None);
+        let cookie = format!("{COOKIE_NAME}={token}");
+        assert_eq!(cookie_browser(KEY, &hashes, Some(&cookie), 1_000), None);
+        let sid = random_id();
+        assert!(!url_sig_ok(KEY, &sid, 2_000, token.rsplit('.').next().unwrap()));
     }
 }

@@ -913,18 +913,11 @@ pub async fn create(
     // A browser starting another title is done with the one it was watching; making it wait out the
     // idle timer for its own old session would turn every change of mind into a 429. An install plays
     // `MAX_SESSIONS_PER_INSTALL` at once — a household's people — and past that its oldest gives way.
-    let mut mine: Vec<(Instant, String)> =
-        st.sessions().values().filter(|s| s.owner == owner).map(|s| (s.started, s.sid.clone())).collect();
-    mine.sort();
-    let excess = (mine.len() + 1).saturating_sub(share);
-    for (_, sid) in mine.into_iter().take(excess) {
-        st.end_session(&sid, "replaced").await;
-    }
-    let Some(_slot) = st.reserve() else {
+    let Some(_slot) = st.reserve(&owner, share).await else {
         return Err(api(
             StatusCode::TOO_MANY_REQUESTS,
             "too_many_sessions",
-            format!("{} sessions are already playing.", st.cfg.max_sessions),
+            "This browser or install, or the server, has no free session slot.",
         ));
     };
     let secrets = [source.base.as_str()];
@@ -944,7 +937,11 @@ pub async fn create(
             .any(|c| matches!(c.to_ascii_lowercase().as_str(), "hevc" | "h265" | "hvc1" | "hev1"));
     let takes_hevc = want.playable.map_or(takes_hevc, Playable::takes_hevc);
     if !takes_hevc {
-        scout::h264_first(&mut candidates);
+        // An explicit release (also used when changing its audio track) takes priority over codec
+        // preferences. Only rank the alternatives; the named HEVC may need the GPU to stay itself.
+        let alternatives =
+            usize::from(candidates.first().is_some_and(|c| want.filename == Some(c.filename())));
+        scout::h264_first(&mut candidates[alternatives..]);
     }
     let mut chosen = None;
     let mut no_transcode = false;

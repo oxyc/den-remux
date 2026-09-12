@@ -54,6 +54,7 @@ pub async fn probe(src: &Source<'_>, head: &[u8]) -> Result<MediaInfo, ProbeErro
     let mut off = 0u64;
     // A real file has a handful of top-level boxes; the bound only stops a malformed one looping.
     for _ in 0..64 {
+        off.checked_add(16).ok_or_else(|| ProbeError::Unsupported("box offset overflow".into()))?;
         let hdr = match head.get(off as usize..(off as usize).saturating_add(16)) {
             Some(h) if off + 16 <= head.len() as u64 => h.to_vec(),
             _ => src.read(off, 16).await?,
@@ -63,7 +64,8 @@ pub async fn probe(src: &Source<'_>, head: &[u8]) -> Result<MediaInfo, ProbeErro
             if size < hl as u64 || size > MAX_ELEMENT {
                 return Err(ProbeError::Unsupported(format!("a {size}-byte moov")));
             }
-            let end = off + size;
+            let end =
+                off.checked_add(size).ok_or_else(|| ProbeError::Unsupported("box size overflow".into()))?;
             let body = if end <= head.len() as u64 {
                 head[(off as usize + hl)..end as usize].to_vec()
             } else {
@@ -77,7 +79,7 @@ pub async fn probe(src: &Source<'_>, head: &[u8]) -> Result<MediaInfo, ProbeErro
         if size < hl as u64 {
             break; // 0 = "to the end of the file": whatever this is, there is no moov after it
         }
-        off += size;
+        off = off.checked_add(size).ok_or_else(|| ProbeError::Unsupported("box size overflow".into()))?;
     }
     Err(ProbeError::Unsupported("no moov box".into()))
 }
@@ -141,49 +143,86 @@ fn parse_trak(trak: &[u8]) -> Option<Trak<'_>> {
     })
 }
 
-/// Presentation times, in the track's timescale, of the sync samples.
+// Decoded limits, separate from MAX_ELEMENT's encoded-byte cap. Three million samples covers six
+// hours at 120 fps. Even an all-intra file may retain at most 8 MB of keyframe ticks, rather than
+// expanding a single hostile stts run into gigabytes. Timing tables stay borrowed from the moov.
+const MAX_SAMPLES: u64 = 3_000_000;
+const MAX_KEYFRAMES: usize = 1_000_000;
+
+fn timing_runs(b: &[u8]) -> Option<(&[u8], u64)> {
+    let n = u32_at(b, 4)? as usize;
+    if n == 0 || n as u64 > MAX_SAMPLES {
+        return None;
+    }
+    let runs = b.get(8..8usize.checked_add(n.checked_mul(8)?)?)?;
+    let total = runs.as_chunks::<8>().0.iter().try_fold(0u64, |total, run| {
+        let count = u32_at(run, 0)? as u64;
+        let next = total.checked_add(count)?;
+        (count > 0 && next <= MAX_SAMPLES).then_some(next)
+    })?;
+    Some((runs, total))
+}
+
+/// Presentation times, in the track's timescale, of the sync samples. Advance whole runs between
+/// keyframes: a large sync index must not cause millions of iterations on the HTTP runtime thread.
 fn keyframe_ticks(stbl: &[u8], media_time: i64) -> Option<Vec<i64>> {
-    let runs = |typ: &[u8; 4]| -> Option<Vec<(u32, u32)>> {
-        let b = child(stbl, typ)?;
-        let n = u32_at(b, 4)? as usize;
-        (0..n).map(|i| Some((u32_at(b, 8 + i * 8)?, u32_at(b, 12 + i * 8)?))).collect()
-    };
-    let stts = runs(b"stts")?;
+    let (stts, total) = timing_runs(child(stbl, b"stts")?)?;
     // ctts offsets are signed in version 1 and, in practice, written as signed in version 0 too.
-    let ctts = runs(b"ctts").unwrap_or_default();
-    let total: u64 = stts.iter().map(|(n, _)| *n as u64).sum();
-    let sync: Vec<u64> = match child(stbl, b"stss") {
+    let ctts = match child(stbl, b"ctts") {
+        Some(b) => {
+            let (runs, count) = timing_runs(b)?;
+            if count != total {
+                return None;
+            }
+            Some(runs)
+        }
+        None => None,
+    };
+    let sync = child(stbl, b"stss");
+    let count = match sync {
         Some(b) => {
             let n = u32_at(b, 4)? as usize;
-            (0..n).map(|i| u32_at(b, 8 + i * 4).map(u64::from)).collect::<Option<_>>()?
+            b.get(8..8usize.checked_add(n.checked_mul(4)?)?)?;
+            n
         }
         // No stss: every sample is a sync sample.
-        None => (1..=total).collect(),
+        None => usize::try_from(total).ok()?,
     };
-    let (mut ti, mut t_left, mut dts) = (0usize, stts.first()?.0 as u64, 0i64);
-    let (mut ci, mut c_left) = (0usize, ctts.first().map(|r| r.0 as u64).unwrap_or(0));
-    let mut sample = 1u64;
-    let mut out = Vec::with_capacity(sync.len());
-    for s in sync {
-        while sample < s {
-            // Advance one sample through both run tables.
-            dts += stts.get(ti)?.1 as i64;
-            t_left -= 1;
-            while t_left == 0 && ti + 1 < stts.len() {
-                ti += 1;
-                t_left = stts[ti].0 as u64;
-            }
-            if !ctts.is_empty() {
-                c_left = c_left.saturating_sub(1);
-                while c_left == 0 && ci + 1 < ctts.len() {
-                    ci += 1;
-                    c_left = ctts[ci].0 as u64;
-                }
-            }
-            sample += 1;
+    if count > MAX_KEYFRAMES {
+        return None;
+    }
+    let (mut ti, mut t_start, mut ticks) = (0usize, 1u64, 0i64);
+    let (mut ci, mut c_start) = (0usize, 1u64);
+    let mut previous = 0;
+    let mut out = Vec::with_capacity(count);
+    for i in 0..count {
+        let sample = match sync {
+            Some(b) => u32_at(b, 8 + i * 4)? as u64,
+            None => i as u64 + 1,
+        };
+        if sample <= previous || sample > total {
+            return None;
         }
-        let cto = ctts.get(ci).map(|r| r.1 as i32 as i64).unwrap_or(0);
-        out.push(dts + cto - media_time);
+        previous = sample;
+        while sample >= t_start + u32_at(stts, ti)? as u64 {
+            let n = u32_at(stts, ti)? as u64;
+            ticks = ticks.checked_add((n as i64).checked_mul(u32_at(stts, ti + 4)? as i64)?)?;
+            t_start += n;
+            ti += 8;
+        }
+        let dts =
+            ticks.checked_add(((sample - t_start) as i64).checked_mul(u32_at(stts, ti + 4)? as i64)?)?;
+        let cto = match ctts {
+            Some(runs) => {
+                while sample >= c_start + u32_at(runs, ci)? as u64 {
+                    c_start += u32_at(runs, ci)? as u64;
+                    ci += 8;
+                }
+                u32_at(runs, ci + 4)? as i32 as i64
+            }
+            None => 0,
+        };
+        out.push(dts.checked_add(cto)?.checked_sub(media_time)?);
     }
     Some(out)
 }
@@ -264,6 +303,54 @@ fn parse_moov(moov: &[u8]) -> Result<MediaInfo, ProbeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn table(typ: &[u8; 4], entries: &[u32], count: u32) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&(16 + entries.len() as u32 * 4).to_be_bytes());
+        b.extend_from_slice(typ);
+        b.extend_from_slice(&0u32.to_be_bytes());
+        b.extend_from_slice(&count.to_be_bytes());
+        for v in entries {
+            b.extend_from_slice(&v.to_be_bytes());
+        }
+        b
+    }
+
+    #[test]
+    fn tiny_sample_tables_cannot_expand_past_decoded_limits() {
+        assert!(keyframe_ticks(&table(b"stts", &[u32::MAX, 1], 1), 0).is_none());
+        assert!(keyframe_ticks(&table(b"stts", &[MAX_KEYFRAMES as u32 + 1, 1], 1), 0).is_none());
+        // A truncated declared table and zero-length runs are malformed, not empty/default timing.
+        assert!(keyframe_ticks(&table(b"stts", &[1, 1], u32::MAX), 0).is_none());
+        assert!(keyframe_ticks(&table(b"stts", &[0, 1], 1), 0).is_none());
+    }
+
+    #[test]
+    fn sync_indices_must_be_ordered_and_inside_the_timing_table() {
+        for indices in [&[0][..], &[u32::MAX], &[2, 1], &[1, 1]] {
+            let mut b = table(b"stts", &[3, 10], 1);
+            b.extend(table(b"stss", indices, indices.len() as u32));
+            assert!(keyframe_ticks(&b, 0).is_none(), "accepted {indices:?}");
+        }
+        let mut b = table(b"stts", &[3, 10], 1);
+        b.extend(table(b"ctts", &[2, 1], 1));
+        assert!(keyframe_ticks(&b, 0).is_none(), "ctts did not cover all samples");
+    }
+
+    #[test]
+    fn sparse_sync_samples_jump_timing_runs_and_keep_composition_offsets() {
+        let mut b = table(b"stts", &[MAX_SAMPLES as u32, 10], 1);
+        b.extend(table(b"ctts", &[1, 2, MAX_SAMPLES as u32 - 1, (-2i32) as u32], 2));
+        b.extend(table(b"stss", &[1, MAX_SAMPLES as u32], 2));
+        assert_eq!(keyframe_ticks(&b, 0), Some(vec![2, (MAX_SAMPLES as i64 - 1) * 10 - 2]));
+
+        let mut b = table(b"stts", &[2, 10, 3, 20], 2);
+        b.extend(table(b"ctts", &[1, 3, 4, (-1i32) as u32], 2));
+        assert_eq!(keyframe_ticks(&b, 4), Some(vec![-1, 5, 15, 35, 55]));
+        b.extend(table(b"stss", &[1, 2, 3, 5], 4));
+        assert_eq!(keyframe_ticks(&b, 4), Some(vec![-1, 5, 15, 55]));
+        assert!(keyframe_ticks(&b, i64::MIN).is_none(), "timestamp overflow was accepted");
+    }
 
     #[test]
     fn a_64_bit_box_size_is_read() {
