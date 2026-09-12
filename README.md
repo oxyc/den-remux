@@ -15,17 +15,17 @@ This is the MVP ("phase 2") of oxyc/den#11: movies and episodes, cached releases
 ## Routes
 
 ```
-POST   /remux/login                     {key} → 204 + Set-Cookie; 401 bad_key · 429 rate_limited
+POST   /remux/login                     {key} → 204 + Set-Cookie + X-Den-Browser-Token; 401 bad_key · 429 rate_limited
 POST   /remux/session                   {imdb, season?, episode?, filename?, scout?, audio?, audioTrack?,
                                          subtitles?, subtitleLanguages?, videoCodecs?, playable?} (a full scout install,
-                                         or the cookie) → 201
+                                         or browser cookie/bearer) → 201
                                         {sid, playlist, release:{label,filename,size}, duration, expiresAt,
                                          video:{codec,transcoded}, audioTrack, audioTracks, subtitles}
                                         401 not_logged_in · 403 scout_refused
                                         400 bad_request/bad_scout/bad_subtitles/bad_audio_track
                                         404 no_release/no_playable_release · 429 too_many_sessions/rate_limited
                                         502 scout_unavailable · 503 scout_unconfigured/transcode_unavailable
-POST   /remux/releases                  {imdb, season?, episode?, scout?} (a full scout install, or the cookie)
+POST   /remux/releases                  {imdb, season?, episode?, scout?} (a full scout install, or browser cookie/bearer)
                                         → 200 {releases:[{label,filename,size}]}: what a session could play, in the
                                         order it would try them, for a player to name one as `filename`. No URLs
 GET    /remux/s/<sid>/<sig>/master.m3u8 one variant: CODECS "<avc1…|hvc1…>,mp4a.40.2", BANDWIDTH from size/duration
@@ -114,8 +114,14 @@ people watching, not titles clicked.
   `SCOUT_INSTALL_URL` fallback, plays only for a browser that posted its key once; the server holds only
   SHA-256 hashes (`BROWSER_KEY_HASHES`, optional). The cookie it gets is `HttpOnly; Secure;
   SameSite=Strict; Path=/remux`, HMAC-signed with an expiry (30 days), and stops working when its key's
-  hash is removed or `REMUX_URL_KEY` rotates. Script on the page cannot read it, and it only ever creates
-  sessions.
+  hash is removed or `REMUX_URL_KEY` rotates. A web page on another site uses the separately signed
+  `X-Den-Browser-Token` returned by the same login: send `Authorization: Bearer <token>` on
+  `/remux/session` and `/remux/releases`. It expires after eight hours and has the same revocation checks;
+  it cannot stand in for the cookie, a session URL signature, or the metrics token. The web app keeps
+  it only in page memory, never the raw browser key, and asks for login again after a reload when no
+  same-origin cookie is available. `WEB_ORIGINS` exposes the response header and permits the authorization
+  preflight; third-party cookies and credentialed CORS are unnecessary. An explicit bearer takes
+  precedence over the cookie. Both browser credentials admit release listing and session creation.
 - **Session URLs are signed bearer URLs.** `/remux/s/<sid>/<sig>/…`: `sid` is 128 random bits, `sig` is
   `HMAC-SHA256(REMUX_URL_KEY, sid‖exp)` truncated to 128 bits, compared in constant time. No cookie is
   asked for there, which is what will let a Cast or AirPlay receiver play. A session lives for the film's

@@ -32,7 +32,7 @@ pub struct AppState {
     /// Ended sessions and the expiry their URLs were signed with.
     tombstones: Mutex<HashMap<String, u64>>,
     /// Sessions being set up: they hold a slot against `MAX_SESSIONS` while their release is probed.
-    creating: AtomicUsize,
+    creating: Mutex<HashMap<String, usize>>,
     /// Starts per visitor in the current minute: `(minute, count)`.
     starts: Mutex<HashMap<IpAddr, (u64, u32)>>,
     pub scratch_bytes: AtomicU64,
@@ -47,11 +47,20 @@ pub struct AppState {
 }
 
 /// A held slot against `MAX_SESSIONS`; released when dropped.
-pub struct Slot<'a>(&'a AtomicUsize);
+pub struct Slot<'a> {
+    creating: &'a Mutex<HashMap<String, usize>>,
+    owner: String,
+}
 
 impl Drop for Slot<'_> {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Relaxed);
+        let mut creating = self.creating.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(count) = creating.get_mut(&self.owner) {
+            *count -= 1;
+            if *count == 0 {
+                creating.remove(&self.owner);
+            }
+        }
     }
 }
 
@@ -82,7 +91,7 @@ impl AppState {
             scout_http: client(reqwest::redirect::Policy::none()),
             sessions: Mutex::new(HashMap::new()),
             tombstones: Mutex::new(HashMap::new()),
-            creating: AtomicUsize::new(0),
+            creating: Mutex::new(HashMap::new()),
             starts: Mutex::new(HashMap::new()),
             scratch_bytes: AtomicU64::new(0),
             sessions_started: AtomicU64::new(0),
@@ -113,14 +122,40 @@ impl AppState {
         self.sessions().get(sid).cloned()
     }
 
-    /// A slot for a new session, or `None` when `MAX_SESSIONS` are playing or being set up.
-    pub fn reserve(&self) -> Option<Slot<'_>> {
-        let map = self.sessions();
-        if map.len() + self.creating.load(Relaxed) >= self.cfg.max_sessions {
-            return None;
+    /// Reserve both the owner's share and the global cap before any upstream work. Published sessions
+    /// may be replaced; another request's reservation cannot. Detaching replacements and counting the
+    /// reservation happen under the same locks, so concurrent starts cannot spend the same free slot.
+    pub async fn reserve(self: &Arc<Self>, owner: &str, share: usize) -> Option<Slot<'_>> {
+        let (slot, replaced) = {
+            let mut map = self.sessions();
+            let mut creating = self.creating.lock().unwrap_or_else(|e| e.into_inner());
+            let pending = creating.get(owner).copied().unwrap_or(0);
+            if pending >= share {
+                return None;
+            }
+            let mut mine: Vec<_> =
+                map.values().filter(|s| s.owner == owner).map(|s| (s.started, s.sid.clone())).collect();
+            mine.sort();
+            let excess = (mine.len() + pending + 1).saturating_sub(share);
+            if map.len() - excess + creating.values().sum::<usize>() >= self.cfg.max_sessions {
+                return None;
+            }
+            let replaced: Vec<_> =
+                mine.into_iter().take(excess).filter_map(|(_, sid)| map.remove(&sid)).collect();
+            *creating.entry(owner.to_string()).or_default() += 1;
+            (Slot { creating: &self.creating, owner: owner.to_string() }, replaced)
+        };
+        if !replaced.is_empty() {
+            let state = self.clone();
+            // Cancellation of the new request must not strand a detached old session or its ffmpeg.
+            let cleanup = tokio::spawn(async move {
+                for old in replaced {
+                    state.end_removed(old, "replaced").await;
+                }
+            });
+            let _ = cleanup.await;
         }
-        self.creating.fetch_add(1, Relaxed);
-        Some(Slot(&self.creating))
+        Some(slot)
     }
 
     /// Count a login or a new session for `visitor`: false once it has had `STARTS_PER_MINUTE` this
@@ -146,6 +181,11 @@ impl AppState {
 
     pub async fn end_session(&self, sid: &str, why: &str) {
         let Some(s) = self.sessions().remove(sid) else { return };
+        self.end_removed(s, why).await;
+    }
+
+    async fn end_removed(&self, s: Arc<Session>, why: &str) {
+        let sid = &s.sid;
         {
             let mut t = self.tombstones.lock().unwrap_or_else(|e| e.into_inner());
             let now = unix_now();

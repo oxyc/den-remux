@@ -210,6 +210,20 @@ async fn origin_handle(
             return origin_full(400, r#"{"error":"bad_config"}"#);
         }
         let p = if scoped { "p/s" } else { "p" };
+        if imdb == "tt0000005" {
+            return origin_full(
+                200,
+                serde_json::json!({"streams": [
+                    {"url": format!("http://{addr}/{p}/hevc.mkv"),
+                     "attributes": {"cached": true, "codec": "hevc", "label": "HEVC"},
+                     "behaviorHints": {"filename": "hevc.mkv"}},
+                    {"url": format!("http://{addr}/{p}/h264.mkv"),
+                     "attributes": {"cached": true, "codec": "h264", "label": "H.264"},
+                     "behaviorHints": {"filename": "h264.mkv"}}
+                ]})
+                .to_string(),
+            );
+        }
         let file = match imdb {
             "tt0000001" => "h264.mkv",
             "tt0000002" => "hevc.mkv",
@@ -692,6 +706,114 @@ async fn an_install_plays_its_share_and_its_oldest_gives_way() {
     state.end_all("test").await;
 }
 
+#[tokio::test]
+async fn concurrent_starts_count_against_the_install_and_browser_shares() {
+    let origin = origin().await;
+    let state = test_state(&origin, 4, Duration::from_secs(600));
+    let body = format!(r#"{{"imdb":"tt0000001","scout":"{origin}/cfg"}}"#);
+    let (a, b, c) = tokio::join!(
+        call(&state, "POST", "/remux/session", None, &body),
+        call(&state, "POST", "/remux/session", None, &body),
+        call(&state, "POST", "/remux/session", None, &body),
+    );
+    let statuses = [a.status, b.status, c.status];
+    assert_eq!(statuses.iter().filter(|s| **s == StatusCode::CREATED).count(), 2);
+    assert_eq!(statuses.iter().filter(|s| **s == StatusCode::TOO_MANY_REQUESTS).count(), 1);
+    assert_eq!(state.sessions().len(), 2);
+    state.end_all("test").await;
+
+    let cookie = login(&state, "phone-key").await;
+    let (a, b) = tokio::join!(
+        call(&state, "POST", "/remux/session", Some(&cookie), &body),
+        call(&state, "POST", "/remux/session", Some(&cookie), &body),
+    );
+    assert_eq!([a.status, b.status].iter().filter(|s| **s == StatusCode::CREATED).count(), 1);
+    assert_eq!(state.sessions().len(), 1);
+    state.end_all("test").await;
+    // A failed setup drops its reservation as well, so a correction can start immediately.
+    assert_eq!(
+        call(&state, "POST", "/remux/session", Some(&cookie), r#"{"imdb":"tt9999999"}"#).await.status,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        call(&state, "POST", "/remux/session", Some(&cookie), &body).await.status,
+        StatusCode::CREATED
+    );
+    state.end_all("test").await;
+}
+
+#[tokio::test]
+async fn cancelling_a_reservation_gives_back_both_limits() {
+    let state = test_state("http://127.0.0.1:9", 2, Duration::from_secs(600));
+    let first = state.reserve("phone", 1).await.unwrap();
+    assert!(state.reserve("phone", 1).await.is_none());
+    let second = state.reserve("laptop", 1).await.unwrap();
+    assert!(state.reserve("other", 1).await.is_none());
+    drop(first);
+    let replacement = state.reserve("phone", 1).await.unwrap();
+    drop((second, replacement));
+    assert!(state.reserve("other", 1).await.is_some());
+}
+
+#[tokio::test]
+async fn an_explicit_release_survives_the_players_codec_preference() {
+    let origin = origin().await;
+    let state = test_state(&origin, 2, Duration::from_secs(600));
+    state.transcode_ok.store(true, Relaxed); // creation reserves the GPU; it does not start ffmpeg
+    let body = format!(
+        r#"{{"imdb":"tt0000005","scout":"{origin}/cfg","filename":"hevc.mkv","audioTrack":0,"videoCodecs":["h264"]}}"#
+    );
+    let response = call(&state, "POST", "/remux/session", None, &body).await;
+    assert_eq!(response.status, StatusCode::CREATED, "{}", response.text());
+    assert_eq!(response.json()["release"]["filename"], "hevc.mkv");
+    assert_eq!(response.json()["video"]["transcoded"], true);
+    state.end_all("test").await;
+    let body = format!(r#"{{"imdb":"tt0000005","scout":"{origin}/cfg","videoCodecs":["h264"]}}"#);
+    let response = call(&state, "POST", "/remux/session", None, &body).await;
+    assert_eq!(response.status, StatusCode::CREATED, "{}", response.text());
+    assert_eq!(response.json()["release"]["filename"], "h264.mkv");
+    assert_eq!(response.json()["video"]["transcoded"], false);
+    state.end_all("test").await;
+}
+
+#[tokio::test]
+async fn a_cross_origin_login_admits_sessions_without_cookies() {
+    let origin = origin().await;
+    let state = test_state(&origin, 2, Duration::from_secs(600));
+    let login_request = Request::builder()
+        .method("POST")
+        .uri("/remux/login")
+        .header("origin", "https://d.example")
+        .body(Full::new(Bytes::from_static(br#"{"key":"phone-key"}"#)))
+        .unwrap();
+    let response = crate::handle_request(state.clone(), login_request).await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(response.headers()["access-control-expose-headers"], crate::auth::BROWSER_TOKEN_HEADER);
+    assert!(response.headers()["set-cookie"].to_str().unwrap().contains("HttpOnly"));
+    let token = response.headers()[crate::auth::BROWSER_TOKEN_HEADER].to_str().unwrap();
+    let body = format!(r#"{{"imdb":"tt0000001","scout":"{origin}/{SCOPED}"}}"#);
+    for path in ["/remux/releases", "/remux/session"] {
+        let request = Request::builder()
+            .method("POST")
+            .uri(path)
+            .header("origin", "https://d.example")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Full::new(Bytes::from(body.clone())))
+            .unwrap();
+        let response = crate::handle_request(state.clone(), request).await;
+        assert!(response.status().is_success(), "{path}: {}", response.status());
+        assert_eq!(response.headers()["access-control-allow-origin"], "https://d.example");
+    }
+    let request = Request::builder()
+        .method("POST")
+        .uri("/remux/session")
+        .header("authorization", "Bearer invalid")
+        .body(Full::new(Bytes::from(body)))
+        .unwrap();
+    assert_eq!(crate::handle_request(state.clone(), request).await.status(), StatusCode::UNAUTHORIZED);
+    state.end_all("test").await;
+}
+
 /// The web app on its public name plays from this service's tailnet address, so it logs in and starts sessions
 /// cross-origin: those two routes answer its CORS, and no other origin's.
 #[tokio::test]
@@ -710,7 +832,7 @@ async fn the_web_app_on_another_origin_may_start_sessions() {
     let preflight = send("OPTIONS", "https://d.example").await;
     assert_eq!(preflight.status(), StatusCode::NO_CONTENT);
     assert_eq!(preflight.headers()["access-control-allow-origin"], "https://d.example");
-    assert_eq!(preflight.headers()["access-control-allow-headers"], "content-type");
+    assert_eq!(preflight.headers()["access-control-allow-headers"], "content-type, authorization");
     let elsewhere = send("OPTIONS", "https://elsewhere.example").await;
     assert!(elsewhere.headers().get("access-control-allow-origin").is_none());
     // The answer itself is readable too — here a refusal of the empty body.

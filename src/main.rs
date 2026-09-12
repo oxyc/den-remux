@@ -216,6 +216,10 @@ where
     ) {
         if let Some(origin) = web_origin(&state, &parts.headers) {
             resp.headers_mut().insert("access-control-allow-origin", origin);
+            resp.headers_mut().insert(
+                "access-control-expose-headers",
+                hyper::header::HeaderValue::from_static(auth::BROWSER_TOKEN_HEADER),
+            );
         }
         resp.headers_mut().append("vary", hyper::header::HeaderValue::from_static("origin"));
     }
@@ -249,7 +253,7 @@ fn preflight() -> Response<Body> {
     Response::builder()
         .status(StatusCode::NO_CONTENT)
         .header("access-control-allow-methods", "POST")
-        .header("access-control-allow-headers", "content-type")
+        .header("access-control-allow-headers", "content-type, authorization")
         .header("access-control-max-age", "86400")
         .body(httputil::full(""))
         .unwrap()
@@ -370,9 +374,11 @@ where
         );
     };
     let value = auth::cookie_value(&state.cfg.url_key, &browser, unix_now() + auth::COOKIE_TTL_SECS);
+    let token = auth::browser_token(&state.cfg.url_key, &browser, unix_now() + auth::BROWSER_TOKEN_TTL_SECS);
     Response::builder()
         .status(StatusCode::NO_CONTENT)
         .header("set-cookie", auth::set_cookie(&value))
+        .header(auth::BROWSER_TOKEN_HEADER, token)
         .header("cache-control", "no-store")
         .body(httputil::full(""))
         .unwrap()
@@ -388,6 +394,11 @@ fn played(s: &session::Session) -> (u32, u32) {
 
 /// The logged-in browser the request's cookie names, if any.
 fn browser_of(state: &AppState, parts: &hyper::http::request::Parts) -> Option<String> {
+    // An explicit credential takes precedence; a bad token cannot silently fall back to a cookie.
+    if let Some(header) = parts.headers.get(hyper::header::AUTHORIZATION) {
+        let token = header.to_str().ok()?.strip_prefix("Bearer ")?.trim();
+        return auth::token_browser(&state.cfg.url_key, &state.cfg.browser_key_hashes, token, unix_now());
+    }
     let cookies: Vec<&str> =
         parts.headers.get_all(hyper::header::COOKIE).iter().filter_map(|v| v.to_str().ok()).collect();
     let cookie = cookies.join("; ");
