@@ -155,7 +155,7 @@ fn timing_runs(b: &[u8]) -> Option<(&[u8], u64)> {
         return None;
     }
     let runs = b.get(8..8usize.checked_add(n.checked_mul(8)?)?)?;
-    let total = runs.chunks_exact(8).try_fold(0u64, |total, run| {
+    let total = runs.as_chunks::<8>().0.iter().try_fold(0u64, |total, run| {
         let count = u32_at(run, 0)? as u64;
         let next = total.checked_add(count)?;
         (count > 0 && next <= MAX_SAMPLES).then_some(next)
