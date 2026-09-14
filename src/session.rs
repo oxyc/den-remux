@@ -250,6 +250,12 @@ impl Session {
         self.lock().last_seen = Instant::now();
     }
 
+    /// `Cache-Control` for what the session's URL serves the same for its whole life: its playlists, a found
+    /// subtitle. The URL names the session and is signed for it, so nothing is kept past it or shared with another.
+    pub fn cache_control(&self) -> String {
+        format!("private, max-age={}", self.exp.saturating_sub(unix_now()))
+    }
+
     /// The segment production follows. Tests use it to see where a resume's first job will start.
     #[cfg(test)]
     pub fn wanted(&self) -> usize {
@@ -492,7 +498,7 @@ impl Session {
                         self.prune(&mut i, n, st);
                         self.gate(&mut i, st);
                     }
-                    return media_response("video/mp4", parts, head);
+                    return media_response(parts, head, self.exp);
                 }
             }
             if Instant::now() >= deadline {
@@ -525,7 +531,7 @@ impl Session {
             self.wake.notify_one();
             if let Some(path) = init {
                 if let Ok(Ok(parts)) = tokio::task::spawn_blocking(move || open_parts(&[path])).await {
-                    return media_response("video/mp4", parts, head);
+                    return media_response(parts, head, self.exp);
                 }
             }
             if Instant::now() >= deadline {
@@ -540,17 +546,18 @@ impl Session {
         playlist::subtitle_media(self.info.duration, n)
     }
 
-    /// Rendition `n`'s WebVTT: the first subtitle in its language that den-subtitles offers and serves,
-    /// made once and kept; an empty document when there is none.
-    pub async fn subtitle(&self, st: &AppState, n: usize) -> String {
-        use crate::subs;
-        let Some(sb) = self.subs.as_ref().filter(|s| n < s.langs.len()) else { return subs::EMPTY.into() };
+    /// Rendition `n`'s WebVTT: the first subtitle in its language that den-subtitles offers and serves, made once
+    /// and kept for the session; `None` when there is none yet. Only what was found is kept: den-subtitles' list is
+    /// kept once it answers, and a failed list or subtitle is asked for again on the player's next request, so one
+    /// blip doesn't leave the session without subtitles.
+    pub async fn subtitle(&self, st: &AppState, n: usize) -> Option<String> {
+        let sb = self.subs.as_ref().filter(|s| n < s.langs.len())?;
         let mut cache = sb.cache.lock().await;
         if let Some(Some(doc)) = cache.docs.get(n) {
-            return doc.clone();
+            return Some(doc.clone());
         }
         if cache.list.is_none() {
-            cache.list = Some(self.list_subtitles(st, sb).await);
+            cache.list = self.list_subtitles(st, sb).await;
         }
         let want = &sb.langs[n];
         let offered: Vec<String> = cache
@@ -568,16 +575,17 @@ impl Session {
                 break;
             }
         }
-        let doc = doc.unwrap_or_else(|| subs::EMPTY.into());
+        let doc = doc?;
         if cache.docs.len() <= n {
             cache.docs.resize(n + 1, None);
         }
         cache.docs[n] = Some(doc.clone());
-        doc
+        Some(doc)
     }
 
-    /// den-subtitles' list for this title, with the release's hash, size and filename as its hints.
-    async fn list_subtitles(&self, st: &AppState, sb: &crate::subs::Subs) -> Vec<crate::subs::Entry> {
+    /// den-subtitles' list for this title, with the release's hash, size and filename as its hints; `None` when it
+    /// could not be had.
+    async fn list_subtitles(&self, st: &AppState, sb: &crate::subs::Subs) -> Option<Vec<crate::subs::Entry>> {
         use crate::subs;
         let size = self.release.size;
         // The hash's second half is the file's last 64 KiB: one ranged read, only now that it is wanted.
@@ -594,7 +602,7 @@ impl Session {
         };
         let Some(url) = subs::list_url(&sb.base, &self.imdb, hash.as_deref(), size, &self.release.filename)
         else {
-            return Vec::new();
+            return Some(Vec::new());
         };
         let secrets = [sb.base.as_str()];
         let listed = async {
@@ -604,12 +612,14 @@ impl Session {
             }
             crate::probe::read_capped(resp, subs::MAX_LIST).await.map(|b| subs::parse_list(&b))
         };
-        listed.await.unwrap_or_else(|e| {
-            crate::log_limited("subtitles_list", || {
-                format!("session {}: subtitles: {}", self.short(), crate::redact::scrub(&e, &secrets))
-            });
-            Vec::new()
-        })
+        listed
+            .await
+            .inspect_err(|e| {
+                crate::log_limited("subtitles_list", || {
+                    format!("session {}: subtitles: {}", self.short(), crate::redact::scrub(e, &secrets))
+                });
+            })
+            .ok()
     }
 
     /// One subtitle as HLS WebVTT, if it is on an allowed origin and is WebVTT.
@@ -690,15 +700,18 @@ fn open_parts(paths: &[PathBuf]) -> std::io::Result<Vec<(std::fs::File, u64)>> {
     Ok(out)
 }
 
-fn media_response(content_type: &str, parts: Vec<(std::fs::File, u64)>, head: bool) -> Response<Body> {
+/// `init.mp4` or a segment. Kept until the session expires at `exp`: its URL is signed for this session alone, and
+/// a player that seeks back to a segment already pruned from scratch takes it from its cache rather than restarting
+/// ffmpeg for it. Whole bodies only — a `Range` is not honoured, and `Accept-Ranges: none` says so.
+fn media_response(parts: Vec<(std::fs::File, u64)>, head: bool, exp: u64) -> Response<Body> {
     let len: u64 = parts.iter().map(|(_, l)| l).sum();
     let body = if head { httputil::full("") } else { httputil::files_body(parts) };
     Response::builder()
         .status(StatusCode::OK)
-        .header("content-type", content_type)
+        .header("content-type", "video/mp4")
         .header("content-length", len)
-        // Only ever this session's bytes, and only for as long as the session lives.
-        .header("cache-control", "private, max-age=600")
+        .header("cache-control", format!("private, max-age={}, immutable", exp.saturating_sub(unix_now())))
+        .header("accept-ranges", "none")
         .body(body)
         .unwrap()
 }
@@ -1856,6 +1869,28 @@ mod tests {
         assert_eq!(snap(&kf, 2.500_004), 2.5);
         assert_eq!(snap(&kf, 4.99), 5.0);
         assert_eq!(snap(&kf, 3.7), 3.7, "a keyframe the index does not list keeps its own time");
+    }
+
+    #[test]
+    fn media_is_kept_until_the_session_expires_and_never_ranged() {
+        let path = std::env::temp_dir().join(format!("den-remux-media-{}", std::process::id()));
+        std::fs::write(&path, b"12345").unwrap();
+        let exp = unix_now() + 3600;
+        let r = media_response(open_parts(std::slice::from_ref(&path)).unwrap(), false, exp);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(r.status(), StatusCode::OK);
+        assert_eq!(r.headers()["content-type"], "video/mp4");
+        assert_eq!(r.headers()["content-length"], "5");
+        assert_eq!(r.headers()["accept-ranges"], "none");
+        let cc = r.headers()["cache-control"].to_str().unwrap();
+        let age: u64 = cc
+            .strip_prefix("private, max-age=")
+            .and_then(|v| v.strip_suffix(", immutable"))
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(|| panic!("{cc}"));
+        assert!((3598..=3600).contains(&age), "the session's remaining life: {cc}");
+        assert_eq!(busy().headers()["cache-control"], "no-store", "not ready is never kept");
+        assert_eq!(gone().headers()["cache-control"], "no-store");
     }
 
     #[test]

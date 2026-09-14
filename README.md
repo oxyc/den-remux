@@ -39,9 +39,10 @@ GET    /remux/s/<sid>/<sig>/master.m3u8 one variant: CODECS "<avc1…|hvc1…|av
 GET    /remux/s/<sid>/<sig>/media.m3u8  VOD, #EXT-X-MAP init.mp4, segments on real keyframes, #EXT-X-ENDLIST;
                                         #EXT-X-START:TIME-OFFSET=<startAt>,PRECISE=YES for a resume
 GET    /remux/s/<sid>/<sig>/init.mp4
-GET    /remux/s/<sid>/<sig>/seg<N>.m4s  200 when made (waits up to 20 s), else 503 + Retry-After: 2
+GET    /remux/s/<sid>/<sig>/seg<N>.m4s  200 when made (waits up to 20 s), else 503 + Retry-After: 2 (no-store)
 GET    /remux/s/<sid>/<sig>/sub<N>.m3u8 a subtitle rendition: one WebVTT segment spanning the film
-GET    /remux/s/<sid>/<sig>/sub<N>.vtt  text/vtt; an empty document when nothing in that language was found
+GET    /remux/s/<sid>/<sig>/sub<N>.vtt  text/vtt, kept for the session; an empty document, no-store, when nothing in
+                                        that language was found or den-subtitles failed (asked again next time)
 POST   /remux/s/<sid>/<sig>/report      {code, message}: the player couldn't play it — logged against the session, 204
 DELETE /remux/s/<sid>/<sig>             204; the session's URLs answer 410 from then on
 GET    /health, /remux/health           200 {status} — ok, or degraded with a reason (Maintenance); the second is
@@ -132,7 +133,12 @@ iOS sends Safari's User-Agent, so it reads as Safari.
 
 `/remux/s/…` responses carry `Access-Control-Allow-Origin: *`, allow `Range` and expose
 `Content-Range`/`Content-Length` — a Cast receiver's page is on Google's origin. Playlists are
-`application/vnd.apple.mpegurl` and `no-store`; `init.mp4` and segments are `video/mp4`. Login and session
+`application/vnd.apple.mpegurl`; `init.mp4` and segments are `video/mp4`, always whole (`Accept-Ranges: none`; a
+`Range` is ignored). What a session's URL serves is fixed for its life and signed for it alone, so playlists, found
+subtitles, `init.mp4` and segments are `private, max-age=<seconds until the session expires>` (`immutable` on the
+media): a seek back to a segment already pruned from scratch comes from the player's cache instead of restarting
+ffmpeg. Errors, a 503 not-ready and an empty subtitle are `no-store`. A retry is a new session with its own URLs, so
+nothing cached reaches it. Login and session
 creation answer CORS only for `WEB_ORIGINS`: the Den web app on its public name, whose player plays from this
 service's tailnet address because video never goes through the Cloudflare tunnel (oxyc/den#15).
 

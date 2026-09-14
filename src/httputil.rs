@@ -45,13 +45,13 @@ pub fn error(status: StatusCode, code: &str, detail: &str) -> Response<Body> {
     json(status, &serde_json::json!({ "error": code, "detail": detail }), &[])
 }
 
-/// A text body of a given type, never stored by a cache.
-pub fn text(content_type: &str, body: String) -> Response<Body> {
+/// A text body of a given type, with the `Cache-Control` it may be kept under.
+pub fn text(content_type: &str, cache_control: &str, body: String) -> Response<Body> {
     Response::builder()
         .status(StatusCode::OK)
         .header("content-type", content_type)
         .header("content-length", body.len())
-        .header("cache-control", "no-store")
+        .header("cache-control", cache_control)
         .body(full(body))
         .unwrap()
 }

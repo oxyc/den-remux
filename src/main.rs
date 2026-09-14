@@ -690,10 +690,12 @@ where
         }
         (&Method::GET | &Method::HEAD, Some(f)) => {
             let resp = match f {
+                // VOD with an ENDLIST, fixed when the session was made: kept for its life. Idleness is judged by
+                // segment and init requests, so a player that doesn't fetch these again still counts as watching.
                 "master.m3u8" | "media.m3u8" => {
                     s.touch();
                     let text = if f == "master.m3u8" { s.master.clone() } else { s.media.clone() };
-                    httputil::text("application/vnd.apple.mpegurl", text)
+                    httputil::text("application/vnd.apple.mpegurl", &s.cache_control(), text)
                 }
                 "init.mp4" => s.serve_init(state, head).await,
                 _ => match session::sub_file(f)
@@ -701,11 +703,20 @@ where
                 {
                     Some((n, false)) => {
                         s.touch();
-                        httputil::text("application/vnd.apple.mpegurl", s.subtitle_playlist(n))
+                        httputil::text(
+                            "application/vnd.apple.mpegurl",
+                            &s.cache_control(),
+                            s.subtitle_playlist(n),
+                        )
                     }
+                    // A found subtitle is kept for the session; an empty document is not, so a player that asks
+                    // again after den-subtitles failed gets another try.
                     Some((n, true)) => {
                         s.touch();
-                        httputil::text("text/vtt; charset=utf-8", s.subtitle(state, n).await)
+                        match s.subtitle(state, n).await {
+                            Some(doc) => httputil::text("text/vtt; charset=utf-8", &s.cache_control(), doc),
+                            None => httputil::text("text/vtt; charset=utf-8", "no-store", subs::EMPTY.into()),
+                        }
                     }
                     None => match session::seg_index(f).filter(|n| *n < s.segments.len()) {
                         Some(n) => s.serve_segment(state, n, head).await,

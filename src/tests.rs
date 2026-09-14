@@ -190,6 +190,9 @@ static NEVER_OPENED: AtomicU32 = AtomicU32::new(0);
 static COUNTED_PLAYS: AtomicU32 = AtomicU32::new(0);
 /// Play URLs the fake scout was asked to follow under `/p/av1/`.
 static AV1_PLAYS: AtomicU32 = AtomicU32::new(0);
+/// Lists and subtitles the `flaky` den-subtitles install was asked for.
+static FLAKY_LISTS: AtomicU32 = AtomicU32::new(0);
+static FLAKY_SUBTITLES: AtomicU32 = AtomicU32::new(0);
 
 /// The fake scout's scope=availability config segment ("scoped", base64url) and the service key it
 /// asks for.
@@ -227,6 +230,23 @@ async fn origin_handle(
         return origin_full(200, body.to_string());
     }
     if path == "/subs/subtitle/1.vtt" {
+        return origin_full(200, "WEBVTT\n\n00:00:01.000 --> 00:00:02.500\nHello\n");
+    }
+    // den-subtitles, install `flaky`: its list and its subtitle each fail the first time they are asked for.
+    if path.starts_with("/flaky/subtitles/movie/tt0000001/") {
+        if FLAKY_LISTS.fetch_add(1, Relaxed) == 0 {
+            return origin_full(500, "");
+        }
+        let url = format!("http://{addr}/flaky/subtitle/1.srt?lang=eng");
+        return origin_full(
+            200,
+            serde_json::json!({"subtitles": [{"id": "1", "url": url, "lang": "eng"}]}).to_string(),
+        );
+    }
+    if path == "/flaky/subtitle/1.vtt" {
+        if FLAKY_SUBTITLES.fetch_add(1, Relaxed) == 0 {
+            return origin_full(502, "");
+        }
         return origin_full(200, "WEBVTT\n\n00:00:01.000 --> 00:00:02.500\nHello\n");
     }
     let listing = path
@@ -565,6 +585,8 @@ async fn end_to_end(
         let r = call(&state, "GET", &format!("{base}seg{i}.m4s"), None, "").await;
         assert_eq!(r.status, StatusCode::OK, "seg{i}: {}", r.text());
         assert_eq!(r.headers["content-type"], "video/mp4");
+        assert!(r.headers["cache-control"].to_str().unwrap().ends_with(", immutable"), "seg{i}");
+        assert_eq!(r.headers["accept-ranges"], "none");
         segs[i] = r.body;
     }
     assert!(state.jobs_started.load(Relaxed) >= 3, "the out-of-order fetch should have restarted the job");
@@ -1295,8 +1317,15 @@ async fn subtitles_are_webvtt_renditions_from_den_subtitles() {
     assert_eq!(en.headers["content-type"], "text/vtt; charset=utf-8");
     assert_eq!(en.headers["access-control-allow-origin"], "*");
     assert!(en.text().contains("X-TIMESTAMP-MAP=MPEGTS:0") && en.text().contains("Hello"), "{}", en.text());
-    let fi = call(&state, "GET", &format!("{base}sub1.vtt"), None, "").await.text();
-    assert_eq!(fi, crate::subs::EMPTY, "the Finnish subtitle is on a refused origin");
+    // Fixed for the session, so kept for as long as it lives and no longer.
+    let expires = j["expiresAt"].as_u64().unwrap();
+    for file in ["master.m3u8", "media.m3u8", "sub0.m3u8", "sub0.vtt"] {
+        let r = call(&state, "GET", &format!("{base}{file}"), None, "").await;
+        assert_kept_for_session(&r, expires, file);
+    }
+    let fi = call(&state, "GET", &format!("{base}sub1.vtt"), None, "").await;
+    assert_eq!(fi.text(), crate::subs::EMPTY, "the Finnish subtitle is on a refused origin");
+    assert_eq!(fi.headers["cache-control"], "no-store", "an empty subtitle is not kept");
     assert_eq!(call(&state, "GET", &format!("{base}sub2.vtt"), None, "").await.status, StatusCode::NOT_FOUND);
     state.end_all("test").await;
 
@@ -1304,6 +1333,43 @@ async fn subtitles_are_webvtt_renditions_from_den_subtitles() {
     let r = call(&state, "POST", "/remux/session", Some(&cookie), off).await;
     assert_eq!(r.status, StatusCode::BAD_REQUEST);
     assert_eq!(r.json()["error"], "bad_subtitles");
+}
+
+/// `Cache-Control: private, max-age=<n>` with n the session's remaining life.
+fn assert_kept_for_session(r: &Reply, expires: u64, what: &str) {
+    assert_eq!(r.status, StatusCode::OK, "{what}: {}", r.text());
+    let cc = r.headers["cache-control"].to_str().unwrap();
+    let age: u64 = cc
+        .strip_prefix("private, max-age=")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| panic!("{what}: {cc}"));
+    let left = expires - crate::state::unix_now();
+    assert!(age > 0 && age <= left + 1 && age + 2 >= left, "{what}: {cc}, the session has {left}s left");
+}
+
+/// A den-subtitles list or subtitle that fails is asked for again on the player's next request, and served empty
+/// and unkept meanwhile; once found, the subtitle is kept for the session and not fetched again.
+#[tokio::test]
+async fn a_subtitle_that_failed_once_is_tried_again() {
+    let origin = origin().await;
+    let state = test_state(&origin, 2, Duration::from_secs(600));
+    let cookie = login(&state, "phone-key").await;
+    let body = format!(r#"{{"imdb":"tt0000001","subtitles":"{origin}/flaky","subtitleLanguages":["en"]}}"#);
+    let r = call(&state, "POST", "/remux/session", Some(&cookie), &body).await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let j = r.json();
+    let vtt = format!("{}sub0.vtt", j["playlist"].as_str().unwrap().trim_end_matches("master.m3u8"));
+    for why in ["the list failed", "the subtitle failed"] {
+        let r = call(&state, "GET", &vtt, None, "").await;
+        assert_eq!(r.text(), crate::subs::EMPTY, "{why}");
+        assert_eq!(r.headers["cache-control"], "no-store", "{why}");
+    }
+    let found = call(&state, "GET", &vtt, None, "").await;
+    assert!(found.text().contains("Hello"), "{}", found.text());
+    assert_kept_for_session(&found, j["expiresAt"].as_u64().unwrap(), "sub0.vtt");
+    assert!(call(&state, "GET", &vtt, None, "").await.text().contains("Hello"));
+    assert_eq!((FLAKY_LISTS.load(Relaxed), FLAKY_SUBTITLES.load(Relaxed)), (2, 2), "kept once found");
+    state.end_all("test").await;
 }
 
 /// A player without HEVC gets an HEVC-only title through the GPU alone: refused while transcoding is
