@@ -14,6 +14,7 @@ unevenly, and the B-frames are what trigger ffmpeg's seek back-off (see `src/job
 | `moov-at-end.mp4` | A `moov` after the `mdat`, found by walking box headers | 0, 2, 5 | 8.0 |
 | `av1.mkv` | AV1: SVT-AV1's 10-bit HDR10 (PQ, BT.2020), `V_AV1` with its `av1C` CodecPrivate, Colour element and sequence header; Opus audio | 0, 2.5, 6, 8.5, 12, 14, 18.5, 21, 24, 27.5 | 30.008 |
 | `av1.mp4` | `av1.mkv`'s video copied into MP4: the `av01` sample entry's `av1C` and `colr` | as `av1.mkv` | 29.999 |
+| `surround.mkv` | `h264.mkv`'s video copied, with a 5.1 AAC track (eng) and a 7.1 one (swe): converted to AAC 5.1 | as `h264.mkv` | 30.021 |
 | `scout-streams.json` | A den-scout stream list: uncached, AV1, XviD/AVI, 3D and cache-unknown releases to skip | — | — |
 
 ## Regenerating
@@ -62,6 +63,14 @@ ffmpeg -y -f lavfi -i testsrc2=size=320x180:rate=24:duration=30 -f lavfi -i sine
   -c:a libopus -b:a 32k -ac 2 -metadata:s:a:0 language=eng av1.mkv
 
 ffmpeg -y -i av1.mkv -map 0:v -c copy -movflags +faststart av1.mp4
+
+# A tone on each channel, the LFE's low and quieter, so a listen tells the channels apart. 40 kbit/s keeps the file under
+# 1 MB; what a session does with the tracks is convert them, so their own quality doesn't matter.
+ffmpeg -y -i h264.mkv \
+  -f lavfi -i "aevalsrc=sin(440*2*PI*t)|sin(550*2*PI*t)|sin(660*2*PI*t)|0.3*sin(55*2*PI*t)|sin(770*2*PI*t)|sin(880*2*PI*t):c=5.1:s=48000:d=30" \
+  -f lavfi -i "aevalsrc=sin(440*2*PI*t)|sin(495*2*PI*t)|sin(550*2*PI*t)|0.3*sin(55*2*PI*t)|sin(660*2*PI*t)|sin(770*2*PI*t)|sin(880*2*PI*t)|sin(990*2*PI*t):c=7.1:s=48000:d=30" \
+  -map 0:v -map 1:a -map 2:a -c:v copy -c:a aac -b:a:0 40k -b:a:1 40k \
+  -metadata:s:a:0 language=eng -metadata:s:a:1 language=swe surround.mkv
 ```
 
 AV1 has no frame reordering, so its keyframes are its key packets as well:

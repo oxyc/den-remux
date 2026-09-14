@@ -10,8 +10,8 @@
 //!
 //! A release comes from den-scout — the full install the request names, which is its own credential; for a
 //! logged-in browser also a scope=availability install opened with this service's key, or this service's
-//! own install. Its video is copied, its audio re-encoded to AAC stereo, and it is served as a VOD
-//! playlist cut on its own keyframes.
+//! own install. Its video is copied, its audio re-encoded to AAC — stereo, or 5.1 for a player that plays it — and it
+//! is served as a VOD playlist cut on its own keyframes.
 
 mod auth;
 mod config;
@@ -497,7 +497,7 @@ where
         return bad_request(
             "Expected {\"imdb\": \"tt…\", \"season\"?: n, \"episode\"?: n, \"filename\"?: \"…\", \"scout\"?: \"…\", \
              \"audio\"?: [\"en\", …], \"audioTrack\"?: n, \"subtitles\"?: \"…\", \"subtitleLanguages\"?: [\"en\", …], \
-             \"videoCodecs\"?: [\"h264\", \"hevc\"], \"playable\"?: {\"h264\", \"h264High10\", \"hevcMain\", \"hevcMain10\", \"hevcHighTier\", \"hdr\", \"eac3\", \"dolbyVision\": {\"p5\", \"p8\"}, \"av1\", \"av1Main10\", \"av1Hdr\"}, \
+             \"videoCodecs\"?: [\"h264\", \"hevc\"], \"playable\"?: {\"h264\", \"h264High10\", \"hevcMain\", \"hevcMain10\", \"hevcHighTier\", \"hdr\", \"eac3\", \"aacMultichannel\", \"dolbyVision\": {\"p5\", \"p8\"}, \"av1\", \"av1Main10\", \"av1Hdr\"}, \
              \"startAt\"?: seconds}.",
         );
     };
@@ -565,7 +565,10 @@ where
                 "duration": s.info.duration,
                 "expiresAt": s.exp,
                 "audioTrack": s.audio,
-                "audioTracks": s.info.audio.iter().map(|a| serde_json::json!({
+                // The channels the session's audio carries, beside the track's own in `audioTracks`: fewer is a
+                // conversion to stereo.
+                "audioChannels": s.audio_channels,
+                "audioTracks":s.info.audio.iter().map(|a| serde_json::json!({
                     "language": a.language,
                     "name": a.name,
                     "channels": a.channels,

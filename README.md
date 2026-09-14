@@ -2,7 +2,8 @@
 
 Den's playback for browsers — and, through the same URLs, for AirPlay and Cast receivers. A phone or a
 laptop cannot play what den-scout returns: Matroska, and Dolby/DTS/TrueHD audio. den-remux copies the
-video, re-encodes the audio to AAC stereo, and serves HLS (fMP4) cut on the file's own keyframes.
+video, re-encodes the audio to AAC (stereo, or 5.1 where the player plays it), and serves HLS (fMP4) cut on the file's
+own keyframes.
 
 ```
 browser ──POST /remux/session {imdb, scout}───►  scout (the library's install URL, its credential) → cached H.264/HEVC/AV1 release
@@ -20,7 +21,8 @@ POST   /remux/session                   {imdb, season?, episode?, filename?, sco
                                          subtitles?, subtitleLanguages?, videoCodecs?, playable?, startAt?} (a full scout install,
                                          or browser cookie/bearer) → 201
                                         {sid, playlist, release:{label,filename,size}, duration, expiresAt,
-                                         video:{codec: h264|hevc|av1, transcoded}, audioTrack, audioTracks, subtitles}
+                                         video:{codec: h264|hevc|av1, transcoded}, audioTrack, audioChannels,
+                                         audioTracks:[{language,name,channels,commentary}], subtitles}
                                         401 not_logged_in · 403 scout_refused
                                         400 bad_request/bad_scout/bad_subtitles/bad_audio_track
                                         404 no_release/no_playable_release · 429 too_many_sessions/rate_limited
@@ -30,6 +32,7 @@ POST   /remux/releases                  {imdb, season?, episode?, scout?} (a ful
                                         order it would try them, for a player to name one as `filename`. No URLs
 GET    /remux/s/<sid>/<sig>/master.m3u8 one variant: CODECS "<avc1…|hvc1…|av01…>,mp4a.40.2", BANDWIDTH from size/duration;
                                         copied Dolby audio: CODECS "…,ec-3|ac-3" and an AUDIO rendition with CHANNELS;
+                                        5.1 AAC: an AUDIO rendition with CHANNELS="6";
                                         HDR AV1: VIDEO-RANGE=PQ|HLG
 GET    /remux/s/<sid>/<sig>/media.m3u8  VOD, #EXT-X-MAP init.mp4, segments on real keyframes, #EXT-X-ENDLIST;
                                         #EXT-X-START:TIME-OFFSET=<startAt>,PRECISE=YES for a resume
@@ -55,8 +58,11 @@ anything else                           404 {"error":"not_found"}
   earlier session's `audioTracks` (send that session's `filename` with it). One track per session, so
   switching language is a new session. For a player whose `playable.eac3` says it plays E-AC-3 and AC-3 in
   fMP4 HLS (Safari, Apple's receivers), such a track is copied as it is, channels and all, and the master names
-  it (`ec-3`/`ac-3`, an AUDIO rendition with `CHANNELS`); every other track, and every other player, gets AAC
-  stereo.
+  it (`ec-3`/`ac-3`, an AUDIO rendition with `CHANNELS`). Every other track is converted to AAC-LC: 5.1 at 384 kbit/s
+  from a track of six channels or more (7.1 folds down to 5.1) for a player whose `playable.aacMultichannel` says it
+  plays multichannel AAC — named in the master by an AUDIO rendition with `CHANNELS="6"` — and stereo at 192 kbit/s
+  otherwise, byte for byte as before. `audioChannels` in the answer is what the session carries, beside the track's
+  own `channels` in `audioTracks`: fewer means the track plays downmixed to stereo.
 - **Subtitles.** `subtitles` is den-subtitles' install URL from the library, on `SUBTITLE_ORIGINS`;
   `subtitleLanguages` (up to 4, most wanted first) become WebVTT renditions in the master playlist — what AirPlay
   and Cast receivers show, which a page's own `<track>` never reaches. The first is `DEFAULT=YES`, so it shows
@@ -69,7 +75,7 @@ anything else                           404 {"error":"not_found"}
   title is transcoded to H.264 on the GPU (Hardware transcode, below) — or refused with
   `transcode_unavailable` while transcoding is off or in use.
 - **What the player decodes.** `playable` — `{h264, h264High10, hevcMain, hevcMain10, hevcHighTier, hdr, eac3,
-  dolbyVision: {p5, p8}}`, the
+  aacMultichannel, dolbyVision: {p5, p8}}`, the
   highest level it takes of 8-bit H.264 and of H.264 High 10 (`level_idc`, 0x33 is 5.1), of 8-bit and 10-bit HEVC
   (level × 30, 153 is 5.1) and of HEVC's High tier, 0 for none, and whether it decodes PQ HDR — decides over
   `videoCodecs` when given. A High 10 release (profile 110) is passed over unless `h264High10` reaches its level:
@@ -207,7 +213,10 @@ The hard part is making ffmpeg cut there. What was tried, on ffmpeg 9.0.1 agains
 The integration tests hold all of it: they fetch segments out of order (3, then 1 — behind that run — then
 0) so the job restarts twice, and check with ffprobe that every segment starts with a keyframe at its
 playlist time (±1 frame), ends before the next, carries audio, and that the segments joined back-to-back
-hold every source frame exactly once over the full duration — for H.264, HEVC and AV1 Matroska and for MP4.
+hold every source frame exactly once over the full duration, with no hole in the audio at any join — for H.264,
+HEVC and AV1 Matroska, for MP4, and for 5.1 and 7.1 tracks converted to AAC 5.1. Where a restarted run joins the run
+before it, one audio frame may overlap (a restart reads audio from a little before its keyframe, see 3 above), which a
+player drops; the tests allow that one frame and no more.
 
 ## Resource use
 
@@ -221,7 +230,8 @@ Low resource use comes first, and the design follows from it:
 - **Idle is zero work.** No timers, sweeps or polling without sessions: scratch is swept at start and a
   session's directory is removed when it ends. Each session has one task, which ticks every 500 ms only
   while its ffmpeg is actually running and otherwise sleeps until a request or its idle deadline.
-- **One ffmpeg per session**, `-threads 1` (the video is copied; stereo AAC needs one thread), paused with
+- **One ffmpeg per session**, `-threads 1` (the video is copied; AAC needs one thread — a 7.1 track decoded and
+  encoded to 5.1 took 0.90 CPU-s for 30 s against stereo's 0.60, 34× real time on one Apple Silicon core), paused with
   `SIGSTOP` once it is four segments ahead of the newest request and resumed when the player catches up.
   Killed (process group) and reaped on end, idle, seek-restart and shutdown.
 - **Scratch is a window**: GOPs behind the previous segment are deleted when a segment is served, and a
@@ -288,8 +298,10 @@ dependabot cannot bump it, so bump both lines by hand.
 - **H.264, HEVC and AV1 sources only.** AV1 plays only as a copy, for a player whose `playable` says it decodes
   it; there is no conversion to fall back on. VP9, MPEG-4 Part 2/XviD and VC-1 are skipped. Files without a
   keyframe index (Matroska with no Cues) are skipped.
-- **Audio is AAC stereo**, one track per session — or, for a player that plays them, E-AC-3/AC-3 copied with
-  no stereo alternate beside it (Apple's authoring spec asks for AC-3 beside E-AC-3 for devices without it).
+- **Audio is AAC**, one track per session: 5.1 at most (a 7.1 track folds down to it) and only for a player that
+  reports `aacMultichannel`, stereo for every other — or, for a player that plays them, E-AC-3/AC-3 copied with no
+  stereo alternate beside it (Apple's authoring spec asks for AC-3 beside E-AC-3 for devices without it). A 5.1
+  variant carries no stereo alternate either: the player downmixes it for stereo output.
 - **Text subtitles only**, from den-subtitles; the release's own tracks (PGS, ASS) are not carried.
 - **Dolby Vision profile 5** has no HDR10/SDR base layer: Safari shows it, Chrome cannot, and stripped or
   transcoded its colours come out green and purple. A session skips it — the probe reads the profile — unless
@@ -341,8 +353,8 @@ The cookie is `Secure`: a browser keeps it over HTTPS (tailscale serve) or on `l
 `cargo test` is hermetic: parsers against the fixtures in `testdata/` (see its README), playlists,
 signing, cookies, redaction, release picking, the scoped-scout validation, and a session created against a
 fake scout that refuses a scoped config without the key and a file host that fails if it ever sees the
-key. The `#[ignore]`d tests drive the whole path with real ffmpeg: four end-to-end remuxes (H.264, HEVC and AV1
-Matroska, MP4), the session cap, the idle kill (ffmpeg killed and reaped), and `DELETE` → 410. They
+key. The `#[ignore]`d tests drive the whole path with real ffmpeg: five end-to-end remuxes (H.264, HEVC and AV1
+Matroska, MP4, and a 5.1 and a 7.1 track converted to AAC 5.1), the session cap, the idle kill (ffmpeg killed and reaped), and `DELETE` → 410. They
 run in the Dockerfile's `test` stage, against the ffmpeg the image ships — another version seeks
 differently (ffmpeg 8.0 lands a restarted H.264 Matroska run one keyframe early), and the alignment
 depends on exactly how it seeks. CI's `e2e` job runs the same:

@@ -134,8 +134,12 @@ pub struct Session {
     pub info: MediaInfo,
     /// The audio track played, counting audio tracks only.
     pub audio: usize,
-    /// The track is copied as it is, as this codec (`ec-3`, `ac-3`); `None` re-encodes it to AAC stereo.
+    /// The track is copied as it is, as this codec (`ec-3`, `ac-3`); `None` re-encodes it to AAC.
     pub audio_copy: Option<&'static str>,
+    /// What happens to the track: copied, or AAC stereo or 5.1.
+    pub audio_out: job::AudioOut,
+    /// The channels the session's audio carries: the track's own when copied, else 2 or 6.
+    pub audio_channels: u32,
     /// Subtitle renditions, when the browser asked for any.
     pub subs: Option<crate::subs::Subs>,
     /// What a copy does with the video's Dolby Vision: kept for a player that shows it, else stripped.
@@ -375,7 +379,7 @@ impl Session {
             seek,
             video: self.video(st),
             audio: self.audio,
-            audio_copy: self.audio_copy.is_some(),
+            audio_out: self.audio_out,
             dir: &dir,
         };
         match Job::spawn(&st.cfg.ffmpeg, id, start, &spec) {
@@ -798,6 +802,8 @@ pub struct Playable {
     pub hdr: bool,
     /// Plays E-AC-3 and AC-3 in fMP4 HLS — Safari and Apple's receivers: such a track is copied, not converted.
     pub eac3: bool,
+    /// Plays 6-channel AAC-LC: a converted track of six channels or more stays 5.1 rather than coming down to stereo.
+    pub aac_multichannel: bool,
     /// Which Dolby Vision the player shows as Dolby Vision rather than as its base layer. Absent is neither.
     pub dolby_vision: DolbyVisionPlay,
     /// 8-bit AV1's highest `seq_level_idx` at Main profile and tier (8 is level 4.0, 13 is 5.1). Nothing on the box
@@ -836,7 +842,8 @@ impl std::fmt::Display for Playable {
             (false, false) => "",
         };
         let av1_hdr = if self.av1_hdr { ", AV1 HDR" } else { "" };
-        write!(f, "{hdr}, AV1 L{}, AV1 10-bit L{}{av1_hdr}{dv}", self.av1, self.av1_main10)
+        let aac = if self.aac_multichannel { ", AAC 5.1" } else { "" };
+        write!(f, "{hdr}, AV1 L{}, AV1 10-bit L{}{av1_hdr}{dv}{aac}", self.av1, self.av1_main10)
     }
 }
 
@@ -1305,8 +1312,17 @@ pub async fn create(
         }
         None => crate::lang::pick_audio(&info.audio, want.audio),
     };
-    // E-AC-3 or AC-3 plays as it is where the player says so; everything else is AAC stereo.
+    // E-AC-3 or AC-3 plays as it is where the player says so; everything else is AAC — 5.1 from six channels or more
+    // where the player plays multichannel AAC, stereo otherwise.
     let audio_copy = dolby_codec(&info.audio[audio].codec).filter(|_| want.playable.is_some_and(|p| p.eac3));
+    let source_channels = info.audio[audio].channels;
+    let audio_out = match audio_copy {
+        Some(_) => job::AudioOut::Copy,
+        None if source_channels >= 6 && want.playable.is_some_and(|p| p.aac_multichannel) => {
+            job::AudioOut::Surround
+        }
+        None => job::AudioOut::Stereo,
+    };
 
     let sid = crate::auth::random_id();
     let exp = unix_now() + (info.duration.ceil() as u64 + SESSION_GRACE_SECS).min(SESSION_MAX_SECS);
@@ -1379,13 +1395,16 @@ pub async fn create(
         master: playlist::master(
             &codecs,
             dv_signal.as_ref(),
-            &match audio_copy {
-                Some(codec) => playlist::Audio::Copy {
+            &match (audio_copy, audio_out) {
+                (Some(codec), _) => playlist::Audio::Copy {
                     codec,
-                    channels: info.audio[audio].channels,
+                    channels: source_channels,
                     language: info.audio[audio].language.as_deref(),
                 },
-                None => playlist::Audio::Aac,
+                (None, job::AudioOut::Surround) => {
+                    playlist::Audio::AacSurround { language: info.audio[audio].language.as_deref() }
+                }
+                (None, _) => playlist::Audio::Aac,
             },
             peak,
             avg,
@@ -1408,6 +1427,8 @@ pub async fn create(
         info,
         audio,
         audio_copy,
+        audio_out,
+        audio_channels: audio_out.channels(source_channels),
         dovi,
         subs,
         transcoded: transcode.is_some(),
@@ -1454,7 +1475,11 @@ pub async fn create(
         session.segments.len(),
         session.audio,
         session.info.audio[session.audio].language.as_deref().unwrap_or("und"),
-        session.audio_copy.map(|c| format!(" copied as {c}")).unwrap_or_default(),
+        match (session.audio_copy, session.audio_out) {
+            (Some(c), _) => format!(" copied as {c}"),
+            (None, job::AudioOut::Surround) => " as AAC 5.1".to_string(),
+            (None, _) => String::new(),
+        },
     );
     tokio::spawn(supervise(st.clone(), session.clone()));
     Ok(session)

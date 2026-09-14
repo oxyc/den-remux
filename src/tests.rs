@@ -79,6 +79,14 @@ async fn an_hdr10_release_reads_as_hdr_and_is_tone_mapped() {
 }
 
 #[tokio::test]
+async fn surround_matroska_reads_each_tracks_channels() {
+    let info = probe_with_head(&fixture("surround.mkv"), crate::scout::HEAD_BYTES as usize).await;
+    assert_keyframes(&info.keyframes, &H264_MKV_KF);
+    let tracks: Vec<_> = info.audio.iter().map(|a| (a.codec.as_str(), a.channels)).collect();
+    assert_eq!(tracks, [("A_AAC", 6), ("A_AAC", 8)]);
+}
+
+#[tokio::test]
 async fn hevc_matroska_gives_an_hvc1_codec_string() {
     let info = probe_with_head(&fixture("hevc.mkv"), crate::scout::HEAD_BYTES as usize).await;
     assert_keyframes(&info.keyframes, &HEVC_MKV_KF);
@@ -299,6 +307,7 @@ async fn origin_handle(
             "tt0000003" => "h264.mp4",
             "tt0000009" => "slow/h264.mkv",
             "tt0000011" => "av1.mkv",
+            "tt0000013" => "surround.mkv",
             "tt0000004:1:2" if path.contains("/stream/series/") => "h264.mkv",
             _ => return origin_full(200, r#"{"streams":[]}"#),
         };
@@ -488,14 +497,14 @@ fn extinfs(media: &str) -> Vec<f64> {
 /// The whole path for one fixture: log in, create a session against the fake scout, fetch the
 /// playlists, then fetch segments out of order so the job has to restart — first mid-file, then
 /// behind itself, then at zero — and check every segment with ffprobe. `extra` goes into the request
-/// (`,"playable":{…}`); the master playlist and the init come back for codec-specific checks.
+/// (`,"playable":{…}`); the master playlist, the init and the joined file come back for codec-specific checks.
 async fn end_to_end(
     imdb: &str,
     fixture_name: &str,
     codec_prefix: &str,
     scoped: bool,
     extra: &str,
-) -> (String, Bytes) {
+) -> (String, Bytes, PathBuf) {
     let origin = origin().await;
     let state = test_state(&origin, 2, Duration::from_secs(600));
     let cookie = login(&state, "phone-key").await;
@@ -606,6 +615,24 @@ async fn end_to_end(
     let dur: f64 =
         ffprobe(&["-show_entries", "format=duration", "-of", "csv=p=0"], &whole).trim().parse().unwrap();
     assert!((dur - duration).abs() < 0.2, "joined duration {dur} vs {duration}");
+    // The audio has no hole at any join, those between two runs included: each packet starts where the one before it
+    // ended, give or take a few samples of the encoder's priming. A run restarted at a keyframe reads its audio from the
+    // demuxer's position a little before it (`-noaccurate_seek`), so where it joins the run before, one packet may
+    // overlap the last one that run made — at most one frame, which a player drops.
+    let audio: Vec<(f64, f64)> = ffprobe(
+        &["-select_streams", "a:0", "-show_entries", "packet=pts_time,duration_time", "-of", "csv=p=0"],
+        &whole,
+    )
+    .lines()
+    .filter_map(|l| {
+        let (pts, d) = l.split_once(',')?;
+        Some((pts.parse().ok()?, d.parse().ok()?))
+    })
+    .collect();
+    for w in audio.windows(2) {
+        let gap = w[1].0 - (w[0].0 + w[0].1);
+        assert!(gap < 0.005 && gap > -(w[0].1 + 0.005), "the audio jumps {gap:.4}s at {:.3}", w[1].0);
+    }
 
     // A player that can't play it says why, into the log; a report that isn't one is refused.
     let report =
@@ -626,7 +653,7 @@ async fn end_to_end(
     assert_eq!(call(&state, "GET", &playlist, None, "").await.status, StatusCode::GONE);
     assert!(!dir.exists(), "scratch left behind");
     assert_eq!(state.scratch_bytes.load(Relaxed), 0);
-    (master.text(), init.body)
+    (master.text(), init.body, whole)
 }
 
 #[tokio::test]
@@ -668,7 +695,7 @@ async fn mp4_end_to_end() {
 #[ignore]
 async fn av1_matroska_end_to_end() {
     let playable = r#","playable":{"h264":51,"av1":13,"av1Main10":13,"av1Hdr":true}"#;
-    let (master, init) = end_to_end("tt0000011", "av1.mkv", "av01.0.", true, playable).await;
+    let (master, init, _) = end_to_end("tt0000011", "av1.mkv", "av01.0.", true, playable).await;
     assert!(master.contains("M.10.0.110.09.16.09.0,mp4a.40.2\",VIDEO-RANGE=PQ,"), "{master}");
     let has = |fourcc: &[u8]| init.windows(4).any(|w| w == fourcc);
     assert!(has(b"av01") && has(b"av1C") && has(b"colr"), "the av01 sample entry, its av1C and colr");
@@ -680,6 +707,28 @@ async fn av1_matroska_end_to_end() {
         &file,
     );
     assert_eq!(stream.trim(), "av1,smpte2084", "the init alone describes AV1 in PQ");
+}
+
+/// 5.1 for a player that plays multichannel AAC: surround.mkv's 5.1 track, and its 7.1 one folded down, come out as
+/// six-channel AAC-LC in 5.1 — in the init, so every run's segments share it — named in the master with CHANNELS="6",
+/// and cut, restarted and joined as the stereo remuxes are.
+#[tokio::test]
+#[ignore]
+async fn surround_matroska_end_to_end() {
+    for track in [0, 1] {
+        let extra = format!(r#","audioTrack":{track},"playable":{{"h264":51,"aacMultichannel":true}}"#);
+        let (master, init, whole) = end_to_end("tt0000013", "surround.mkv", "avc1.64", true, &extra).await;
+        assert!(master.contains("CHANNELS=\"6\"") && master.contains(",AUDIO=\"audio\""), "{master}");
+        let file = temp_dir().join("init.mp4");
+        std::fs::write(&file, &init).unwrap();
+        let entries =
+            ["-select_streams", "a:0", "-show_entries", "stream=codec_name,channels,channel_layout"];
+        let stream = ffprobe(&[&entries[..], &["-of", "csv=p=0"]].concat(), &file);
+        assert_eq!(stream.trim(), "aac,6,5.1", "track {track}: the init alone describes 5.1 AAC");
+        let profile =
+            ffprobe(&["-select_streams", "a:0", "-show_entries", "stream=profile", "-of", "csv=p=0"], &whole);
+        assert_eq!(profile.trim(), "LC", "track {track}");
+    }
 }
 
 /// An AV1 release plays for a player whose report says it decodes it — its level, its 10 bits, its PQ — named so in
@@ -1168,6 +1217,36 @@ async fn dolby_audio_is_copied_for_a_player_that_plays_it() {
         assert!(master.contains(&format!(",{audio}\"")), "{body}: {master}");
         let named = master.contains("TYPE=AUDIO") && master.contains("CHANNELS=\"2\"");
         assert_eq!(named, audio != "mp4a.40.2", "{body}: {master}");
+    }
+    state.end_all("test").await;
+}
+
+/// Converted audio stays 5.1 for a player that plays multichannel AAC, from surround.mkv's 5.1 track and its 7.1 one.
+/// A player that doesn't say so gets stereo, as does a mono track (h264.mkv's second); a copied Dolby track keeps its
+/// own channels. The answer names what the session carries beside each track's own. Creating a session starts no ffmpeg.
+#[tokio::test]
+async fn converted_audio_stays_5_1_for_a_player_that_plays_it() {
+    let origin = origin().await;
+    let state = test_state(&origin, 4, Duration::from_secs(600));
+    let cookie = login(&state, "phone-key").await;
+    let chrome = r#""playable":{"h264":51,"aacMultichannel":true}"#;
+    let apple = r#""playable":{"h264":51,"hevcMain":153,"eac3":true,"aacMultichannel":true}"#;
+    let cases = [
+        (format!(r#"{{"imdb":"tt0000013",{chrome}}}"#), 6, 6),
+        (format!(r#"{{"imdb":"tt0000013","audioTrack":1,{chrome}}}"#), 8, 6),
+        (r#"{"imdb":"tt0000013","playable":{"h264":51}}"#.to_string(), 6, 2),
+        (format!(r#"{{"imdb":"tt0000001","audioTrack":1,{chrome}}}"#), 1, 2),
+        (format!(r#"{{"imdb":"tt0000002",{apple}}}"#), 2, 2),
+    ];
+    for (body, source, carried) in cases {
+        let r = call(&state, "POST", "/remux/session", Some(&cookie), &body).await;
+        assert_eq!(r.status, StatusCode::CREATED, "{body}: {}", r.text());
+        let j = r.json();
+        let track = j["audioTrack"].as_u64().unwrap() as usize;
+        assert_eq!(j["audioTracks"][track]["channels"], source, "{body}");
+        assert_eq!(j["audioChannels"], carried, "{body}");
+        let master = call(&state, "GET", j["playlist"].as_str().unwrap(), None, "").await.text();
+        assert_eq!(master.contains("CHANNELS=\"6\""), carried == 6, "{body}: {master}");
     }
     state.end_all("test").await;
 }

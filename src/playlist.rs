@@ -61,6 +61,8 @@ pub fn media(segs: &[Segment], start: f64) -> String {
 pub enum Audio<'a> {
     /// The track re-encoded to AAC-LC stereo.
     Aac,
+    /// The track re-encoded to AAC-LC 5.1, with its language.
+    AacSurround { language: Option<&'a str> },
     /// A Dolby track copied as it is: `ec-3` or `ac-3`, with its channel count and language.
     Copy { codec: &'static str, channels: u32, language: Option<&'a str> },
 }
@@ -78,8 +80,8 @@ pub struct DolbyVision {
 /// `(language, name)` in `subs`, most wanted first. The first is the default, so a player shows it without being
 /// asked; the rest are there to choose.
 ///
-/// Copied audio is also named by an AUDIO rendition with no URI — its media is in the variant's own segments — so
-/// the player learns its CHANNELS, which CODECS does not carry.
+/// Copied and 5.1 audio is also named by an AUDIO rendition with no URI — its media is in the variant's own segments —
+/// so the player learns its CHANNELS, which CODECS does not carry. Stereo AAC, which every player assumes, is not.
 pub fn master(
     video_codecs: &str,
     dolby_vision: Option<&DolbyVision>,
@@ -91,20 +93,21 @@ pub fn master(
 ) -> String {
     let res = resolution.filter(|(w, h)| *w > 0 && *h > 0).map(|(w, h)| format!(",RESOLUTION={w}x{h}"));
     let mut out = String::from("#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-INDEPENDENT-SEGMENTS\n");
-    let audio_codec = match audio {
-        Audio::Aac => "mp4a.40.2",
-        Audio::Copy { codec, channels, language } => {
-            let (name, lang) = match language {
-                Some(l) => (crate::lang::name(l), format!(",LANGUAGE=\"{l}\"")),
-                None => ("Audio".to_string(), String::new()),
-            };
-            out.push_str(&format!(
-                "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"audio\",NAME=\"{name}\"{lang},DEFAULT=YES,AUTOSELECT=YES,\
-                 CHANNELS=\"{channels}\"\n"
-            ));
-            codec
-        }
+    let (audio_codec, rendition) = match audio {
+        Audio::Aac => ("mp4a.40.2", None),
+        Audio::AacSurround { language } => ("mp4a.40.2", Some((6, language))),
+        Audio::Copy { codec, channels, language } => (*codec, Some((*channels, language))),
     };
+    if let Some((channels, language)) = rendition {
+        let (name, lang) = match language {
+            Some(l) => (crate::lang::name(l), format!(",LANGUAGE=\"{l}\"")),
+            None => ("Audio".to_string(), String::new()),
+        };
+        out.push_str(&format!(
+            "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"audio\",NAME=\"{name}\"{lang},DEFAULT=YES,AUTOSELECT=YES,\
+             CHANNELS=\"{channels}\"\n"
+        ));
+    }
     for (i, (lang, name)) in subs.iter().enumerate() {
         let default = if i == 0 { "YES" } else { "NO" };
         out.push_str(&format!(
@@ -121,7 +124,7 @@ pub fn master(
         "#EXT-X-STREAM-INF:BANDWIDTH={bandwidth},AVERAGE-BANDWIDTH={average},CODECS=\"{video_codecs},{audio_codec}\"{dv}{}{}{}\n\
          media.m3u8\n",
         res.unwrap_or_default(),
-        if matches!(audio, Audio::Aac) { "" } else { ",AUDIO=\"audio\"" },
+        if rendition.is_none() { "" } else { ",AUDIO=\"audio\"" },
         if subs.is_empty() { "" } else { ",SUBTITLES=\"subs\"" }
     ));
     out
@@ -252,6 +255,25 @@ mod tests {
         let ac3 = Audio::Copy { codec: "ac-3", channels: 2, language: None };
         let m = master("avc1.640028", None, &ac3, 1, 1, None, &[]);
         assert!(m.contains("NAME=\"Audio\",DEFAULT=YES") && m.contains(",ac-3\""), "{m}");
+    }
+
+    #[test]
+    fn aac_5_1_is_named_with_its_channels_and_stereo_is_not() {
+        let m = master("avc1.640028", None, &Audio::AacSurround { language: Some("swe") }, 1, 1, None, &[]);
+        assert!(
+            m.contains(
+                "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"audio\",NAME=\"Swedish\",LANGUAGE=\"swe\",DEFAULT=YES,AUTOSELECT=YES,CHANNELS=\"6\"\n"
+            ),
+            "{m}"
+        );
+        assert!(m.contains("CODECS=\"avc1.640028,mp4a.40.2\",AUDIO=\"audio\"\nmedia.m3u8"), "{m}");
+        let stereo = master("avc1.640028", None, &Audio::Aac, 1, 1, None, &[]);
+        assert_eq!(
+            stereo,
+            "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-INDEPENDENT-SEGMENTS\n\
+             #EXT-X-STREAM-INF:BANDWIDTH=1,AVERAGE-BANDWIDTH=1,CODECS=\"avc1.640028,mp4a.40.2\"\nmedia.m3u8\n",
+            "stereo is as it always was"
+        );
     }
 
     #[test]

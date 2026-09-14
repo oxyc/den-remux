@@ -91,15 +91,36 @@ pub const TRANSCODE_PEAK: u64 = 12_000_000;
 const TRANSCODE_MAXRATE: &str = "12M";
 const TRANSCODE_BUFSIZE: &str = "16M";
 
+/// What happens to the audio track.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum AudioOut {
+    /// Copied as it is — E-AC-3 or AC-3, for a player that plays them in fMP4 HLS.
+    Copy,
+    /// Re-encoded to AAC-LC stereo, which every player takes.
+    Stereo,
+    /// Re-encoded to AAC-LC 5.1, for a player that plays multichannel AAC, from a track of six channels or more.
+    /// `-ac 6` hands the encoder 5.1 whatever the source's layout: swresample folds 7.1 down to it.
+    Surround,
+}
+
+impl AudioOut {
+    /// The channels the session's audio carries, from the source track's.
+    pub fn channels(self, source: u32) -> u32 {
+        match self {
+            AudioOut::Copy => source,
+            AudioOut::Stereo => 2,
+            AudioOut::Surround => 6,
+        }
+    }
+}
+
 pub struct Spec<'a> {
     pub input: &'a str,
     pub seek: Option<f64>,
     pub video: Video,
     /// Which audio track, counting audio tracks only.
     pub audio: usize,
-    /// Copy that track as it is — E-AC-3 or AC-3, for a player that plays them in fMP4 HLS — rather than
-    /// re-encode it to AAC stereo.
-    pub audio_copy: bool,
+    pub audio_out: AudioOut,
     pub dir: &'a Path,
 }
 
@@ -127,7 +148,7 @@ pub fn args(spec: &Spec<'_>, ca_file: Option<&str>) -> Vec<String> {
         }
     }
     // One thread for the audio decoder, the filter graph and the AAC encoder: the video is copied, and
-    // stereo AAC keeps one core far from busy.
+    // AAC — stereo or 5.1 — keeps one core far from busy.
     a.extend(s(&["-threads", "1", "-copyts", "-start_at_zero", "-noaccurate_seek"]));
     if let Video::Transcode { device, .. } = &spec.video {
         // Decoded frames stay on the GPU for the scaler and encoder.
@@ -174,10 +195,12 @@ pub fn args(spec: &Spec<'_>, ca_file: Option<&str>) -> Vec<String> {
             a.extend(s(&["-force_key_frames", "source", "-g", "1000"]));
         }
     }
-    match spec.audio_copy {
+    match spec.audio_out {
         // No encoder priming to account for: the packets keep the source's timestamps, as the copied video's do.
-        true => a.extend(s(&["-c:a", "copy"])),
-        false => a.extend(s(&["-c:a", "aac", "-ac", "2", "-b:a", "192k"])),
+        AudioOut::Copy => a.extend(s(&["-c:a", "copy"])),
+        AudioOut::Stereo => a.extend(s(&["-c:a", "aac", "-ac", "2", "-b:a", "192k"])),
+        // 64 kbit/s a channel, as the stereo track has.
+        AudioOut::Surround => a.extend(s(&["-c:a", "aac", "-ac", "6", "-b:a", "384k"])),
     }
     a.extend(s(&["-threads", "1", "-filter_threads", "1"]));
     a.extend(s(&["-max_muxing_queue_size", "1024", "-avoid_negative_ts", "disabled"]));
@@ -393,7 +416,7 @@ mod tests {
             seek: seek_for(13.0),
             video: Video::Copy { tag: Some("hvc1"), dovi: Dovi::Absent },
             audio: 1,
-            audio_copy: false,
+            audio_out: AudioOut::Stereo,
             dir,
         };
         let a = args(&spec, Some(CA_BUNDLE));
@@ -432,7 +455,7 @@ mod tests {
                 tonemap: true,
             },
             audio: 0,
-            audio_copy: false,
+            audio_out: AudioOut::Stereo,
             dir: Path::new("/d"),
         };
         let a = args(&spec, None);
@@ -467,7 +490,7 @@ mod tests {
             seek: None,
             video: Video::Copy { tag: None, dovi: Dovi::Absent },
             audio: 0,
-            audio_copy: false,
+            audio_out: AudioOut::Stereo,
             dir: Path::new("/d"),
         };
         let a = args(&spec, None);
@@ -481,7 +504,7 @@ mod tests {
             seek: None,
             video: Video::Copy { tag: Some("dvh1"), dovi: Dovi::Keep },
             audio: 0,
-            audio_copy: false,
+            audio_out: AudioOut::Stereo,
             dir: Path::new("/d"),
         };
         let joined = args(&spec, None).join(" ");
@@ -496,7 +519,7 @@ mod tests {
             seek: seek_for(13.0),
             video: Video::Copy { tag: Some("hvc1"), dovi: Dovi::Absent },
             audio: 2,
-            audio_copy: true,
+            audio_out: AudioOut::Copy,
             dir: Path::new("/d"),
         };
         let joined = args(&spec, None).join(" ");
@@ -504,6 +527,30 @@ mod tests {
         assert!(!joined.contains("aac") && !joined.contains("-ac 2"), "{joined}");
         let alignment = "-copyts -start_at_zero -noaccurate_seek -ss 13.135000";
         assert!(joined.contains(alignment), "the same alignment: {joined}");
+    }
+
+    #[test]
+    fn surround_for_a_player_that_plays_it_is_aac_5_1() {
+        let spec = Spec {
+            input: "/f.mkv",
+            seek: seek_for(13.0),
+            video: Video::Copy { tag: Some("hvc1"), dovi: Dovi::Absent },
+            audio: 1,
+            audio_out: AudioOut::Surround,
+            dir: Path::new("/d"),
+        };
+        let joined = args(&spec, None).join(" ");
+        assert!(
+            joined.contains("-map 0:a:1 -c:v copy -tag:v hvc1 -c:a aac -ac 6 -b:a 384k -threads 1"),
+            "{joined}"
+        );
+        let alignment = "-copyts -start_at_zero -noaccurate_seek -ss 13.135000";
+        assert!(joined.contains(alignment), "the same alignment: {joined}");
+        assert_eq!(
+            [AudioOut::Copy, AudioOut::Stereo, AudioOut::Surround].map(|o| o.channels(8)),
+            [8, 2, 6],
+            "7.1 copied keeps its eight, converted comes down to two or six"
+        );
     }
 
     #[test]
