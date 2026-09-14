@@ -259,8 +259,9 @@ dependabot cannot bump it, so bump both lines by hand.
   keyframe index (Matroska with no Cues) are skipped.
 - **Audio is AAC stereo**, one track per session.
 - **Text subtitles only**, from den-subtitles; the release's own tracks (PGS, ASS) are not carried.
-- **Dolby Vision profile 5** has no HDR10/SDR base layer: Safari shows it, Chrome cannot, and a transcode
-  gets its colours wrong. It is not excluded yet.
+- **Dolby Vision profile 5** has no HDR10/SDR base layer: Safari shows it, Chrome cannot, and stripped or
+  transcoded its colours come out green and purple. A session skips it: the probe reads the profile, and a
+  release whose file says profile 5 is never chosen.
 - **Bandwidth**: at home this is fine. Away from home every byte crosses the home **upload** link, so a
   remote session is bounded by it — a 4K remux will not fit. A transcode is 8 Mbit/s at most 1080p, but
   nothing asks for one on bandwidth grounds yet.
