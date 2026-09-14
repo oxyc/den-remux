@@ -160,6 +160,8 @@ type OriginBody = http_body_util::combinators::BoxBody<Bytes, Infallible>;
 
 /// Play URLs the fake scout was asked to follow for a release its attributes rule out.
 static NEVER_OPENED: AtomicU32 = AtomicU32::new(0);
+/// Play URLs the fake scout was asked to follow under `/p/counted/`.
+static COUNTED_PLAYS: AtomicU32 = AtomicU32::new(0);
 
 /// The fake scout's scope=availability config segment ("scoped", base64url) and the service key it
 /// asks for.
@@ -240,6 +242,14 @@ async fn origin_handle(
             ]});
             return origin_full(200, body.to_string());
         }
+        if imdb == "tt0000010" {
+            let body = serde_json::json!({"streams": [
+                {"url": format!("http://{addr}/{p}/counted/h264.mkv"),
+                 "attributes": {"cached": true, "codec": "h264", "label": "H.264"},
+                 "behaviorHints": {"filename": "h264.mkv"}}
+            ]});
+            return origin_full(200, body.to_string());
+        }
         if imdb == "tt0000008" {
             // Four releases that won't open, ahead of one that does.
             let release = |url: String, filename: String| {
@@ -277,6 +287,13 @@ async fn origin_handle(
         if rest.starts_with("never/") {
             NEVER_OPENED.fetch_add(1, Relaxed);
         }
+        let rest = match rest.strip_prefix("counted/") {
+            Some(r) => {
+                COUNTED_PLAYS.fetch_add(1, Relaxed);
+                r
+            }
+            None => rest,
+        };
         return Response::builder()
             .status(302)
             .header("location", format!("http://{files}/f/{rest}"))
@@ -787,6 +804,22 @@ async fn ruled_out_releases_stay_unopened_and_the_search_goes_past_three() {
     let r = call(&state, "POST", "/remux/session", None, &with("tt0000008")).await;
     assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
     assert_eq!(r.json()["release"]["filename"], "h264.mkv", "the fifth release");
+    state.end_all("test").await;
+}
+
+/// Another audio track of the release playing — a second session naming it — opens from what den-remux
+/// remembers of the first: scout's play URL is followed once, and the file isn't probed again.
+#[tokio::test]
+async fn reopening_a_release_takes_its_link_and_probe_from_the_first_open() {
+    let origin = origin().await;
+    let state = test_state(&origin, 4, Duration::from_secs(600));
+    let body = |extra: &str| format!(r#"{{"imdb":"tt0000010","scout":"{origin}/cfg"{extra}}}"#);
+    for (extra, track) in [("", 0), (r#","filename":"h264.mkv","audioTrack":1"#, 1)] {
+        let r = call(&state, "POST", "/remux/session", None, &body(extra)).await;
+        assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+        assert_eq!(r.json()["audioTrack"], track);
+    }
+    assert_eq!(COUNTED_PLAYS.load(Relaxed), 1, "the second session followed scout's play URL again");
     state.end_all("test").await;
 }
 

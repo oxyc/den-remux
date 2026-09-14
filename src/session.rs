@@ -145,6 +145,9 @@ pub struct Session {
     /// when the one ffmpeg reads stops working mid-session. Both are secrets.
     play_url: String,
     source: scout::ScoutSource,
+    /// What the release's link and probe are remembered under (`opened_key`), so a link that stops working is
+    /// forgotten there too.
+    opened_key: String,
     inner: Mutex<Inner>,
     wake: Notify,
 }
@@ -423,6 +426,8 @@ impl Session {
             }
             i.reresolved = true;
         }
+        // The next session for this release must not be handed the link that just failed.
+        st.opened().forget(&self.opened_key);
         let play_url = crate::config::local(&self.play_url, &st.cfg.origin_aliases);
         match scout::resolve(&st.scout_http, &play_url, &self.source).await {
             Ok(r) => self.lock().input = r.url,
@@ -693,12 +698,23 @@ fn source_failed() -> Response<Body> {
     )
 }
 
-/// Try one candidate: follow its play URL, read the head, and probe it.
+/// What an opened release is remembered under: the install that listed it, by its hash as a session's owner is,
+/// and the release by its size and name. Not its play URL: scout issues a new ticket with every listing.
+pub(crate) fn opened_key(base: &str, s: &scout::Stream) -> String {
+    format!("{}/{}/{}", crate::auth::install_id(base), s.attributes.size_bytes.unwrap_or(0), s.filename())
+}
+
+/// Try one candidate: follow its play URL, read the head, and probe it — or take all of that from a recent
+/// open of the same release by the same install.
 async fn open(
     st: &AppState,
     src: &scout::ScoutSource,
     s: &scout::Stream,
 ) -> Result<(scout::Resolved, MediaInfo), String> {
+    let key = opened_key(&src.base, s);
+    if let Some(hit) = st.opened().get(&key, Instant::now()) {
+        return Ok(hit);
+    }
     // A ticket on scout's public name (d-play) is fetched at its LAN address, like the install it came from.
     let r =
         scout::resolve(&st.scout_http, &crate::config::local(&s.url, &st.cfg.origin_aliases), src).await?;
@@ -711,6 +727,7 @@ async fn open(
     if info.audio.is_empty() {
         return Err("no audio track".into());
     }
+    st.opened().put(key, &r, &info, Instant::now());
     Ok((r, info))
 }
 
@@ -1193,6 +1210,7 @@ pub async fn create(
         .as_ref()
         .map(|s| s.langs.iter().map(|l| (l.clone(), crate::lang::name(l))).collect())
         .unwrap_or_default();
+    let opened_key = opened_key(&source.base, c);
     let session = Arc::new(Session {
         master: playlist::master(&codecs, peak, avg, Some(resolution), &renditions),
         media: playlist::media(&segments, start_at),
@@ -1207,6 +1225,7 @@ pub async fn create(
         segments,
         play_url: c.url.clone(),
         source,
+        opened_key,
         info,
         audio,
         subs,
@@ -1380,6 +1399,22 @@ mod tests {
         assert_eq!(fit(&a("hevc"), None, false), Fit::Convert, "videoCodecs without HEVC");
         let unknown = scout::Attributes::default();
         assert_eq!(fit(&unknown, Some(&firefox), false), Fit::Copy, "unknown: the probe decides");
+    }
+
+    #[test]
+    fn an_opened_release_is_remembered_per_install_whatever_its_ticket() {
+        let s = scout::Stream {
+            title: "f.mkv".into(),
+            url: "http://scout/p/t1".into(),
+            attributes: scout::Attributes::default(),
+            hints: scout::Hints::default(),
+        };
+        let key = opened_key("http://scout/c2VhbGVk", &s);
+        assert!(!key.contains("c2VhbGVk"), "the install is named by its hash, never its URL: {key}");
+        assert_ne!(key, opened_key("http://scout/b3RoZXI", &s), "another install opens its own");
+        let reticketed = scout::Stream { url: "http://scout/p/t2".into(), ..s.clone() };
+        let again = opened_key("http://scout/c2VhbGVk", &reticketed);
+        assert_eq!(key, again, "a new listing's ticket, the same release");
     }
 
     #[test]

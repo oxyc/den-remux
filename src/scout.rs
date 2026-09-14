@@ -162,6 +162,7 @@ pub fn h264_first(c: &mut [Stream]) {
 /// or a faststart `moov` for a short file; anything larger is fetched by what points at it.
 pub const HEAD_BYTES: u64 = 256 * 1024;
 
+#[derive(Clone)]
 pub struct Resolved {
     /// Where the play URL led — the debrid's link. ffmpeg reads this directly, so a seek does not
     /// go back through scout.

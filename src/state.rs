@@ -6,9 +6,11 @@ use std::net::IpAddr;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::config::Config;
+use crate::probe::MediaInfo;
+use crate::scout::Resolved;
 use crate::session::Session;
 
 pub fn unix_now() -> u64 {
@@ -21,6 +23,53 @@ const TOMBSTONES_MAX: usize = 1024;
 /// Logins and new sessions one visitor may start a minute: far above a person trying titles, far below
 /// what it takes to keep every slot churning or to guess at a browser key.
 pub const STARTS_PER_MINUTE: u32 = 10;
+
+/// Releases remembered as opened. Each is a link, a subtitle-hash's worth of head and a keyframe index: a few
+/// hundred KB at most.
+const OPENED_MAX: usize = 8;
+/// How long an opened release is remembered: well inside a debrid link's life, which is hours. A link that
+/// stops working anyway is fetched again by the session's expired-link refetch, which also forgets it here.
+const OPENED_TTL: Duration = Duration::from_secs(10 * 60);
+
+/// Releases opened lately, so opening one again — another of its audio tracks, or the same title a second
+/// time — neither fetches a fresh debrid link through scout nor probes the file again. Keyed by
+/// `session::opened_key`: the install that listed it, and the release.
+#[derive(Default)]
+pub struct OpenedCache {
+    entries: Vec<Opened>,
+}
+
+struct Opened {
+    key: String,
+    at: Instant,
+    resolved: Resolved,
+    info: MediaInfo,
+}
+
+impl OpenedCache {
+    /// The release opened under `key`, if it was within `OPENED_TTL` of `now`.
+    pub fn get(&mut self, key: &str, now: Instant) -> Option<(Resolved, MediaInfo)> {
+        self.entries.retain(|e| now.duration_since(e.at) < OPENED_TTL);
+        self.entries.iter().find(|e| e.key == key).map(|e| (e.resolved.clone(), e.info.clone()))
+    }
+
+    /// Remember an opened release, the oldest giving way past `OPENED_MAX`. Of the head only what a subtitle's
+    /// hash reads is kept; the probe that needed the rest is done.
+    pub fn put(&mut self, key: String, resolved: &Resolved, info: &MediaInfo, now: Instant) {
+        self.entries.retain(|e| e.key != key && now.duration_since(e.at) < OPENED_TTL);
+        if self.entries.len() >= OPENED_MAX {
+            self.entries.remove(0);
+        }
+        let head = resolved.head[..resolved.head.len().min(crate::subs::HASH_CHUNK as usize)].to_vec();
+        let resolved = Resolved { url: resolved.url.clone(), head, size: resolved.size };
+        self.entries.push(Opened { key, at: now, resolved, info: info.clone() });
+    }
+
+    /// Drop a release whose link stopped working, so the next session fetches a fresh one.
+    pub fn forget(&mut self, key: &str) {
+        self.entries.retain(|e| e.key != key);
+    }
+}
 
 pub struct AppState {
     pub cfg: Config,
@@ -35,6 +84,8 @@ pub struct AppState {
     creating: Mutex<HashMap<String, usize>>,
     /// Starts per visitor in the current minute: `(minute, count)`.
     starts: Mutex<HashMap<IpAddr, (u64, u32)>>,
+    /// Releases opened lately: their debrid links and probes.
+    opened: Mutex<OpenedCache>,
     pub scratch_bytes: AtomicU64,
     pub sessions_started: AtomicU64,
     pub jobs_started: AtomicU64,
@@ -93,6 +144,7 @@ impl AppState {
             tombstones: Mutex::new(HashMap::new()),
             creating: Mutex::new(HashMap::new()),
             starts: Mutex::new(HashMap::new()),
+            opened: Mutex::new(OpenedCache::default()),
             scratch_bytes: AtomicU64::new(0),
             sessions_started: AtomicU64::new(0),
             jobs_started: AtomicU64::new(0),
@@ -112,6 +164,10 @@ impl AppState {
         let max = self.cfg.max_transcodes;
         self.transcodes.fetch_update(Relaxed, Relaxed, |n| (n < max).then_some(n + 1)).ok()?;
         Some(TranscodeSlot(self.transcodes.clone()))
+    }
+
+    pub fn opened(&self) -> MutexGuard<'_, OpenedCache> {
+        self.opened.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     pub fn sessions(&self) -> MutexGuard<'_, HashMap<String, Arc<Session>>> {
@@ -282,4 +338,47 @@ async fn reports_all(ffmpeg: &str, checks: &[(&[&str], &str)]) -> bool {
         }
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn opened(url: &str) -> (Resolved, MediaInfo) {
+        let info = MediaInfo {
+            container: "matroska",
+            duration: 1.0,
+            video: crate::probe::VideoCodec::H264,
+            codecs: None,
+            width: 0,
+            height: 0,
+            hdr: false,
+            dolby_vision: None,
+            audio: Vec::new(),
+            keyframes: vec![0.0],
+        };
+        (Resolved { url: url.into(), head: vec![7; 200_000], size: Some(1) }, info)
+    }
+
+    #[test]
+    fn an_opened_release_is_remembered_briefly_and_boundedly() {
+        let mut cache = OpenedCache::default();
+        let t0 = Instant::now();
+        let (r, info) = opened("https://debrid/a");
+        cache.put("a".into(), &r, &info, t0);
+        let (hit, _) = cache.get("a", t0 + Duration::from_secs(60)).expect("remembered");
+        assert_eq!(hit.url, "https://debrid/a");
+        let hash_part = crate::subs::HASH_CHUNK as usize;
+        assert_eq!(hit.head.len(), hash_part, "only the subtitle hash's part of the head");
+        assert!(cache.get("b", t0).is_none());
+        assert!(cache.get("a", t0 + OPENED_TTL).is_none(), "a link that old is fetched again");
+
+        for i in 0..=OPENED_MAX {
+            cache.put(format!("r{i}"), &r, &info, t0);
+        }
+        assert!(cache.get("r0", t0).is_none(), "the oldest gave way");
+        assert!(cache.get(&format!("r{OPENED_MAX}"), t0).is_some());
+        cache.forget("r1");
+        assert!(cache.get("r1", t0).is_none(), "a dead link is forgotten");
+    }
 }

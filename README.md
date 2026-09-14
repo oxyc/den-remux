@@ -84,7 +84,9 @@ anything else                           404 {"error":"not_found"}
   beyond the player, 10-bit H.264 without `h264High10`) is never opened, and anything they don't say is left to
   the probe. Three are opened at a time and taken in rank order; the first that plays as it is wins, one that
   plays only converted is the last resort, and the search goes on — up to 12 releases, starting none after 30 s,
-  20 s each — while a release that may play as it is remains. A named `filename` (another
+  20 s each — while a release that may play as it is remains. An opened release — its debrid link and probe — is remembered
+  per install for 10 minutes (8 releases at most), so another of its audio tracks, or the title again, starts
+  without scout or a probe; a link that stops working mid-session is fetched again and forgotten. A named `filename` (another
   audio track of the release playing) goes first and is kept, converted if need be.
 
 `/remux/s/…` responses carry `Access-Control-Allow-Origin: *`, allow `Range` and expose
