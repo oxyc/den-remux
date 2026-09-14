@@ -739,8 +739,10 @@ async fn open(
     let info = crate::probe::probe(&Source::Http { client: &st.http, url: &r.url }, &r.head)
         .await
         .map_err(|e| e.to_string())?;
-    if let VideoCodec::Other(c) = &info.video {
-        return Err(format!("video is {c}, which needs a re-encode"));
+    match &info.video {
+        VideoCodec::Other(c) => return Err(format!("video is {c}, which needs a re-encode")),
+        VideoCodec::Av1 => return Err("video is AV1, which needs a re-encode".into()),
+        _ => {}
     }
     if info.audio.is_empty() {
         return Err("no audio track".into());
@@ -852,7 +854,7 @@ impl Playable {
                 };
                 fits(max) && (!info.hdr || self.hdr)
             }
-            VideoCodec::Other(_) => false,
+            VideoCodec::Av1 | VideoCodec::Other(_) => false,
         }
     }
 

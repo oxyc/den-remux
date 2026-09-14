@@ -34,6 +34,7 @@ const COLOUR: u32 = 0x55B0;
 const TRANSFER_CHARACTERISTICS: u32 = 0x55BA;
 const PRIMARIES: u32 = 0x55BB;
 const MATRIX_COEFFICIENTS: u32 = 0x55B1;
+const RANGE: u32 = 0x55B9;
 const AUDIO: u32 = 0xE1;
 const CHANNELS: u32 = 0x9F;
 const BLOCK_ADDITION_MAPPING: u32 = 0x41E4;
@@ -124,6 +125,8 @@ struct Track {
     transfer: u64,
     primaries: u64,
     matrix: u64,
+    /// Matroska's Range: 1 broadcast, 2 full; 0 (and 3, "defined by the matrix and transfer") says neither.
+    range: u64,
     channels: u32,
     dovi: Option<super::DolbyVision>,
 }
@@ -154,6 +157,7 @@ fn parse_tracks(b: &[u8]) -> Vec<Track> {
                         t.transfer = of(TRANSFER_CHARACTERISTICS);
                         t.primaries = of(PRIMARIES);
                         t.matrix = of(MATRIX_COEFFICIENTS);
+                        t.range = of(RANGE);
                     }
                     AUDIO => t.channels = child(v, CHANNELS).map(uint).unwrap_or(1) as u32,
                     BLOCK_ADDITION_MAPPING => {
@@ -172,6 +176,20 @@ fn parse_tracks(b: &[u8]) -> Vec<Track> {
             t
         })
         .collect()
+}
+
+/// What a track's Colour element says.
+fn colour(t: &Track) -> super::Colour {
+    super::Colour {
+        primaries: t.primaries,
+        transfer: t.transfer,
+        matrix: t.matrix,
+        full_range: match t.range {
+            1 => Some(false),
+            2 => Some(true),
+            _ => None,
+        },
+    }
 }
 
 /// CueTimes (in timestamp-scale units) of the cue points that index `track`.
@@ -301,10 +319,16 @@ pub async fn probe(src: &Source<'_>, head: &[u8]) -> Result<MediaInfo, ProbeErro
     if keyframes.is_empty() {
         return Err(ProbeError::Unsupported("the Cues index no video keyframes".into()));
     }
+    let mut hdr = super::is_hdr(video.transfer, video.primaries, video.matrix);
     let (codec, codecs) = if video.codec_id.starts_with("V_MPEG4/ISO/AVC") {
         (VideoCodec::H264, super::avc_codecs(&video.private))
     } else if video.codec_id.starts_with("V_MPEGH/ISO/HEVC") {
         (VideoCodec::Hevc, super::hevc_codecs(&video.private))
+    } else if video.codec_id == "V_AV1" {
+        // V_AV1's CodecPrivate is the `av1C` record itself.
+        let (codecs, av1_hdr) = super::av1_track(&video.private, colour(video));
+        hdr = av1_hdr;
+        (VideoCodec::Av1, codecs)
     } else {
         (VideoCodec::Other(video.codec_id.clone()), None)
     };
@@ -329,7 +353,7 @@ pub async fn probe(src: &Source<'_>, head: &[u8]) -> Result<MediaInfo, ProbeErro
         codecs,
         width: video.width,
         height: video.height,
-        hdr: super::is_hdr(video.transfer, video.primaries, video.matrix),
+        hdr,
         dolby_vision: video.dovi,
         audio,
         keyframes,
@@ -370,5 +394,23 @@ mod tests {
         let tracks = parse_tracks(&track(b"dvvC"));
         assert_eq!(tracks[0].dovi, Some(super::super::DolbyVision { profile: 8, compat: 1, level: 6 }));
         assert_eq!(parse_tracks(&track(b"mvcC"))[0].dovi, None, "another block addition");
+    }
+
+    #[test]
+    fn a_real_av1_sequence_header_names_the_colours_its_colour_element_does() {
+        // av1.mkv is SVT-AV1's HDR10: its Colour element and its sequence header both say PQ and BT.2020.
+        let file = include_bytes!("../../testdata/av1.mkv");
+        let (_, size, hl) = header(file).unwrap();
+        let segment = &file[hl + size.unwrap() as usize..];
+        let (_, _, shl) = header(segment).unwrap();
+        let tracks = children(&segment[shl..]).find(|(id, _)| *id == TRACKS).unwrap().1;
+        let video = parse_tracks(tracks).into_iter().find(|t| t.kind == 1).unwrap();
+        assert_eq!(video.codec_id, "V_AV1");
+        let (from_container, hdr) = super::super::av1_track(&video.private, colour(&video));
+        assert!(hdr);
+        let silent = super::super::Colour::default();
+        let (from_header, header_hdr) = super::super::av1_track(&video.private, silent);
+        assert_eq!(from_header, from_container, "the sequence header alone gives the same string");
+        assert!(header_hdr && from_header.unwrap().ends_with(".10.0.110.09.16.09.0"));
     }
 }

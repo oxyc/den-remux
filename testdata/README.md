@@ -12,6 +12,8 @@ unevenly, and the B-frames are what trigger ffmpeg's seek back-off (see `src/job
 | `hdr10.mkv` | HDR10: Main 10 HEVC, PQ and BT.2020 with mastering metadata — the transfer a conversion tone-maps | 0, 3, 6.5, 9, 12, 15.5, 18, 21, 24.5, 27 | 30.000 |
 | `h264.mp4` | MP4 `stss`/`stts`/`ctts` with an edit list; faststart | 0, 3.5, 6, 9, 11.5, 15, 18, 20.5, 24, 27 | 30.000 |
 | `moov-at-end.mp4` | A `moov` after the `mdat`, found by walking box headers | 0, 2, 5 | 8.0 |
+| `av1.mkv` | AV1: SVT-AV1's 10-bit HDR10 (PQ, BT.2020), `V_AV1` with its `av1C` CodecPrivate, Colour element and sequence header; Opus audio | 0, 2.5, 6, 8.5, 12, 14, 18.5, 21, 24, 27.5 | 30.008 |
+| `av1.mp4` | `av1.mkv`'s video copied into MP4: the `av01` sample entry's `av1C` and `colr` | as `av1.mkv` | 29.999 |
 | `scout-streams.json` | A den-scout stream list: uncached, AV1, XviD/AVI, 3D and cache-unknown releases to skip | — | — |
 
 ## Regenerating
@@ -48,7 +50,22 @@ ffmpeg -y -f lavfi -i testsrc2=size=320x180:rate=24:duration=30 -f lavfi -i sine
 ffmpeg -y -f lavfi -i testsrc2=size=160x90:rate=24:duration=8 -f lavfi -i sine=frequency=440:duration=8:sample_rate=48000 \
   -map 0:v -map 1:a -c:v libx264 -preset veryfast -crf 36 -bf 3 -g 1000 -keyint_min 1000 -sc_threshold 0 \
   -force_key_frames 0,2,5 -pix_fmt yuv420p -c:a aac -b:a 32k -ac 2 moov-at-end.mp4
+
+# AV1 is SVT-AV1 (libsvtav1, 4.1.0 in nixpkgs): what AV1 releases are mostly encoded with, and its forced keyframes
+# are one key packet each — libaom's keyframe filtering adds a second right behind every one. `setparams` tags the
+# frames, which is where the encoder takes HDR10's colours from: with `-color_*` alone a libaom encode's transfer and
+# primaries came out "unknown".
+ffmpeg -y -f lavfi -i testsrc2=size=320x180:rate=24:duration=30 -f lavfi -i sine=frequency=500:duration=30:sample_rate=48000 \
+  -map 0:v -map 1:a -vf setparams=color_primaries=bt2020:color_trc=smpte2084:colorspace=bt2020nc,format=yuv420p10le \
+  -c:v libsvtav1 -preset 10 -crf 60 -g 1000 -force_key_frames 0,2.5,6,8.5,12,14,18.5,21,24,27.5 \
+  -color_primaries bt2020 -color_trc smpte2084 -colorspace bt2020nc \
+  -c:a libopus -b:a 32k -ac 2 -metadata:s:a:0 language=eng av1.mkv
+
+ffmpeg -y -i av1.mkv -map 0:v -c copy -movflags +faststart av1.mp4
 ```
+
+AV1 has no frame reordering, so its keyframes are its key packets as well:
+`ffprobe -v error -select_streams v:0 -show_entries packet=pts_time,flags -of csv=p=0 av1.mkv` lists the same ten.
 
 The expected keyframe lists come from:
 

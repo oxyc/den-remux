@@ -19,6 +19,8 @@ use std::fmt;
 pub enum VideoCodec {
     H264,
     Hevc,
+    /// Copied only, for a player that decodes it: nothing on the box converts AV1.
+    Av1,
     Other(String),
 }
 
@@ -41,8 +43,8 @@ pub struct MediaInfo {
     pub container: &'static str,
     pub duration: f64,
     pub video: VideoCodec,
-    /// The RFC 6381 string for the copied video — `avc1.640028`, `hvc1.2.4.L150.B0` — from the codec
-    /// configuration record. `None` when the file carries none.
+    /// The RFC 6381 string for the copied video — `avc1.640028`, `hvc1.2.4.L150.B0`, `av01.0.08M.08` — from the
+    /// codec configuration record. `None` when the file carries none.
     pub codecs: Option<String>,
     pub width: u32,
     pub height: u32,
@@ -82,6 +84,218 @@ impl fmt::Display for ProbeError {
 /// Rec. 709.
 pub fn is_hdr(transfer: u64, primaries: u64, matrix: u64) -> bool {
     matches!(transfer, 16 | 18) || primaries == 9 || matrix == 9
+}
+
+/// What something says of a stream's colours, as H.273 code points — primaries, transfer, matrix — and whether its
+/// range is full. 0 is "doesn't say", and so is 2, H.273's "unspecified".
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Colour {
+    pub primaries: u64,
+    pub transfer: u64,
+    pub matrix: u64,
+    pub full_range: Option<bool>,
+}
+
+impl Colour {
+    /// What this says, and where it says nothing, what `other` says.
+    fn or(self, other: Colour) -> Colour {
+        let pick = |a: u64, b: u64| if matches!(a, 0 | 2) { b } else { a };
+        Colour {
+            primaries: pick(self.primaries, other.primaries),
+            transfer: pick(self.transfer, other.transfer),
+            matrix: pick(self.matrix, other.matrix),
+            full_range: self.full_range.or(other.full_range),
+        }
+    }
+
+    fn says(&self) -> bool {
+        [self.primaries, self.transfer, self.matrix].iter().any(|c| !matches!(c, 0 | 2))
+    }
+}
+
+/// An AV1 track's codec string and whether it is HDR, from its `av1C` record — Matroska's CodecPrivate for `V_AV1`,
+/// or the MP4 box — and what the container says of its colours. Where the container is silent, the colour
+/// description in the record's sequence header speaks instead: a muxer that writes no Matroska Colour element or MP4
+/// `colr` box still carries that.
+pub fn av1_track(av1c: &[u8], container: Colour) -> (Option<String>, bool) {
+    let colour = container.or(av1c.get(4..).and_then(av1_sequence_colour).unwrap_or_default());
+    (av1_codecs(av1c, colour), is_hdr(colour.transfer, colour.primaries, colour.matrix))
+}
+
+/// `av01.P.LLT.DD` from an `av1C` record, per AV1-ISOBMFF's codecs parameter string: the profile, `seq_level_idx_0`
+/// (two digits), the tier (`M`/`H`) and the bit depth. The optional fields — monochrome, chroma subsampling and
+/// sample position, primaries, transfer, matrix, full range — go all together or not at all, and absent they mean
+/// 4:2:0 BT.709: so they're written whenever the stream says anything of its colours, or isn't 4:2:0 in colour. An
+/// HDR stream's string then names its PQ or HLG, which is how a player knows it from SDR.
+pub fn av1_codecs(av1c: &[u8], colour: Colour) -> Option<String> {
+    // marker (1) and version (1); seq_profile (3) and seq_level_idx_0 (5); seq_tier_0, high_bitdepth, twelve_bit,
+    // monochrome, chroma_subsampling_x, chroma_subsampling_y, chroma_sample_position (2).
+    let b = av1c.get(..4)?;
+    if b[0] != 0x81 {
+        return None;
+    }
+    let (profile, level) = (b[1] >> 5, b[1] & 0x1f);
+    let tier = if b[2] & 0x80 != 0 { 'H' } else { 'M' };
+    let depth = match (b[2] & 0x40 != 0, b[2] & 0x20 != 0) {
+        (false, _) => 8,
+        (true, false) => 10,
+        (true, true) => 12,
+    };
+    let mut s = format!("av01.{profile}.{level:02}{tier}.{depth:02}");
+    let (mono, x, y) = ((b[2] >> 4) & 1, (b[2] >> 3) & 1, (b[2] >> 2) & 1);
+    if colour.says() || mono == 1 || (x, y) != (1, 1) {
+        // The sample position counts only for 4:2:0.
+        let position = if (x, y) == (1, 1) { b[2] & 3 } else { 0 };
+        let code = |c: u64| if c == 0 { 2 } else { c };
+        s.push_str(&format!(
+            ".{mono}.{x}{y}{position}.{:02}.{:02}.{:02}.{}",
+            code(colour.primaries),
+            code(colour.transfer),
+            code(colour.matrix),
+            u8::from(colour.full_range == Some(true))
+        ));
+    }
+    Some(s)
+}
+
+/// Bits of an OBU, most significant first.
+struct Bits<'a> {
+    b: &'a [u8],
+    pos: usize,
+}
+
+impl Bits<'_> {
+    fn read(&mut self, n: u32) -> Option<u64> {
+        let mut v = 0u64;
+        for _ in 0..n {
+            let byte = *self.b.get(self.pos / 8)?;
+            v = v << 1 | ((byte >> (7 - self.pos % 8)) & 1) as u64;
+            self.pos += 1;
+        }
+        Some(v)
+    }
+
+    fn flag(&mut self) -> Option<bool> {
+        self.read(1).map(|v| v == 1)
+    }
+
+    /// AV1's `uvlc()`.
+    fn uvlc(&mut self) -> Option<u64> {
+        let mut zeros = 0;
+        while !self.flag()? {
+            zeros += 1;
+            if zeros >= 32 {
+                return None;
+            }
+        }
+        Some(self.read(zeros)? + (1 << zeros) - 1)
+    }
+}
+
+/// The colours the sequence header among an `av1C` record's configOBUs describes, walked field by field to its
+/// `color_config` (AV1 spec 5.5). `None` without a sequence header, or with one that ends early.
+fn av1_sequence_colour(mut obus: &[u8]) -> Option<Colour> {
+    // An OBU: its header (type in bits 1–4, then an extension flag and a has-size flag), an optional extension
+    // byte, a leb128 size when it has one — else it runs to the end.
+    while let Some(&head) = obus.first() {
+        let mut at = 1 + usize::from(head & 0x04 != 0);
+        let size = match head & 0x02 != 0 {
+            true => {
+                let mut size = 0usize;
+                for i in 0..8 {
+                    let byte = *obus.get(at)?;
+                    at += 1;
+                    size |= ((byte & 0x7f) as usize) << (7 * i);
+                    if byte & 0x80 == 0 {
+                        break;
+                    }
+                }
+                size
+            }
+            false => obus.len().checked_sub(at)?,
+        };
+        let payload = obus.get(at..at.checked_add(size)?)?;
+        if (head >> 3) & 0x0f == 1 {
+            return sequence_colour(payload);
+        }
+        obus = &obus[at + size..];
+    }
+    None
+}
+
+fn sequence_colour(payload: &[u8]) -> Option<Colour> {
+    let mut r = Bits { b: payload, pos: 0 };
+    let profile = r.read(3)?;
+    let _still_picture = r.flag()?;
+    let reduced = r.flag()?;
+    if reduced {
+        r.read(5)?; // seq_level_idx[0]
+    } else {
+        let mut decoder_model = false;
+        let mut buffer_delay_bits = 0;
+        if r.flag()? {
+            // timing_info: num_units_in_display_tick, time_scale, equal_picture_interval.
+            r.read(64)?;
+            if r.flag()? {
+                r.uvlc()?;
+            }
+            decoder_model = r.flag()?;
+            if decoder_model {
+                buffer_delay_bits = r.read(5)? as u32 + 1;
+                r.read(32 + 5 + 5)?;
+            }
+        }
+        let initial_display_delay = r.flag()?;
+        for _ in 0..=r.read(5)? {
+            r.read(12)?; // operating_point_idc
+            if r.read(5)? > 7 {
+                r.read(1)?; // seq_tier
+            }
+            if decoder_model && r.flag()? {
+                r.read(2 * buffer_delay_bits + 1)?;
+            }
+            if initial_display_delay && r.flag()? {
+                r.read(4)?;
+            }
+        }
+    }
+    let width_bits = r.read(4)? as u32 + 1;
+    let height_bits = r.read(4)? as u32 + 1;
+    r.read(width_bits + height_bits)?;
+    if !reduced && r.flag()? {
+        r.read(4 + 3)?; // frame id lengths
+    }
+    r.read(3)?; // use_128x128_superblock, enable_filter_intra, enable_intra_edge_filter
+    if !reduced {
+        r.read(4)?; // interintra, masked compound, warped motion, dual filter
+        let order_hint = r.flag()?;
+        if order_hint {
+            r.read(2)?; // jnt_comp, ref_frame_mvs
+        }
+        let screen_content = if r.flag()? { 2 } else { r.read(1)? };
+        if screen_content > 0 && !r.flag()? {
+            r.read(1)?; // seq_force_integer_mv
+        }
+        if order_hint {
+            r.read(3)?;
+        }
+    }
+    r.read(3)?; // enable_superres, enable_cdef, enable_restoration
+    let high_bitdepth = r.flag()?;
+    if profile == 2 && high_bitdepth {
+        r.read(1)?;
+    }
+    let mono = profile != 1 && r.flag()?;
+    let mut colour = Colour::default();
+    if r.flag()? {
+        colour.primaries = r.read(8)?;
+        colour.transfer = r.read(8)?;
+        colour.matrix = r.read(8)?;
+    }
+    // sRGB (BT.709 primaries, the sRGB transfer, the identity matrix) is full range without saying so.
+    let srgb = !mono && (colour.primaries, colour.transfer, colour.matrix) == (1, 13, 0);
+    colour.full_range = Some(srgb || r.flag()?);
+    Some(colour)
 }
 
 /// A Dolby Vision stream's profile, and what its base layer is without it — written `8.1`, `7.6`, as Dolby does.
@@ -203,7 +417,7 @@ pub fn avc_codecs(avcc: &[u8]) -> Option<String> {
 
 /// The profile, level and tier an RFC 6381 string names: `avc1.640033` is (100, 51, false), level 5.1 as
 /// `level_idc`; `hvc1.2.4.H153.B0` is (2, 153, true), Main 10 at level 5.1 (`general_level_idc`, level × 30) in
-/// HEVC's High tier.
+/// HEVC's High tier; `av01.0.13M.10` is (0, 13, false), Main profile at `seq_level_idx` 13 (level 5.1), Main tier.
 pub fn profile_level(codecs: &str) -> Option<(u8, u16, bool)> {
     let mut parts = codecs.split('.');
     match parts.next()? {
@@ -217,6 +431,12 @@ pub fn profile_level(codecs: &str) -> Option<(u8, u16, bool)> {
             let tier_level = parts.nth(1)?;
             let level = tier_level.get(1..)?.parse().ok()?;
             Some((profile, level, tier_level.starts_with('H')))
+        }
+        "av01" => {
+            let profile = parts.next()?.parse().ok()?;
+            let level_tier = parts.next()?;
+            let level = level_tier.get(..2)?.parse().ok()?;
+            Some((profile, level, level_tier.get(2..)? == "H"))
         }
         _ => None,
     }
@@ -273,6 +493,85 @@ mod tests {
         assert_eq!(profile_level("hev1.A1.60.H120"), Some((1, 120, true)));
         assert_eq!(profile_level("mp4a.40.2"), None);
         assert_eq!(profile_level("hvc1.2"), None);
+        assert_eq!(profile_level("av01.0.13M.10.0.110.09.16.09.0"), Some((0, 13, false)));
+        assert_eq!(profile_level("av01.0.14H.10"), Some((0, 14, true)));
+        assert_eq!(profile_level("av01.0"), None);
+    }
+
+    /// `fields` as (value, width) pairs, packed most significant bit first.
+    fn pack(fields: &[(u64, u32)]) -> Vec<u8> {
+        let mut out: Vec<u8> = Vec::new();
+        let mut n = 0usize;
+        for &(value, width) in fields {
+            for i in (0..width).rev() {
+                if n.is_multiple_of(8) {
+                    out.push(0);
+                }
+                if (value >> i) & 1 == 1 {
+                    *out.last_mut().unwrap() |= 0x80 >> (n % 8);
+                }
+                n += 1;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn an_av1_record_names_profile_level_tier_and_depth() {
+        let none = Colour::default();
+        // Main, level 4.0, 8-bit 4:2:0: nothing to say past the depth.
+        assert_eq!(av1_codecs(&[0x81, 0x08, 0x0C, 0], none).as_deref(), Some("av01.0.08M.08"));
+        assert_eq!(av1_codecs(&[0x01, 0x08, 0x0C, 0], none), None, "no marker bit");
+        assert_eq!(av1_codecs(&[0x81, 0x08], none), None, "truncated");
+        // Professional, level 6.2, High tier, 12-bit 4:2:2: the optional fields, unspecified colours and all.
+        let pro = av1_codecs(&[0x81, (2 << 5) | 14, 0b1110_1000, 0], none);
+        assert_eq!(pro.as_deref(), Some("av01.2.14H.12.0.100.02.02.02.0"));
+        let mono = av1_codecs(&[0x81, 0x04, 0b0001_1100, 0], none);
+        assert_eq!(mono.as_deref(), Some("av01.0.04M.08.1.110.02.02.02.0"));
+        // HDR10: the colours written out, so the string says PQ.
+        let pq = Colour { primaries: 9, transfer: 16, matrix: 9, full_range: Some(false) };
+        let hdr10 = av1_codecs(&[0x81, 13, 0x4C, 0], pq).unwrap();
+        assert_eq!(hdr10, "av01.0.13M.10.0.110.09.16.09.0");
+    }
+
+    #[test]
+    fn an_av1_sequence_header_speaks_for_a_silent_container() {
+        // A full sequence header: timing and decoder model info, two operating points (one past level 3.3, so
+        // with a tier bit), order hints and screen content tools chosen per frame, then HDR10's colour config.
+        #[rustfmt::skip]
+        let header = pack(&[
+            (0, 3), (0, 1), (0, 1),            // Main, not a still, not reduced
+            (1, 1), (1001, 32), (24000, 32), (1, 1), (1, 1), // timing info, equal intervals, uvlc 0
+            (1, 1), (9, 5), (1, 32), (4, 5), (4, 5), // decoder model info: 10-bit buffer delays
+            (1, 1), (1, 5),                    // initial display delays; two operating points
+            (0x101, 12), (13, 5), (0, 1), (1, 1), (5, 10), (7, 10), (0, 1), (1, 1), (9, 4),
+            (0x100, 12), (5, 5), (0, 1), (0, 1),
+            (11, 4), (10, 4), (3839, 12), (2159, 11), // frame size bits and maxima
+            (0, 1), (0b011, 3), (0b1111, 4),   // no frame ids; superblock and intra tools; inter tools
+            (1, 1), (0b11, 2), (1, 1), (1, 1), (6, 3), // order hint, jnt/ref mvs, screen content, integer mv
+            (0b011, 3),                        // superres, cdef, restoration
+            (1, 1), (0, 1), (1, 1), (9, 8), (16, 8), (9, 8), (0, 1), (0, 2), // 10-bit, colours, limited range
+        ]);
+        let obus = |header: &[u8]| [&[0x12, 0x00][..], &[0x0A, header.len() as u8], header].concat();
+        let record = [&[0x81, 13, 0x4C, 0][..], &obus(&header)].concat();
+        assert_eq!(
+            av1_track(&record, Colour::default()),
+            (Some("av01.0.13M.10.0.110.09.16.09.0".into()), true),
+            "after a temporal delimiter, the sequence header's PQ"
+        );
+        let sdr = Colour { primaries: 1, transfer: 1, matrix: 1, full_range: Some(false) };
+        assert_eq!(
+            av1_track(&record, sdr),
+            (Some("av01.0.13M.10.0.110.01.01.01.0".into()), false),
+            "the container says otherwise, and wins"
+        );
+        let cut = [&[0x81, 13, 0x4C, 0][..], &obus(&header[..header.len() - 4])].concat();
+        assert_eq!(
+            av1_track(&cut, Colour::default()),
+            (Some("av01.0.13M.10".into()), false),
+            "a sequence header that ends early says nothing"
+        );
+        assert_eq!(av1_sequence_colour(&[0x0C]), None, "an extension byte that isn't there");
     }
 
     #[test]

@@ -31,6 +31,7 @@ const H264_MKV_KF: [f64; 11] = [0.0, 2.5, 5.0, 8.0, 10.5, 13.0, 16.0, 19.5, 22.0
 const HEVC_MKV_KF: [f64; 10] = [0.0, 3.0, 6.5, 9.0, 12.0, 15.5, 18.0, 21.0, 24.5, 27.0];
 const H264_MP4_KF: [f64; 10] = [0.0, 3.5, 6.0, 9.0, 11.5, 15.0, 18.0, 20.5, 24.0, 27.0];
 const MOOV_END_KF: [f64; 3] = [0.0, 2.0, 5.0];
+const AV1_KF: [f64; 10] = [0.0, 2.5, 6.0, 8.5, 12.0, 14.0, 18.5, 21.0, 24.0, 27.5];
 
 fn assert_keyframes(got: &[f64], want: &[f64]) {
     assert_eq!(got.len(), want.len(), "keyframes: got {got:?}, want {want:?}");
@@ -85,6 +86,23 @@ async fn hevc_matroska_gives_an_hvc1_codec_string() {
     assert!(info.codecs.as_deref().is_some_and(|c| c.starts_with("hvc1.1.6.L")), "{:?}", info.codecs);
     assert_eq!(info.audio[0].codec, "A_EAC3");
     assert!(!info.hdr, "the fixture is SDR");
+}
+
+#[tokio::test]
+async fn av1_matroska_and_mp4_give_the_same_av01_codec_string() {
+    let mkv = probe_with_head(&fixture("av1.mkv"), crate::scout::HEAD_BYTES as usize).await;
+    assert_keyframes(&mkv.keyframes, &AV1_KF);
+    assert_eq!(mkv.video, VideoCodec::Av1);
+    let codecs = mkv.codecs.clone().unwrap();
+    assert!(codecs.starts_with("av01.0.") && codecs.ends_with("M.10.0.110.09.16.09.0"), "HDR10: {codecs}");
+    assert!(mkv.hdr, "the PQ transfer");
+    assert_eq!((mkv.width, mkv.height), (320, 180));
+    assert_eq!(mkv.audio[0].codec, "A_OPUS");
+    let mp4 = probe_with_head(&fixture("av1.mp4"), crate::scout::HEAD_BYTES as usize).await;
+    assert_keyframes(&mp4.keyframes, &AV1_KF);
+    assert_eq!(mp4.video, VideoCodec::Av1);
+    assert_eq!(mp4.codecs, mkv.codecs, "the av01 sample entry's av1C and colr");
+    assert!(mp4.hdr);
 }
 
 #[tokio::test]

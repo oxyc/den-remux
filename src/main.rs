@@ -549,9 +549,10 @@ where
                 // What is playing, which a converted release is not what its name says: the size it came down to,
                 // and whether its colours were tone-mapped to SDR.
                 "video": {
-                    "codec": match s.transcoded || s.info.video == probe::VideoCodec::H264 {
-                        true => "h264",
-                        false => "hevc",
+                    "codec": match (s.transcoded, &s.info.video) {
+                        (false, probe::VideoCodec::Hevc) => "hevc",
+                        (false, probe::VideoCodec::Av1) => "av1",
+                        _ => "h264",
                     },
                     "transcoded": s.transcoded,
                     "width": played(&s).0,
