@@ -146,6 +146,8 @@ pub struct Session {
     pub dovi: job::Dovi,
     /// The HEVC is transcoded to H.264 on the GPU, for a player that cannot take it.
     pub transcoded: bool,
+    /// The size and rate a transcode comes down to: 720p for a player whose link can't carry 1080p.
+    pub preset: job::Preset,
     pub segments: Vec<Segment>,
     pub master: String,
     pub media: String,
@@ -328,12 +330,13 @@ impl Session {
     fn video(&self, st: &AppState) -> job::Video {
         match self.transcoded {
             true => {
-                let (width, height) = transcode_size(self.info.width, self.info.height);
+                let (width, height) = transcode_size(self.info.width, self.info.height, self.preset);
                 job::Video::Transcode {
                     device: st.cfg.vaapi_device.to_string_lossy().into_owned(),
                     width,
                     height,
                     tonemap: tonemaps(&self.info),
+                    preset: self.preset,
                 }
             }
             false => {
@@ -780,6 +783,9 @@ pub struct Want<'a> {
     pub playable: Option<&'a Playable>,
     /// Seconds into the title the player starts at: a resume. 0 from the start.
     pub start_at: f64,
+    /// The bits a second the player's link carries, as it measured them: a remote player's. A copy needing more is
+    /// taken only when nothing fits, after a transcode at the preset the link takes. `None` is a player at home.
+    pub max_bitrate: Option<u64>,
 }
 
 /// What the player decodes, as its own tests found (`playable` in `POST /remux/session`): the highest level it
@@ -1028,15 +1034,25 @@ pub(crate) fn fit(a: &scout::Attributes, playable: Option<&Playable>, takes_hevc
     }
 }
 
-/// A transcode's output size: the source's, fitted inside `TRANSCODE_WIDTH` × `TRANSCODE_HEIGHT` with its
-/// aspect kept (a 2.4:1 4K film becomes 1920 × 800 — 1080 lines of it would be wider than level 4.1
-/// allows), never scaled up, both even. 0 × 0 when the source's is unknown.
-pub(crate) fn transcode_size(w: u32, h: u32) -> (u32, u32) {
+/// A release's average bitrate, from its size and duration; `None` when either isn't known.
+fn average_bitrate(size: Option<u64>, duration: f64) -> Option<u64> {
+    size.filter(|_| duration > 0.0).map(|s| (s as f64 * 8.0 / duration) as u64)
+}
+
+/// Whether a copy of the release needs more than the player's `maxBitrate`. Without one every release fits, and so does
+/// one whose size or duration isn't known: nothing says it doesn't.
+pub(crate) fn over(max_bitrate: Option<u64>, size: Option<u64>, duration: f64) -> bool {
+    max_bitrate.zip(average_bitrate(size, duration)).is_some_and(|(max, average)| average > max)
+}
+
+/// A transcode's output size: the source's, fitted inside the preset's with its aspect kept (a 2.4:1 4K film becomes
+/// 1920 × 800 at 1080p — 1080 lines of it would be wider than level 4.1 allows), never scaled up, both even. 0 × 0
+/// when the source's is unknown.
+pub(crate) fn transcode_size(w: u32, h: u32, preset: job::Preset) -> (u32, u32) {
     if w == 0 || h == 0 {
         return (0, 0);
     }
-    let scale =
-        (job::TRANSCODE_WIDTH as f64 / w as f64).min(job::TRANSCODE_HEIGHT as f64 / h as f64).min(1.0);
+    let scale = (preset.width as f64 / w as f64).min(preset.height as f64 / h as f64).min(1.0);
     let even = |x: u32| ((x as f64 * scale).round() as u32 & !1).max(2);
     (even(w), even(h))
 }
@@ -1209,7 +1225,7 @@ pub async fn create(
     let named_first = usize::from(ranked.first().is_some_and(|(_, c)| want.filename == Some(c.filename())));
     ranked[named_first..].sort_by_key(|(f, _)| *f);
     let mut no_transcode = false;
-    let (mut chosen, fallback) = {
+    let (mut chosen, fallback, mut too_big) = {
         let source = &source;
         let started = Instant::now();
         let mut queue = ranked.into_iter().peekable();
@@ -1218,6 +1234,8 @@ pub async fn create(
         let mut chosen = None;
         // The first release that plays only converted: the last resort, taken once nothing tried plays as it is.
         let mut fallback = None;
+        // Releases that play as they are but need more than the player's `maxBitrate`, in rank order.
+        let mut too_big: Vec<(&scout::Stream, (scout::Resolved, MediaInfo))> = Vec::new();
         loop {
             while opening.len() < PARALLEL_OPENS && tried < MAX_TRIES && started.elapsed() < PICK_BUDGET {
                 // With a converted release in hand, one scout says plays only converted can't do better.
@@ -1264,6 +1282,22 @@ pub async fn create(
                     c.attributes.label,
                     info.codecs.as_deref().unwrap_or("its video")
                 ),
+                // A copy needing more than the player's link carries is kept aside while one that fits is looked for —
+                // unless the player named it, which is then decided on below as the only one.
+                Ok((r, info))
+                    if over(want.max_bitrate, r.size.or(c.attributes.size_bytes), info.duration) =>
+                {
+                    eprintln!(
+                        "session: {imdb} \"{}\" needs more than the player's {} kbit/s",
+                        c.attributes.label,
+                        want.max_bitrate.unwrap_or(0) / 1000
+                    );
+                    let named = want.filename == Some(c.filename());
+                    too_big.push((c, (r, info)));
+                    if named {
+                        break;
+                    }
+                }
                 Ok(found) => {
                     chosen = Some((c, found, None));
                     break;
@@ -1275,12 +1309,28 @@ pub async fn create(
                 ),
             }
         }
-        (chosen, fallback)
+        (chosen, fallback, too_big)
+    };
+    let preset = job::preset_for(want.max_bitrate);
+    let bitrate = |t: &(&scout::Stream, (scout::Resolved, MediaInfo))| {
+        average_bitrate(t.1 .0.size.or(t.0.attributes.size_bytes), t.1 .1.duration)
     };
     if chosen.is_none() {
-        if let Some((c, found)) = fallback {
+        // Nothing plays as it is and fits: a conversion at the preset the link takes — of the first release that plays
+        // only converted, else of the first HEVC copy too big for the link that the preset comes in under.
+        let from_too_big = fallback.is_none();
+        let convert = fallback.or_else(|| {
+            let hevc = |t: &(&scout::Stream, (scout::Resolved, MediaInfo))| {
+                t.1 .1.video == VideoCodec::Hevc && bitrate(t).is_some_and(|b| b > preset.bitrate)
+            };
+            let i = too_big.iter().position(hevc)?;
+            Some(too_big.remove(i))
+        });
+        if let Some((c, found)) = convert {
             match st.reserve_transcode() {
                 Some(slot) => chosen = Some((c, found, Some(slot))),
+                // The GPU is busy: it still plays as it is, below.
+                None if from_too_big => too_big.push((c, found)),
                 None => {
                     no_transcode = true;
                     eprintln!(
@@ -1289,6 +1339,13 @@ pub async fn create(
                     );
                 }
             }
+        }
+    }
+    if chosen.is_none() {
+        // Last, the copy too big for the link that needs the least: a stall now and then beats nothing to play.
+        if let Some(i) = (0..too_big.len()).min_by_key(|&i| bitrate(&too_big[i]).unwrap_or(u64::MAX)) {
+            let (c, found) = too_big.swap_remove(i);
+            chosen = Some((c, found, None));
         }
     }
     let Some((c, (resolved, info), transcode)) = chosen else {
@@ -1356,8 +1413,8 @@ pub async fn create(
     let (codecs, resolution, (peak, avg)) = match transcode {
         Some(_) => (
             job::TRANSCODE_CODECS.to_string(),
-            transcode_size(info.width, info.height),
-            (job::TRANSCODE_PEAK + 192_000, job::TRANSCODE_BITRATE),
+            transcode_size(info.width, info.height, preset),
+            (preset.peak + 192_000, preset.bitrate),
         ),
         None => (codecs, (info.width, info.height), (peak, avg)),
     };
@@ -1432,6 +1489,7 @@ pub async fn create(
         dovi,
         subs,
         transcoded: transcode.is_some(),
+        preset,
         inner: Mutex::new(Inner {
             job: None,
             next_job: 0,
@@ -1456,8 +1514,9 @@ pub async fn create(
         _ => format!(", {dv} stripped to its base layer"),
     });
     let player = want.playable.map_or_else(|| "no capability report".to_string(), |p| p.to_string());
+    let link = want.max_bitrate.map(|b| format!(", link {} kbit/s", b / 1000)).unwrap_or_default();
     eprintln!(
-        "session {}: {imdb} \"{}\" ({}, {:?} {}{}{}, {:.0}s, {} keyframes, {} segments, audio {} {}{}; player: {player})",
+        "session {}: {imdb} \"{}\" ({}, {:?} {}{}{}, {:.0}s, {} keyframes, {} segments, audio {} {}{}; player: {player}{link})",
         session.short(),
         session.release.label,
         session.info.container,
@@ -1465,10 +1524,10 @@ pub async fn create(
         codecs,
         dv.unwrap_or_default(),
         match (session.transcoded, tonemaps(&session.info)) {
-            (true, true) => " → H.264 SDR on the GPU",
-            (true, false) => " → H.264 on the GPU",
-            (false, true) => ", HDR",
-            (false, false) => "",
+            (true, true) => format!(" → {}p H.264 SDR on the GPU", session.preset.height),
+            (true, false) => format!(" → {}p H.264 on the GPU", session.preset.height),
+            (false, true) => ", HDR".to_string(),
+            (false, false) => String::new(),
         },
         session.info.duration,
         session.info.keyframes.len(),
@@ -1765,14 +1824,27 @@ mod tests {
     }
 
     #[test]
-    fn a_transcode_comes_down_to_1080p_with_its_aspect() {
-        assert_eq!(transcode_size(3840, 2160), (1920, 1080));
-        assert_eq!(transcode_size(3840, 1600), (1920, 800), "a wide film is fitted to the width");
-        assert_eq!(transcode_size(4096, 2160), (1920, 1012));
-        assert_eq!(transcode_size(1440, 1080), (1440, 1080));
-        assert_eq!(transcode_size(1280, 720), (1280, 720), "never scaled up");
-        assert_eq!(transcode_size(1920, 803), (1920, 802), "both even");
-        assert_eq!(transcode_size(0, 0), (0, 0));
+    fn a_transcode_comes_down_to_its_preset_with_its_aspect() {
+        let hd = job::HD1080;
+        assert_eq!(transcode_size(3840, 2160, hd), (1920, 1080));
+        assert_eq!(transcode_size(3840, 1600, hd), (1920, 800), "a wide film is fitted to the width");
+        assert_eq!(transcode_size(4096, 2160, hd), (1920, 1012));
+        assert_eq!(transcode_size(1440, 1080, hd), (1440, 1080));
+        assert_eq!(transcode_size(1280, 720, hd), (1280, 720), "never scaled up");
+        assert_eq!(transcode_size(1920, 803, hd), (1920, 802), "both even");
+        assert_eq!(transcode_size(0, 0, hd), (0, 0));
+        assert_eq!(transcode_size(3840, 2160, job::HD720), (1280, 720));
+        assert_eq!(transcode_size(3840, 1600, job::HD720), (1280, 532));
+    }
+
+    #[test]
+    fn a_copy_is_over_the_link_by_its_average_bitrate() {
+        // 3.75 MB over 30 s is 1 Mbit/s.
+        assert!(!over(None, Some(3_750_000), 30.0), "no maxBitrate: every release fits");
+        assert!(!over(Some(1_000_000), Some(3_750_000), 30.0), "at the limit fits");
+        assert!(over(Some(999_999), Some(3_750_000), 30.0));
+        assert!(!over(Some(1), None, 30.0), "an unknown size fits");
+        assert!(!over(Some(1), Some(3_750_000), 0.0), "and so does an unknown duration");
     }
 
     #[test]

@@ -18,7 +18,7 @@ This is the MVP ("phase 2") of oxyc/den#11: movies and episodes, cached releases
 ```
 POST   /remux/login                     {key} → 204 + Set-Cookie + X-Den-Browser-Token; 401 bad_key · 429 rate_limited
 POST   /remux/session                   {imdb, season?, episode?, filename?, scout?, audio?, audioTrack?,
-                                         subtitles?, subtitleLanguages?, videoCodecs?, playable?, startAt?} (a full scout install,
+                                         subtitles?, subtitleLanguages?, videoCodecs?, playable?, startAt?, maxBitrate?} (a full scout install,
                                          or browser cookie/bearer) → 201
                                         {sid, playlist, release:{label,filename,size}, duration, expiresAt,
                                          video:{codec: h264|hevc|av1, transcoded}, audioTrack, audioChannels,
@@ -30,6 +30,8 @@ POST   /remux/session                   {imdb, season?, episode?, filename?, sco
 POST   /remux/releases                  {imdb, season?, episode?, scout?} (a full scout install, or browser cookie/bearer)
                                         → 200 {releases:[{label,filename,size}]}: what a session could play, in the
                                         order it would try them, for a player to name one as `filename`. No URLs
+GET    /remux/speed?bytes=<n>           200 application/octet-stream: n random bytes (2 MiB unnamed, 8 MiB at most),
+                                        no-store, no credential; 400 for a count that isn't one · 429 rate_limited
 GET    /remux/s/<sid>/<sig>/master.m3u8 one variant: CODECS "<avc1…|hvc1…|av01…>,mp4a.40.2", BANDWIDTH from size/duration;
                                         copied Dolby audio: CODECS "…,ec-3|ac-3" and an AUDIO rendition with CHANNELS;
                                         5.1 AAC: an AUDIO rendition with CHANNELS="6";
@@ -99,6 +101,16 @@ anything else                           404 {"error":"not_found"}
   `av1C`; the master names the AV1-ISOBMFF codec string — with its colour fields whenever the stream describes its
   colours, so HDR10 is `av01.0.13M.10.0.110.09.16.09.0` — and `VIDEO-RANGE=PQ` (or `HLG`) for HDR. The colours come
   from Matroska's Colour element or MP4's `colr`, and where those are silent from the sequence header in `av1C`.
+- **A remote player's link.** Away from home every byte crosses the home upload, so a player that reached den-remux
+  off the LAN times its link with `GET /remux/speed` and sends `maxBitrate`, in bits a second (the web app sends 70 %
+  of what it measured). A release that plays as it is but whose average bitrate — its size × 8 over its duration —
+  is above it is kept aside while one that fits is looked for, in rank order as before. With none that fits, a
+  transcode is taken next: of a release that plays only converted, else of an HEVC one that plays as it is, where the
+  preset comes in under it. The preset is 1080p at 8 Mbit/s where `maxBitrate` carries that and 5.1 audio, else 720p
+  at 3 Mbit/s (4.5 max) — two and no more, since a transcode holds the box's one GPU slot for the film, and below 720p
+  a remote player does better with the smallest release as it is. With the GPU busy or nothing to convert, that
+  smallest copy plays: a stall now and then beats nothing. A named `filename` is weighed alone, the same way. Without
+  `maxBitrate` nothing changes. The session's log line names the link.
 - **Resume.** `startAt` is the second the player starts at. The media playlist names it (`EXT-X-START`, so
   Safari's native player starts there), and the first job starts a segment before it rather than at zero, so a
   resume runs ffmpeg once instead of twice. Negative is a 400; at or past the end starts from zero.
@@ -139,8 +151,9 @@ people watching, not titles clicked.
   SSRF guard, without which a request could make this service fetch anything on the LAN.
 - **Shares and limits.** An install plays `MAX_SESSIONS_PER_INSTALL` sessions at once and its oldest gives
   way to a new one, so one household — or one leaked install URL — cannot hold every slot; `MAX_SESSIONS`
-  and `MAX_TRANSCODES` cap the box. Logins and new sessions are limited to 10 a minute per visitor: the
-  address a `TRUSTED_PROXIES` proxy forwarded, else the connection's.
+  and `MAX_TRANSCODES` cap the box. Logins, new sessions and speed tests are limited to 10 a minute per visitor,
+  counted together: the address a `TRUSTED_PROXIES` proxy forwarded, else the connection's. A speed test is up to
+  8 MiB of the home upload, and all it tells anyone is how fast that is.
 - **The key reaches scout and nothing else.** An HTTP client forwards custom headers across a
   cross-origin redirect, which would hand the key to the debrid's CDN on scout's 302. den-remux talks to
   scout with a client that follows no redirect and follows play URLs by hand, sending the key only to
@@ -308,15 +321,17 @@ dependabot cannot bump it, so bump both lines by hand.
   `playable.dolbyVision.p5` says the player shows profile 5 and it takes the release as it is: then it is copied,
   tagged `dvh1`.
 - **Bandwidth**: at home this is fine. Away from home every byte crosses the home **upload** link, so a
-  remote session is bounded by it — a 4K remux will not fit. A transcode is 8 Mbit/s at most 1080p, but
-  nothing asks for one on bandwidth grounds yet.
+  remote session is bounded by it — a 4K remux will not fit. A player that sends `maxBitrate` gets a release that
+  fits, or a 1080p or 720p transcode, or failing both the smallest copy; its measure is taken once, before the
+  session, and nothing adapts to a link that changes mid-film (one variant, no ABR ladder).
 - **One listener.** The public `/remux/s/` listener for Cast/AirPlay (#11 §C) is phase 3.
 
 ### Hardware transcode
 
 For a player without HEVC, or without the HEVC a release needs (`playable`), an HEVC release is decoded, scaled
 and — HDR10, HLG or Dolby Vision — tone-mapped on the box's UHD 630, and encoded to H.264 High 4.1 there (VAAPI,
-the `h264_vaapi` encoder), fitted inside 1920 × 1080 at 8 Mbit/s (12 max). The tone-mapper marks every frame it
+the `h264_vaapi` encoder), fitted inside 1920 × 1080 at 8 Mbit/s (12 max) — or, for a `maxBitrate` below that,
+inside 1280 × 720 at 3 Mbit/s (4.5 max). The tone-mapper marks every frame it
 makes BT.709, which is what the output carries: H.264 tagged BT.2020 and PQ is HDR H.264, which Apple's decoders
 refuse. (Naming those colours on the command line as well breaks the filter graph, so it isn't done.) A UHD Blu-ray remux often leaves Matroska's Colour element
 out, so Dolby Vision counts as HDR too — its base layer is HDR10 or HLG, except profile 8.2's, already SDR. `-force_key_frames source` puts an output

@@ -270,6 +270,18 @@ async fn origin_handle(
             ]});
             return origin_full(200, body.to_string());
         }
+        if imdb == "tt0000014" {
+            // One title in two releases: h264.mkv, ranked first, needs 217 kbit/s; hevc.mkv needs 165.
+            let body = serde_json::json!({"streams": [
+                {"url": format!("http://{addr}/{p}/h264.mkv"),
+                 "attributes": {"cached": true, "codec": "h264", "label": "H.264"},
+                 "behaviorHints": {"filename": "h264.mkv"}},
+                {"url": format!("http://{addr}/{p}/hevc.mkv"),
+                 "attributes": {"cached": true, "codec": "hevc", "label": "HEVC"},
+                 "behaviorHints": {"filename": "hevc.mkv"}}
+            ]});
+            return origin_full(200, body.to_string());
+        }
         if imdb == "tt0000010" {
             let body = serde_json::json!({"streams": [
                 {"url": format!("http://{addr}/{p}/counted/h264.mkv"),
@@ -1330,6 +1342,97 @@ async fn hevc_for_a_player_without_it_takes_the_one_transcode() {
     let r = call(&state, "POST", "/remux/session", Some(&laptop), h264_only).await;
     assert_eq!(r.status, StatusCode::CREATED, "the ended session gave its transcode back: {}", r.text());
     state.end_all("test").await;
+}
+
+/// With `maxBitrate` a release is copied only where its average bitrate fits: h264.mkv (217 kbit/s, ranked first)
+/// gives way to hevc.mkv (165). With nothing that fits, what plays only converted is transcoded at 720p; with the GPU
+/// off, the copy that needs least plays rather than none — as it does when a 720p transcode would need more than the
+/// copy. Without `maxBitrate` nothing changes. Creating a session starts no ffmpeg.
+#[tokio::test]
+async fn a_player_naming_its_link_gets_a_release_that_fits_it() {
+    let origin = origin().await;
+    let state = test_state(&origin, 4, Duration::from_secs(600));
+    let hevc = r#""playable":{"h264":51,"hevcMain":153}"#;
+    let h264 = r#""playable":{"h264":51}"#;
+    let start = |extra: String| {
+        let (state, origin) = (state.clone(), origin.clone());
+        async move {
+            let body = format!(r#"{{"imdb":"tt0000014","scout":"{origin}/cfg",{extra}}}"#);
+            let r = call(&state, "POST", "/remux/session", None, &body).await;
+            assert_eq!(r.status, StatusCode::CREATED, "{body}: {}", r.text());
+            let j = r.json();
+            let master = call(&state, "GET", j["playlist"].as_str().unwrap(), None, "").await.text();
+            state.end_all("test").await;
+            (j, master)
+        }
+    };
+    let cases = [
+        (hevc.to_string(), "h264.mkv"),
+        (format!(r#"{hevc},"maxBitrate":190000"#), "hevc.mkv"),
+        (format!(r#"{hevc},"maxBitrate":100000"#), "hevc.mkv"),
+        (format!(r#"{h264},"maxBitrate":100000"#), "h264.mkv"),
+    ];
+    for (extra, filename) in cases {
+        let (j, _) = start(extra.clone()).await;
+        assert_eq!(j["release"]["filename"], filename, "{extra}");
+        assert_eq!(j["video"]["transcoded"], false, "{extra}");
+    }
+
+    state.transcode_ok.store(true, Relaxed);
+    let (j, master) = start(format!(r#"{h264},"maxBitrate":100000"#)).await;
+    assert_eq!(j["release"]["filename"], "hevc.mkv");
+    assert_eq!(j["video"]["transcoded"], true);
+    assert!(master.contains("BANDWIDTH=4692000,AVERAGE-BANDWIDTH=3000000,"), "the 720p preset: {master}");
+    let (j, master) = start(h264.to_string()).await;
+    assert_eq!(
+        (j["release"]["filename"].as_str(), j["video"]["transcoded"].as_bool()),
+        (Some("h264.mkv"), Some(false))
+    );
+    assert!(!master.contains("BANDWIDTH=4692000"), "{master}");
+
+    let body = format!(r#"{{"imdb":"tt0000014","scout":"{origin}/cfg","maxBitrate":0}}"#);
+    assert_eq!(call(&state, "POST", "/remux/session", None, &body).await.status, StatusCode::BAD_REQUEST);
+}
+
+/// `/remux/speed` sends the bytes asked for — 2 MiB unasked, 8 MiB at most — random and never stored, to anyone, as
+/// `/health` answers anyone; the web app's origin may read it, and a visitor gets a few a minute.
+#[tokio::test]
+async fn the_speed_probe_sends_what_it_is_asked_for_and_no_more() {
+    let state = test_state("http://127.0.0.1:9", 2, Duration::from_secs(600));
+    let r = call(&state, "GET", "/remux/speed?bytes=100000", None, "").await;
+    assert_eq!(r.status, StatusCode::OK);
+    assert_eq!((r.body.len(), &r.headers["content-length"]), (100_000, &"100000".parse().unwrap()));
+    assert_eq!(r.headers["cache-control"], "no-store");
+    let again = call(&state, "GET", "/remux/speed?bytes=100000", None, "").await;
+    assert_ne!(r.body, again.body, "random, so nothing on the way can compress it");
+    assert_eq!(call(&state, "GET", "/remux/speed", None, "").await.body.len(), 2 * 1024 * 1024);
+    assert_eq!(
+        call(&state, "GET", "/remux/speed?bytes=99999999", None, "").await.body.len(),
+        8 * 1024 * 1024
+    );
+    assert_eq!(
+        call(&state, "GET", "/remux/speed?bytes=lots", None, "").await.status,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(call(&state, "POST", "/remux/speed", None, "").await.status, StatusCode::METHOD_NOT_ALLOWED);
+    let head = call(&state, "HEAD", "/remux/speed?bytes=5", None, "").await;
+    assert!(head.body.is_empty() && head.headers["content-length"] == "5");
+
+    let from = |ip: &str| {
+        Request::builder()
+            .uri("/remux/speed?bytes=1")
+            .header("origin", "https://d.example")
+            .extension(crate::Peer(ip.parse().unwrap()))
+            .body(Full::new(Bytes::new()))
+            .unwrap()
+    };
+    let r = crate::handle_request(state.clone(), from("100.64.0.7")).await;
+    assert_eq!(r.headers()["access-control-allow-origin"], "https://d.example");
+    for _ in 1..crate::state::STARTS_PER_MINUTE {
+        assert_eq!(crate::handle_request(state.clone(), from("100.64.0.7")).await.status(), StatusCode::OK);
+    }
+    let limited = crate::handle_request(state.clone(), from("100.64.0.7")).await;
+    assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
 }
 
 /// An install URL on a public name (`ORIGIN_ALIASES`) is fetched at scout's LAN address: the session is

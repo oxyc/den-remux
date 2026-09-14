@@ -59,11 +59,12 @@ pub enum Video {
     /// every source keyframe, so the GOPs, and the playlist cut on them, are the ones a copy would make.
     Transcode {
         device: String,
-        /// The output size, inside `TRANSCODE_WIDTH` × `TRANSCODE_HEIGHT`; 0 × 0 when the source's is
-        /// unknown, which leaves ffmpeg to scale it to 1080 lines.
+        /// The output size, inside the preset's; 0 × 0 when the source's is unknown, which leaves ffmpeg to scale it
+        /// to the preset's lines.
         width: u32,
         height: u32,
         tonemap: bool,
+        preset: Preset,
     },
 }
 
@@ -83,13 +84,37 @@ pub enum Dovi {
 
 /// A transcode's H.264: High, level 4.1 — what every H.264 player takes, up to 1920 × 1080.
 pub const TRANSCODE_CODECS: &str = "avc1.640029";
-pub const TRANSCODE_WIDTH: u32 = 1920;
-pub const TRANSCODE_HEIGHT: u32 = 1080;
-pub const TRANSCODE_BITRATE: u64 = 8_000_000;
-/// The rate cap, as the master playlist's BANDWIDTH counts it and as ffmpeg is told it.
-pub const TRANSCODE_PEAK: u64 = 12_000_000;
-const TRANSCODE_MAXRATE: &str = "12M";
-const TRANSCODE_BUFSIZE: &str = "16M";
+
+/// A transcode's size and rate: the picture fitted inside `width` × `height`, `bitrate` on average, `peak` at most —
+/// as the master playlist's BANDWIDTH counts it and as ffmpeg is told it — over a `buffer` of rate control.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Preset {
+    pub width: u32,
+    pub height: u32,
+    pub bitrate: u64,
+    pub peak: u64,
+    pub buffer: u64,
+}
+
+/// What every transcode was before a player could name its link: 1080p at 8 Mbit/s.
+pub const HD1080: Preset =
+    Preset { width: 1920, height: 1080, bitrate: 8_000_000, peak: 12_000_000, buffer: 16_000_000 };
+/// For a link that can't carry that: 720p at 3 Mbit/s, about what streaming services give 720p.
+pub const HD720: Preset =
+    Preset { width: 1280, height: 720, bitrate: 3_000_000, peak: 4_500_000, buffer: 6_000_000 };
+
+/// The most audio a session adds to its video: AAC 5.1.
+const AUDIO_MAX: u64 = 384_000;
+
+/// The preset for a player's `maxBitrate` (bits a second): 1080p where it carries 1080p with its audio, or nothing is
+/// said, else 720p. Two and no more: a transcode takes the box's one GPU slot for the whole film, and below 720p at
+/// 3 Mbit/s a remote player is better served by the smallest release as it is.
+pub fn preset_for(max_bitrate: Option<u64>) -> Preset {
+    match max_bitrate {
+        Some(max) if max < HD1080.bitrate + AUDIO_MAX => HD720,
+        _ => HD1080,
+    }
+}
 
 /// What happens to the audio track.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -174,9 +199,9 @@ pub fn args(spec: &Spec<'_>, ca_file: Option<&str>) -> Vec<String> {
                 Dovi::Absent => {}
             }
         }
-        Video::Transcode { width, height, tonemap, .. } => {
+        Video::Transcode { width, height, tonemap, preset, .. } => {
             let size = match width {
-                0 => format!("w=-2:h={TRANSCODE_HEIGHT}"),
+                0 => format!("w=-2:h={}", preset.height),
                 w => format!("w={w}:h={height}"),
             };
             let scale = format!("scale_vaapi={size}:format=nv12");
@@ -189,8 +214,8 @@ pub fn args(spec: &Spec<'_>, ca_file: Option<&str>) -> Vec<String> {
             // colours here as well (`-colorspace bt709` and its two) instead breaks the graph — "Error
             // reinitializing filters!", and the encoder never opens.
             a.extend(s(&["-c:v", "h264_vaapi", "-profile:v", "high", "-level:v", "4.1"]));
-            let rate = format!("{}", TRANSCODE_BITRATE);
-            a.extend(s(&["-b:v", &rate, "-maxrate", TRANSCODE_MAXRATE, "-bufsize", TRANSCODE_BUFSIZE]));
+            let [rate, peak, buffer] = [preset.bitrate, preset.peak, preset.buffer].map(|b| b.to_string());
+            a.extend(s(&["-b:v", &rate, "-maxrate", &peak, "-bufsize", &buffer]));
             // Keyframes where the source has them, and no others the encoder would add on its own.
             a.extend(s(&["-force_key_frames", "source", "-g", "1000"]));
         }
@@ -453,6 +478,7 @@ mod tests {
                 width: 1920,
                 height: 800,
                 tonemap: true,
+                preset: HD1080,
             },
             audio: 0,
             audio_out: AudioOut::Stereo,
@@ -463,7 +489,7 @@ mod tests {
         for want in [
             "-hwaccel vaapi -hwaccel_device /dev/dri/renderD128 -hwaccel_output_format vaapi -ss 13.135000 -i /f.mkv",
             "-vf tonemap_vaapi=format=nv12:t=bt709:m=bt709:p=bt709,scale_vaapi=w=1920:h=800:format=nv12",
-            "-c:v h264_vaapi -profile:v high -level:v 4.1 -b:v 8000000 -maxrate 12M",
+            "-c:v h264_vaapi -profile:v high -level:v 4.1 -b:v 8000000 -maxrate 12000000 -bufsize 16000000",
             "-force_key_frames source",
             "-f hls -hls_time 0",
         ] {
@@ -471,15 +497,38 @@ mod tests {
         }
         assert!(!joined.contains("-tag:v") && !joined.contains("-c:v copy"));
         let sdr = Spec {
-            video: Video::Transcode { device: "/d".into(), width: 1280, height: 720, tonemap: false },
+            video: Video::Transcode {
+                device: "/d".into(),
+                width: 1280,
+                height: 720,
+                tonemap: false,
+                preset: HD720,
+            },
             ..spec
         };
-        assert!(args(&sdr, None).join(" ").contains("-vf scale_vaapi=w=1280:h=720:format=nv12 "));
+        let sdr_args = args(&sdr, None).join(" ");
+        assert!(sdr_args.contains("-vf scale_vaapi=w=1280:h=720:format=nv12 "));
+        assert!(sdr_args.contains("-b:v 3000000 -maxrate 4500000 -bufsize 6000000"), "{sdr_args}");
         let unknown = Spec {
-            video: Video::Transcode { device: "/d".into(), width: 0, height: 0, tonemap: false },
+            video: Video::Transcode {
+                device: "/d".into(),
+                width: 0,
+                height: 0,
+                tonemap: false,
+                preset: HD1080,
+            },
             ..sdr
         };
         assert!(args(&unknown, None).join(" ").contains("-vf scale_vaapi=w=-2:h=1080:format=nv12 "));
+    }
+
+    #[test]
+    fn a_link_below_1080p_gets_the_720p_transcode() {
+        assert_eq!(preset_for(None), HD1080, "nothing said: as before");
+        assert_eq!(preset_for(Some(50_000_000)), HD1080);
+        assert_eq!(preset_for(Some(8_384_000)), HD1080, "8 Mbit/s of video and 5.1 AAC");
+        assert_eq!(preset_for(Some(8_383_999)), HD720);
+        assert_eq!(preset_for(Some(2_000_000)), HD720, "nothing smaller: 720p is the floor");
     }
 
     #[test]

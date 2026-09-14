@@ -1,8 +1,9 @@
 //! den-remux — Den's playback for browsers, AirPlay and Cast receivers.
 //!
 //!   POST /remux/login   {key}               → cookie for what needs this service to vouch
-//!   POST /remux/session {imdb, season?, episode?, filename?, scout?} → a signed session: /remux/s/<sid>/<sig>/master.m3u8
+//!   POST /remux/session {imdb, season?, episode?, filename?, scout?, maxBitrate?} → a signed session: /remux/s/<sid>/<sig>/master.m3u8
 //!   POST /remux/releases {imdb, season?, episode?, scout?} → what a session could play: labels and names, no URLs
+//!   GET  /remux/speed?bytes=<n>             → n random bytes (8 MiB at most), for a remote player to time its link
 //!   GET  /remux/s/<sid>/<sig>/…             → HLS (fMP4): master, media, init.mp4, seg<N>.m4s
 //!   POST /remux/s/<sid>/<sig>/report {code, message} → the player couldn't play it, into the log
 //!   DELETE /remux/s/<sid>/<sig>             → end it (410 from then on)
@@ -212,7 +213,7 @@ where
         add_cors(&mut resp);
     } else if matches!(
         parts.uri.path(),
-        "/remux/login" | "/remux/session" | "/remux/releases" | "/remux/health"
+        "/remux/login" | "/remux/session" | "/remux/releases" | "/remux/health" | "/remux/speed"
     ) {
         if let Some(origin) = web_origin(&state, &parts.headers) {
             resp.headers_mut().insert("access-control-allow-origin", origin);
@@ -259,6 +260,38 @@ fn preflight() -> Response<Body> {
         .unwrap()
 }
 
+fn rate_limited(detail: &str) -> Response<Body> {
+    httputil::json(
+        StatusCode::TOO_MANY_REQUESTS,
+        &serde_json::json!({"error": "rate_limited", "detail": detail}),
+        &[("retry-after", "60")],
+    )
+}
+
+/// Most bytes `/remux/speed` sends, and what it sends when no count is named.
+const SPEED_MAX_BYTES: u64 = 8 * 1024 * 1024;
+const SPEED_DEFAULT_BYTES: u64 = 2 * 1024 * 1024;
+
+/// `GET /remux/speed?bytes=<n>`: n random bytes, for a player away from home to time the link it would play over and
+/// ask for a session that fits it (`maxBitrate`). It reveals nothing, so it asks for no more than `/health` does; every
+/// byte crosses the home upload, so it is counted per visitor with logins and new sessions.
+fn speed(parts: &hyper::http::request::Parts) -> Response<Body> {
+    let named = parts.uri.query().unwrap_or("").split('&').find_map(|p| p.strip_prefix("bytes="));
+    let bytes = match named.map(str::parse::<u64>) {
+        None => SPEED_DEFAULT_BYTES,
+        Some(Ok(n)) => n.min(SPEED_MAX_BYTES),
+        Some(Err(_)) => return bad_request("bytes is a count of bytes."),
+    };
+    let body = if parts.method == Method::HEAD { httputil::full("") } else { httputil::random_body(bytes) };
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/octet-stream")
+        .header("content-length", bytes)
+        .header("cache-control", "no-store")
+        .body(body)
+        .unwrap()
+}
+
 fn method_not_allowed(allow: &str) -> Response<Body> {
     httputil::json(
         StatusCode::METHOD_NOT_ALLOWED,
@@ -291,18 +324,18 @@ where
                 .body(httputil::full(body))
                 .unwrap()
         }
-        "/health" | "/remux/health" | "/metrics" => method_not_allowed("GET, HEAD"),
+        "/remux/speed" if get && !state.admit(visitor(state, parts)) => {
+            rate_limited("Too many speed tests, logins or new sessions from here; wait a minute.")
+        }
+        "/remux/speed" if get => speed(parts),
+        "/health" | "/remux/health" | "/metrics" | "/remux/speed" => method_not_allowed("GET, HEAD"),
         "/remux/login" | "/remux/session" | "/remux/releases" if parts.method == Method::OPTIONS => {
             preflight()
         }
         "/remux/login" | "/remux/session" | "/remux/releases"
             if parts.method == Method::POST && !state.admit(visitor(state, parts)) =>
         {
-            httputil::json(
-                StatusCode::TOO_MANY_REQUESTS,
-                &serde_json::json!({"error": "rate_limited", "detail": "Too many logins or new sessions from here; wait a minute."}),
-                &[("retry-after", "60")],
-            )
+            rate_limited("Too many logins or new sessions from here; wait a minute.")
         }
         "/remux/login" if parts.method == Method::POST => login(state, body).await,
         "/remux/session" if parts.method == Method::POST => create_session(state, parts, body).await,
@@ -387,7 +420,7 @@ where
 /// The picture's size as it plays: the release's, or what a conversion brings it down to.
 fn played(s: &session::Session) -> (u32, u32) {
     match s.transcoded {
-        true => session::transcode_size(s.info.width, s.info.height),
+        true => session::transcode_size(s.info.width, s.info.height, s.preset),
         false => (s.info.width, s.info.height),
     }
 }
@@ -492,17 +525,21 @@ where
         video_codecs: Vec<String>,
         playable: Option<session::Playable>,
         start_at: Option<f64>,
+        max_bitrate: Option<u64>,
     }
     let Some(req) = read_body(body).await.and_then(|b| serde_json::from_slice::<Create>(&b).ok()) else {
         return bad_request(
             "Expected {\"imdb\": \"tt…\", \"season\"?: n, \"episode\"?: n, \"filename\"?: \"…\", \"scout\"?: \"…\", \
              \"audio\"?: [\"en\", …], \"audioTrack\"?: n, \"subtitles\"?: \"…\", \"subtitleLanguages\"?: [\"en\", …], \
              \"videoCodecs\"?: [\"h264\", \"hevc\"], \"playable\"?: {\"h264\", \"h264High10\", \"hevcMain\", \"hevcMain10\", \"hevcHighTier\", \"hdr\", \"eac3\", \"aacMultichannel\", \"dolbyVision\": {\"p5\", \"p8\"}, \"av1\", \"av1Main10\", \"av1Hdr\"}, \
-             \"startAt\"?: seconds}.",
+             \"startAt\"?: seconds, \"maxBitrate\"?: bits a second}.",
         );
     };
     if req.start_at.is_some_and(|t| !t.is_finite() || t < 0.0) {
         return bad_request("startAt is seconds into the title, 0 or more.");
+    }
+    if req.max_bitrate == Some(0) {
+        return bad_request("maxBitrate is bits a second, more than 0.");
     }
     // A logged-in browser, or — with no cookie — whoever holds the scout install the request names: that
     // URL is the credential, as every addon's is. Without either there is nothing to play with.
@@ -541,6 +578,7 @@ where
         video_codecs: &req.video_codecs,
         playable: req.playable.as_ref(),
         start_at: req.start_at.unwrap_or(0.0),
+        max_bitrate: req.max_bitrate,
     };
     match session::create(state, admission, &want).await {
         Ok(s) => httputil::json(

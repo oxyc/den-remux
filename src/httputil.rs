@@ -60,6 +60,20 @@ pub fn text(content_type: &str, body: String) -> Response<Body> {
 /// without holding much per response.
 const STREAM_BUF: usize = 64 * 1024;
 
+/// `len` random bytes, made as they go out a buffer at a time: nothing on the way can compress them, so the time they
+/// take to arrive is the link's.
+pub fn random_body(len: u64) -> Body {
+    let stream = futures_util::stream::unfold(len, |left| async move {
+        (left > 0).then(|| {
+            let n = left.min(STREAM_BUF as u64);
+            let mut chunk = vec![0u8; n as usize];
+            getrandom::fill(&mut chunk).expect("the OS random source is unavailable");
+            (Ok(Frame::data(Bytes::from(chunk))), left - n)
+        })
+    });
+    BodyExt::boxed(StreamBody::new(stream))
+}
+
 /// Stream already-opened files back to back, `len` bytes of each from its current position. The
 /// files are opened before the response starts, so deleting them from the scratch window while the
 /// body is still going out cannot cut it short — an open descriptor keeps its inode.
