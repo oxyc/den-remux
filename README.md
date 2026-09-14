@@ -28,7 +28,8 @@ POST   /remux/session                   {imdb, season?, episode?, filename?, sco
 POST   /remux/releases                  {imdb, season?, episode?, scout?} (a full scout install, or browser cookie/bearer)
                                         → 200 {releases:[{label,filename,size}]}: what a session could play, in the
                                         order it would try them, for a player to name one as `filename`. No URLs
-GET    /remux/s/<sid>/<sig>/master.m3u8 one variant: CODECS "<avc1…|hvc1…>,mp4a.40.2", BANDWIDTH from size/duration
+GET    /remux/s/<sid>/<sig>/master.m3u8 one variant: CODECS "<avc1…|hvc1…>,mp4a.40.2", BANDWIDTH from size/duration;
+                                        copied Dolby audio: CODECS "…,ec-3|ac-3" and an AUDIO rendition with CHANNELS
 GET    /remux/s/<sid>/<sig>/media.m3u8  VOD, #EXT-X-MAP init.mp4, segments on real keyframes, #EXT-X-ENDLIST;
                                         #EXT-X-START:TIME-OFFSET=<startAt>,PRECISE=YES for a resume
 GET    /remux/s/<sid>/<sig>/init.mp4
@@ -50,8 +51,11 @@ anything else                           404 {"error":"not_found"}
   uses (`en-US`, `eng`, `fin`). The first language a track is in wins — the default-flagged track among
   several — and a commentary never does (Matroska's FlagCommentary, or "commentary" in the track title).
   No match: the first default track that is not a commentary. `audioTrack` picks one by index from an
-  earlier session's `audioTracks` (send that session's `filename` with it). The track is re-encoded to AAC
-  stereo as before; one per session, so switching language is a new session.
+  earlier session's `audioTracks` (send that session's `filename` with it). One track per session, so
+  switching language is a new session. For a player whose `playable.eac3` says it plays E-AC-3 and AC-3 in
+  fMP4 HLS (Safari, Apple's receivers), such a track is copied as it is, channels and all, and the master names
+  it (`ec-3`/`ac-3`, an AUDIO rendition with `CHANNELS`); every other track, and every other player, gets AAC
+  stereo.
 - **Subtitles.** `subtitles` is den-subtitles' install URL from the library, on `SUBTITLE_ORIGINS`;
   `subtitleLanguages` (up to 4, most wanted first) become WebVTT renditions in the master playlist — what AirPlay
   and Cast receivers show, which a page's own `<track>` never reaches. The first is `DEFAULT=YES`, so it shows
@@ -264,7 +268,8 @@ dependabot cannot bump it, so bump both lines by hand.
 - **Cached releases only** (an uncached one would start a debrid download).
 - **H.264 and HEVC sources only.** AV1, VP9, MPEG-4 Part 2/XviD and VC-1 are skipped. Files without a
   keyframe index (Matroska with no Cues) are skipped.
-- **Audio is AAC stereo**, one track per session.
+- **Audio is AAC stereo**, one track per session — or, for a player that plays them, E-AC-3/AC-3 copied with
+  no stereo alternate beside it (Apple's authoring spec asks for AC-3 beside E-AC-3 for devices without it).
 - **Text subtitles only**, from den-subtitles; the release's own tracks (PGS, ASS) are not carried.
 - **Dolby Vision profile 5** has no HDR10/SDR base layer: Safari shows it, Chrome cannot, and stripped or
   transcoded its colours come out green and purple. A session skips it: the probe reads the profile, and a

@@ -84,6 +84,9 @@ pub struct Spec<'a> {
     pub video: Video,
     /// Which audio track, counting audio tracks only.
     pub audio: usize,
+    /// Copy that track as it is — E-AC-3 or AC-3, for a player that plays them in fMP4 HLS — rather than
+    /// re-encode it to AAC stereo.
+    pub audio_copy: bool,
     pub dir: &'a Path,
 }
 
@@ -157,7 +160,12 @@ pub fn args(spec: &Spec<'_>, ca_file: Option<&str>) -> Vec<String> {
             a.extend(s(&["-force_key_frames", "source", "-g", "1000"]));
         }
     }
-    a.extend(s(&["-c:a", "aac", "-ac", "2", "-b:a", "192k", "-threads", "1", "-filter_threads", "1"]));
+    match spec.audio_copy {
+        // No encoder priming to account for: the packets keep the source's timestamps, as the copied video's do.
+        true => a.extend(s(&["-c:a", "copy"])),
+        false => a.extend(s(&["-c:a", "aac", "-ac", "2", "-b:a", "192k"])),
+    }
+    a.extend(s(&["-threads", "1", "-filter_threads", "1"]));
     a.extend(s(&["-max_muxing_queue_size", "1024", "-avoid_negative_ts", "disabled"]));
     a.extend(s(&["-f", "hls", "-hls_time", "0", "-hls_segment_type", "fmp4"]));
     a.extend(s(&["-hls_segment_options", "movflags=+frag_discont+skip_sidx"]));
@@ -371,6 +379,7 @@ mod tests {
             seek: seek_for(13.0),
             video: Video::Copy { hevc: true, strip_dovi: false },
             audio: 1,
+            audio_copy: false,
             dir,
         };
         let a = args(&spec, Some(CA_BUNDLE));
@@ -409,6 +418,7 @@ mod tests {
                 tonemap: true,
             },
             audio: 0,
+            audio_copy: false,
             dir: Path::new("/d"),
         };
         let a = args(&spec, None);
@@ -443,10 +453,28 @@ mod tests {
             seek: None,
             video: Video::Copy { hevc: false, strip_dovi: false },
             audio: 0,
+            audio_copy: false,
             dir: Path::new("/d"),
         };
         let a = args(&spec, None);
         assert!(!a.iter().any(|x| x == "-ss" || x == "-reconnect" || x == "-tls_verify" || x == "-tag:v"));
+    }
+
+    #[test]
+    fn dolby_audio_for_a_player_that_plays_it_is_copied() {
+        let spec = Spec {
+            input: "/f.mkv",
+            seek: seek_for(13.0),
+            video: Video::Copy { hevc: true, strip_dovi: false },
+            audio: 2,
+            audio_copy: true,
+            dir: Path::new("/d"),
+        };
+        let joined = args(&spec, None).join(" ");
+        assert!(joined.contains("-map 0:a:2 -c:v copy -tag:v hvc1 -c:a copy -threads 1"), "{joined}");
+        assert!(!joined.contains("aac") && !joined.contains("-ac 2"), "{joined}");
+        let alignment = "-copyts -start_at_zero -noaccurate_seek -ss 13.135000";
+        assert!(joined.contains(alignment), "the same alignment: {joined}");
     }
 
     #[test]

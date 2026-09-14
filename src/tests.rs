@@ -1026,6 +1026,32 @@ async fn a_resume_starts_where_the_player_does() {
     state.end_all("test").await;
 }
 
+/// A player that plays Dolby audio in fMP4 HLS gets an E-AC-3 (hevc.mkv) or AC-3 (h264.mkv's first track) track
+/// copied, named in the master with an audio rendition giving its channels. Another track, or a player that
+/// doesn't say so, gets AAC stereo. Creating a session starts no ffmpeg.
+#[tokio::test]
+async fn dolby_audio_is_copied_for_a_player_that_plays_it() {
+    let origin = origin().await;
+    let state = test_state(&origin, 4, Duration::from_secs(600));
+    let cookie = login(&state, "phone-key").await;
+    let apple = r#""playable":{"h264":51,"hevcMain":153,"hevcMain10":153,"eac3":true}"#;
+    let cases = [
+        (format!(r#"{{"imdb":"tt0000002",{apple}}}"#), "ec-3"),
+        (format!(r#"{{"imdb":"tt0000001",{apple}}}"#), "ac-3"),
+        (format!(r#"{{"imdb":"tt0000001","audioTrack":1,{apple}}}"#), "mp4a.40.2"),
+        (r#"{"imdb":"tt0000002","playable":{"hevcMain":153}}"#.to_string(), "mp4a.40.2"),
+    ];
+    for (body, audio) in cases {
+        let r = call(&state, "POST", "/remux/session", Some(&cookie), &body).await;
+        assert_eq!(r.status, StatusCode::CREATED, "{body}: {}", r.text());
+        let master = call(&state, "GET", r.json()["playlist"].as_str().unwrap(), None, "").await.text();
+        assert!(master.contains(&format!(",{audio}\"")), "{body}: {master}");
+        let named = master.contains("TYPE=AUDIO") && master.contains("CHANNELS=\"2\"");
+        assert_eq!(named, audio != "mp4a.40.2", "{body}: {master}");
+    }
+    state.end_all("test").await;
+}
+
 /// Subtitle renditions: named in the master, one WebVTT segment each, fetched from den-subtitles with the
 /// release's hash; a language whose subtitle is on another origin serves an empty document, and an install
 /// off `SUBTITLE_ORIGINS` is refused up front.

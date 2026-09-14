@@ -57,11 +57,23 @@ pub fn media(segs: &[Segment], start: f64) -> String {
     out
 }
 
-/// The master playlist: one variant, the copied video plus AAC-LC stereo, and a WebVTT rendition per
+/// The audio in the variant's segments.
+pub enum Audio<'a> {
+    /// The track re-encoded to AAC-LC stereo.
+    Aac,
+    /// A Dolby track copied as it is: `ec-3` or `ac-3`, with its channel count and language.
+    Copy { codec: &'static str, channels: u32, language: Option<&'a str> },
+}
+
+/// The master playlist: one variant — the copied video plus its audio — and a WebVTT rendition per
 /// `(language, name)` in `subs`, most wanted first. The first is the default, so a player shows it without being
 /// asked; the rest are there to choose.
+///
+/// Copied audio is also named by an AUDIO rendition with no URI — its media is in the variant's own segments — so
+/// the player learns its CHANNELS, which CODECS does not carry.
 pub fn master(
     video_codecs: &str,
+    audio: &Audio<'_>,
     bandwidth: u64,
     average: u64,
     resolution: Option<(u32, u32)>,
@@ -69,6 +81,20 @@ pub fn master(
 ) -> String {
     let res = resolution.filter(|(w, h)| *w > 0 && *h > 0).map(|(w, h)| format!(",RESOLUTION={w}x{h}"));
     let mut out = String::from("#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-INDEPENDENT-SEGMENTS\n");
+    let audio_codec = match audio {
+        Audio::Aac => "mp4a.40.2",
+        Audio::Copy { codec, channels, language } => {
+            let (name, lang) = match language {
+                Some(l) => (crate::lang::name(l), format!(",LANGUAGE=\"{l}\"")),
+                None => ("Audio".to_string(), String::new()),
+            };
+            out.push_str(&format!(
+                "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"audio\",NAME=\"{name}\"{lang},DEFAULT=YES,AUTOSELECT=YES,\
+                 CHANNELS=\"{channels}\"\n"
+            ));
+            codec
+        }
+    };
     for (i, (lang, name)) in subs.iter().enumerate() {
         let default = if i == 0 { "YES" } else { "NO" };
         out.push_str(&format!(
@@ -77,9 +103,10 @@ pub fn master(
         ));
     }
     out.push_str(&format!(
-        "#EXT-X-STREAM-INF:BANDWIDTH={bandwidth},AVERAGE-BANDWIDTH={average},CODECS=\"{video_codecs},mp4a.40.2\"{}{}\n\
+        "#EXT-X-STREAM-INF:BANDWIDTH={bandwidth},AVERAGE-BANDWIDTH={average},CODECS=\"{video_codecs},{audio_codec}\"{}{}{}\n\
          media.m3u8\n",
         res.unwrap_or_default(),
+        if matches!(audio, Audio::Aac) { "" } else { ",AUDIO=\"audio\"" },
         if subs.is_empty() { "" } else { ",SUBTITLES=\"subs\"" }
     ));
     out
@@ -173,19 +200,36 @@ mod tests {
         let (peak, avg) = bandwidth(Some(3_750_000), 30.0);
         assert_eq!(avg, 1_000_000);
         assert!(peak > avg);
-        let m = master("hvc1.1.6.L93.B0", peak, avg, Some((320, 180)), &[]);
+        let m = master("hvc1.1.6.L93.B0", &Audio::Aac, peak, avg, Some((320, 180)), &[]);
         assert!(m.contains("CODECS=\"hvc1.1.6.L93.B0,mp4a.40.2\""), "{m}");
         assert!(m.contains("RESOLUTION=320x180"));
         assert!(m.contains(&format!("BANDWIDTH={peak},AVERAGE-BANDWIDTH={avg}")));
         assert!(m.ends_with("media.m3u8\n"));
-        assert!(!m.contains("SUBTITLES"));
-        assert!(!master("avc1.64001e", 1, 1, None, &[]).contains("RESOLUTION"));
+        assert!(!m.contains("SUBTITLES") && !m.contains("TYPE=AUDIO") && !m.contains("AUDIO=\""));
+        assert!(!master("avc1.64001e", &Audio::Aac, 1, 1, None, &[]).contains("RESOLUTION"));
+    }
+
+    #[test]
+    fn copied_dolby_audio_is_named_with_its_channels() {
+        let eac3 = Audio::Copy { codec: "ec-3", channels: 6, language: Some("eng") };
+        let m = master("hvc1.2.4.L150.B0", &eac3, 1, 1, None, &[]);
+        assert!(
+            m.contains(
+                "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"audio\",NAME=\"English\",LANGUAGE=\"eng\",DEFAULT=YES,AUTOSELECT=YES,CHANNELS=\"6\"\n"
+            ),
+            "{m}"
+        );
+        assert!(m.contains("CODECS=\"hvc1.2.4.L150.B0,ec-3\",AUDIO=\"audio\"\nmedia.m3u8"), "{m}");
+        assert!(!m.contains("URI="), "the audio is in the variant's own segments: {m}");
+        let ac3 = Audio::Copy { codec: "ac-3", channels: 2, language: None };
+        let m = master("avc1.640028", &ac3, 1, 1, None, &[]);
+        assert!(m.contains("NAME=\"Audio\",DEFAULT=YES") && m.contains(",ac-3\""), "{m}");
     }
 
     #[test]
     fn subtitles_are_renditions_of_one_group() {
         let subs = [("en".to_string(), "English".to_string()), ("fi".to_string(), "Finnish".to_string())];
-        let m = master("avc1.640028", 1, 1, None, &subs);
+        let m = master("avc1.640028", &Audio::Aac, 1, 1, None, &subs);
         assert!(m.contains("TYPE=SUBTITLES,GROUP-ID=\"subs\",NAME=\"Finnish\",LANGUAGE=\"fi\""), "{m}");
         assert!(m.contains("URI=\"sub1.m3u8\""));
         assert!(m.contains("LANGUAGE=\"en\",DEFAULT=YES,AUTOSELECT=YES"), "the most wanted shows: {m}");

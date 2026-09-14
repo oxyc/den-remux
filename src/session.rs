@@ -134,6 +134,8 @@ pub struct Session {
     pub info: MediaInfo,
     /// The audio track played, counting audio tracks only.
     pub audio: usize,
+    /// The track is copied as it is, as this codec (`ec-3`, `ac-3`); `None` re-encodes it to AAC stereo.
+    pub audio_copy: Option<&'static str>,
     /// Subtitle renditions, when the browser asked for any.
     pub subs: Option<crate::subs::Subs>,
     /// The HEVC is transcoded to H.264 on the GPU, for a player that cannot take it.
@@ -359,7 +361,14 @@ impl Session {
         i.next_job += 1;
         let dir = self.dir.join(format!("j{id}"));
         let input = i.input.clone();
-        let spec = Spec { input: &input, seek, video: self.video(st), audio: self.audio, dir: &dir };
+        let spec = Spec {
+            input: &input,
+            seek,
+            video: self.video(st),
+            audio: self.audio,
+            audio_copy: self.audio_copy.is_some(),
+            dir: &dir,
+        };
         match Job::spawn(&st.cfg.ffmpeg, id, start, &spec) {
             Ok(new) => {
                 if let Some(old) = i.job.replace(new) {
@@ -777,11 +786,18 @@ pub struct Playable {
     /// reports 0 there; a player that doesn't send it gets it converted.
     pub hevc_high_tier: u16,
     pub hdr: bool,
+    /// Plays E-AC-3 and AC-3 in fMP4 HLS — Safari and Apple's receivers: such a track is copied, not converted.
+    pub eac3: bool,
 }
 
 impl std::fmt::Display for Playable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let hdr = if self.hdr { ", HDR" } else { "" };
+        let hdr = match (self.hdr, self.eac3) {
+            (true, true) => ", HDR, E-AC-3",
+            (true, false) => ", HDR",
+            (false, true) => ", E-AC-3",
+            (false, false) => "",
+        };
         let (h264, high10) = (self.h264, self.h264_high10);
         let (main, main10, high) = (self.hevc_main, self.hevc_main10, self.hevc_high_tier);
         write!(f, "H.264 L{h264}, High 10 L{high10}, HEVC L{main}, 10-bit L{main10}, High tier L{high}{hdr}")
@@ -815,6 +831,16 @@ impl Playable {
 
     fn takes_hevc(&self) -> bool {
         self.hevc_main > 0 || self.hevc_main10 > 0
+    }
+}
+
+/// The HLS codec a Dolby track is copied as, from the container's name for it — Matroska's `A_EAC3`/`A_AC3`
+/// (and its `A_AC3/BSID…` variants), MP4's `ec-3`/`ac-3` — or `None` for anything else.
+pub(crate) fn dolby_codec(container_codec: &str) -> Option<&'static str> {
+    match container_codec {
+        "A_EAC3" | "ec-3" => Some("ec-3"),
+        c if c.starts_with("A_AC3") || c == "ac-3" => Some("ac-3"),
+        _ => None,
     }
 }
 
@@ -1163,6 +1189,8 @@ pub async fn create(
         }
         None => crate::lang::pick_audio(&info.audio, want.audio),
     };
+    // E-AC-3 or AC-3 plays as it is where the player says so; everything else is AAC stereo.
+    let audio_copy = dolby_codec(&info.audio[audio].codec).filter(|_| want.playable.is_some_and(|p| p.eac3));
 
     let sid = crate::auth::random_id();
     let exp = unix_now() + (info.duration.ceil() as u64 + SESSION_GRACE_SECS).min(SESSION_MAX_SECS);
@@ -1212,7 +1240,21 @@ pub async fn create(
         .unwrap_or_default();
     let opened_key = opened_key(&source.base, c);
     let session = Arc::new(Session {
-        master: playlist::master(&codecs, peak, avg, Some(resolution), &renditions),
+        master: playlist::master(
+            &codecs,
+            &match audio_copy {
+                Some(codec) => playlist::Audio::Copy {
+                    codec,
+                    channels: info.audio[audio].channels,
+                    language: info.audio[audio].language.as_deref(),
+                },
+                None => playlist::Audio::Aac,
+            },
+            peak,
+            avg,
+            Some(resolution),
+            &renditions,
+        ),
         media: playlist::media(&segments, start_at),
         sid: sid.clone(),
         sig,
@@ -1228,6 +1270,7 @@ pub async fn create(
         opened_key,
         info,
         audio,
+        audio_copy,
         subs,
         transcoded: transcode.is_some(),
         inner: Mutex::new(Inner {
@@ -1252,7 +1295,7 @@ pub async fn create(
     let dv = session.info.dolby_vision.map(|dv| format!(", {dv} stripped to its base layer"));
     let player = want.playable.map_or_else(|| "no capability report".to_string(), |p| p.to_string());
     eprintln!(
-        "session {}: {imdb} \"{}\" ({}, {:?} {}{}{}, {:.0}s, {} keyframes, {} segments, audio {} {}; player: {player})",
+        "session {}: {imdb} \"{}\" ({}, {:?} {}{}{}, {:.0}s, {} keyframes, {} segments, audio {} {}{}; player: {player})",
         session.short(),
         session.release.label,
         session.info.container,
@@ -1270,6 +1313,7 @@ pub async fn create(
         session.segments.len(),
         session.audio,
         session.info.audio[session.audio].language.as_deref().unwrap_or("und"),
+        session.audio_copy.map(|c| format!(" copied as {c}")).unwrap_or_default(),
     );
     tokio::spawn(supervise(st.clone(), session.clone()));
     Ok(session)
@@ -1370,6 +1414,18 @@ mod tests {
         assert!(firefox.takes(&info(VideoCodec::H264, "avc1.640029", false)));
         assert!(!firefox.takes(&hobbit) && !firefox.takes_hevc());
         assert!(!Playable { h264: 0x29, ..firefox }.takes(&info(VideoCodec::H264, "avc1.640033", false)));
+    }
+
+    #[test]
+    fn only_dolby_tracks_are_copied() {
+        assert_eq!(dolby_codec("A_EAC3"), Some("ec-3"));
+        assert_eq!(dolby_codec("ec-3"), Some("ec-3"));
+        assert_eq!(dolby_codec("A_AC3"), Some("ac-3"));
+        assert_eq!(dolby_codec("A_AC3/BSID9"), Some("ac-3"));
+        assert_eq!(dolby_codec("ac-3"), Some("ac-3"));
+        for other in ["A_TRUEHD", "A_DTS", "A_AAC", "mp4a", "A_OPUS"] {
+            assert_eq!(dolby_codec(other), None, "{other}");
+        }
     }
 
     #[test]
