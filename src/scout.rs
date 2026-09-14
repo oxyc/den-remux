@@ -37,6 +37,23 @@ pub struct Attributes {
     pub label: String,
     #[serde(default, rename = "threeD")]
     pub three_d: bool,
+    /// `2160p`, `1080p`, … as the release name gives it.
+    pub resolution: Option<String>,
+    /// HDR by the name or the file; Dolby Vision counts.
+    #[serde(default)]
+    pub hdr: bool,
+    #[serde(default, rename = "dolbyVision")]
+    pub dolby_vision: bool,
+    /// 8 or 10, 0 when nobody read it. The name supplies 10 for "10bit"/"Hi10P" and for any HDR or Dolby Vision
+    /// release; scout's probe replaces that with what the codec's configuration record says.
+    #[serde(default, rename = "bitDepth")]
+    pub bit_depth: u32,
+    /// The Dolby Vision profile scout's probe read from the file (5, 7, 8); 0 when unknown, never "none".
+    #[serde(default, rename = "dvProfile")]
+    pub dv_profile: u32,
+    /// Scout read the file itself, so the codec, depth and profile above are the file's, not the name's.
+    #[serde(default)]
+    pub probed: bool,
 }
 
 #[derive(Deserialize, Clone, Debug, Default)]
@@ -126,7 +143,8 @@ pub fn phone_first(c: &mut [Stream]) {
             _ if has(&["1080p"]) => 0,
             _ => 1,
         };
-        (resolution, has(&["remux"]), has(&["dolby vision", "dovi", ".dv.", " dv "]))
+        let dolby_vision = s.attributes.dolby_vision || has(&["dolby vision", "dovi", ".dv.", " dv "]);
+        (resolution, has(&["remux"]), dolby_vision)
     });
 }
 

@@ -158,6 +158,9 @@ async fn origin() -> String {
 
 type OriginBody = http_body_util::combinators::BoxBody<Bytes, Infallible>;
 
+/// Play URLs the fake scout was asked to follow for a release its attributes rule out.
+static NEVER_OPENED: AtomicU32 = AtomicU32::new(0);
+
 /// The fake scout's scope=availability config segment ("scoped", base64url) and the service key it
 /// asks for.
 const SCOPED: &str = "c2NvcGVk";
@@ -224,6 +227,30 @@ async fn origin_handle(
                 .to_string(),
             );
         }
+        if imdb == "tt0000006" {
+            // Scout's probe read Dolby Vision profile 5 off the first release: it must not be opened.
+            let body = serde_json::json!({"streams": [
+                {"url": format!("http://{addr}/{p}/never/hevc.mkv"),
+                 "attributes": {"cached": true, "codec": "hevc", "dvProfile": 5, "dolbyVision": true, "probed": true,
+                                "label": "DV5"},
+                 "behaviorHints": {"filename": "dv5.mkv"}},
+                {"url": format!("http://{addr}/{p}/h264.mkv"),
+                 "attributes": {"cached": true, "codec": "h264", "label": "H.264"},
+                 "behaviorHints": {"filename": "h264.mkv"}}
+            ]});
+            return origin_full(200, body.to_string());
+        }
+        if imdb == "tt0000008" {
+            // Four releases that won't open, ahead of one that does.
+            let release = |url: String, filename: String| {
+                serde_json::json!({"url": url, "attributes": {"cached": true, "codec": "h264", "label": "x"},
+                                   "behaviorHints": {"filename": filename}})
+            };
+            let gone = |i| release(format!("http://{addr}/{p}/missing{i}.mkv"), format!("gone{i}.mkv"));
+            let mut streams: Vec<_> = (0..4).map(gone).collect();
+            streams.push(release(format!("http://{addr}/{p}/h264.mkv"), "h264.mkv".into()));
+            return origin_full(200, serde_json::json!({ "streams": streams }).to_string());
+        }
         let file = match imdb {
             "tt0000001" => "h264.mkv",
             "tt0000002" => "hevc.mkv",
@@ -247,6 +274,9 @@ async fn origin_handle(
             Some(r) => r,
             None => rest,
         };
+        if rest.starts_with("never/") {
+            NEVER_OPENED.fetch_add(1, Relaxed);
+        }
         return Response::builder()
             .status(302)
             .header("location", format!("http://{files}/f/{rest}"))
@@ -739,6 +769,24 @@ async fn concurrent_starts_count_against_the_install_and_browser_shares() {
         call(&state, "POST", "/remux/session", Some(&cookie), &body).await.status,
         StatusCode::CREATED
     );
+    state.end_all("test").await;
+}
+
+/// A release scout's attributes rule out (here Dolby Vision profile 5, which has no picture without it) is never
+/// opened, and a title is tried past the first three releases that won't open. No ffmpeg needed.
+#[tokio::test]
+async fn ruled_out_releases_stay_unopened_and_the_search_goes_past_three() {
+    let origin = origin().await;
+    let state = test_state(&origin, 2, Duration::from_secs(600));
+    let with = |imdb: &str| format!(r#"{{"imdb":"{imdb}","scout":"{origin}/cfg"}}"#);
+    let r = call(&state, "POST", "/remux/session", None, &with("tt0000006")).await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    assert_eq!(r.json()["release"]["filename"], "h264.mkv");
+    assert_eq!(NEVER_OPENED.load(Relaxed), 0, "the profile 5 release was opened");
+    state.end_all("test").await;
+    let r = call(&state, "POST", "/remux/session", None, &with("tt0000008")).await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    assert_eq!(r.json()["release"]["filename"], "h264.mkv", "the fifth release");
     state.end_all("test").await;
 }
 

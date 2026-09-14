@@ -78,8 +78,13 @@ anything else                           404 {"error":"not_found"}
   resume runs ffmpeg once instead of twice. Negative is a 400; at or past the end starts from zero.
 - **Which release.** Scout ranks for a TV, best first; here it is re-ranked for a phone or a laptop, often over
   the tailnet: 1080p before 720p or unnamed before 4K, and within each a web release before a remux and one
-  without Dolby Vision before one with (scout's order holds within each). Of the first three that probe, the
-  first that plays as it is wins; one that plays only converted is the last resort. A named `filename` (another
+  without Dolby Vision before one with (scout's order holds within each). Before any is opened, scout's
+  attributes (`codec`, `resolution`, `hdr`, `bitDepth`, `dvProfile`, `probed`) sort them for this player: those
+  that play as they are, then those that play only converted; one they rule out (Dolby Vision profile 5, H.264
+  beyond the player, 10-bit H.264 without `h264High10`) is never opened, and anything they don't say is left to
+  the probe. Three are opened at a time and taken in rank order; the first that plays as it is wins, one that
+  plays only converted is the last resort, and the search goes on — up to 12 releases, starting none after 30 s,
+  20 s each — while a release that may play as it is remains. A named `filename` (another
   audio track of the release playing) goes first and is kept, converted if need be.
 
 `/remux/s/…` responses carry `Access-Control-Allow-Origin: *`, allow `Range` and expose

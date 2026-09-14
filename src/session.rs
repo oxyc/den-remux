@@ -14,6 +14,7 @@ use std::sync::atomic::Ordering::Relaxed;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+use futures_util::stream::{FuturesOrdered, StreamExt};
 use hyper::{Response, StatusCode};
 use tokio::sync::Notify;
 
@@ -44,8 +45,17 @@ const SNAP: f64 = 0.05;
 const START_SLACK: f64 = 1.0;
 /// ffmpeg runs in a row that produced nothing before the session gives up on its source.
 const MAX_FAILURES: u32 = 3;
-/// How many releases to resolve and probe before giving up on a title.
-const MAX_TRIES: usize = 3;
+/// How many releases to resolve and probe before giving up on a title. Past the first few, each is one debrid
+/// link and a handful of ranged reads, so a title whose top releases won't open still finds one further down.
+const MAX_TRIES: usize = 12;
+/// Releases opened at once while picking. The pick still goes by rank: one that answers sooner waits for those
+/// ranked above it.
+const PARALLEL_OPENS: usize = 3;
+/// No new release is opened once picking has taken this long — about where a person gives up on a play
+/// button; those already opening finish.
+const PICK_BUDGET: Duration = Duration::from_secs(30);
+/// One release's resolve and probe. A debrid slower than this to hand over the head of a file plays badly anyway.
+const OPEN_TIMEOUT: Duration = Duration::from_secs(20);
 /// A session lives for the film plus this, and never longer than `SESSION_MAX_SECS`.
 const SESSION_GRACE_SECS: u64 = 60 * 60;
 const SESSION_MAX_SECS: u64 = 6 * 60 * 60;
@@ -807,6 +817,53 @@ fn plays(want: &Want<'_>, takes_hevc: bool, info: &crate::probe::MediaInfo) -> b
     }
 }
 
+/// How a release will play for this player, by what scout says of it before anything is opened.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Fit {
+    /// As it is — or nothing says otherwise, and the probe decides.
+    Copy,
+    /// Only converted on the GPU.
+    Convert,
+    /// Not at all, so it isn't opened.
+    Never,
+}
+
+/// A release's `Fit` from scout's attributes, only where they say so. The probe still has the last word on
+/// whatever is tried; this decides the order, and which not to try.
+pub(crate) fn fit(a: &scout::Attributes, playable: Option<&Playable>, takes_hevc: bool) -> Fit {
+    // Dolby Vision profile 5 has no base layer: stripped or converted, its picture is green and purple. Only
+    // scout's probe reads the profile, so it is the file's.
+    if a.dv_profile == 5 {
+        return Fit::Never;
+    }
+    let uhd =
+        a.resolution.as_deref().is_some_and(|r| matches!(r.to_ascii_lowercase().as_str(), "2160p" | "4k"));
+    let ten_bit = a.bit_depth >= 10;
+    match (a.codec.as_deref().map(str::to_ascii_lowercase).as_deref(), playable) {
+        (Some("h264"), Some(p)) => {
+            // A 10 the name inferred from "HDR" is no evidence of High 10: H.264 releases are not HDR.
+            let max = if ten_bit && (a.probed || !a.hdr) { p.h264_high10 } else { p.h264 };
+            // Nothing here makes H.264 smaller; 3840 × 2160 needs level 5.1.
+            if max == 0 || (uhd && max < 51) {
+                Fit::Never
+            } else {
+                Fit::Copy
+            }
+        }
+        (Some("hevc"), Some(p)) => {
+            let max = if ten_bit { p.hevc_main10 } else { p.hevc_main.max(p.hevc_main10) };
+            // 3840 × 2160 needs level 5.0.
+            if max == 0 || (uhd && max < 150) || (a.hdr && !p.hdr) {
+                Fit::Convert
+            } else {
+                Fit::Copy
+            }
+        }
+        (Some("hevc"), None) if !takes_hevc => Fit::Convert,
+        _ => Fit::Copy,
+    }
+}
+
 /// A transcode's output size: the source's, fitted inside `TRANSCODE_WIDTH` × `TRANSCODE_HEIGHT` with its
 /// aspect kept (a 2.4:1 4K film becomes 1920 × 800 — 1080 lines of it would be wider than level 4.1
 /// allows), never scaled up, both even. 0 × 0 when the source's is unknown.
@@ -970,53 +1027,90 @@ pub async fn create(
             usize::from(candidates.first().is_some_and(|c| want.filename == Some(c.filename())));
         scout::h264_first(&mut candidates[alternatives..]);
     }
-    let mut chosen = None;
-    let mut no_transcode = false;
-    // The first release that plays only converted: the last resort, taken once nothing tried plays as it is.
-    let mut fallback = None;
-    for c in candidates.iter().take(MAX_TRIES) {
-        match open(st, &source, c).await {
-            // Dolby Vision profile 5 has no base layer to fall back to: stripped or transcoded, its picture is
-            // green and purple.
-            Ok((_, info)) if info.dolby_vision.is_some_and(|dv| !dv.has_fallback()) => eprintln!(
-                "session: {imdb} skipped \"{}\": {} has no picture without Dolby Vision",
-                c.attributes.label,
-                info.dolby_vision.map(|dv| dv.to_string()).unwrap_or_default()
+    // What scout says of each release decides, before any is opened, which are tried first — those that play as
+    // they are, then those that play only converted, the ranking above holding within each — and which aren't
+    // opened at all. The named release stays first unless it can't play.
+    let mut ranked: Vec<(Fit, &scout::Stream)> = Vec::new();
+    for c in &candidates {
+        match fit(&c.attributes, want.playable, takes_hevc) {
+            Fit::Never => eprintln!(
+                "session: {imdb} skipped \"{}\" unopened: scout's attributes say it can't play here",
+                c.attributes.label
             ),
-            // HEVC the player can't take as it is plays only converted on the GPU: kept as the last resort while
-            // the rest are looked through for one that plays untouched — unless the player named this release
-            // (another audio track of it), which it keeps.
-            Ok((r, info)) if info.video == VideoCodec::Hevc && !plays(want, takes_hevc, &info) => {
-                eprintln!(
-                    "session: {imdb} \"{}\" ({}) plays here only converted",
-                    c.attributes.label,
-                    info.codecs.as_deref().unwrap_or("HEVC")
-                );
-                let named = want.filename == Some(c.filename());
-                if fallback.is_none() {
-                    fallback = Some((c, (r, info)));
-                }
-                if named {
-                    break;
-                }
-            }
-            // H.264 beyond the player: nothing here makes it smaller.
-            Ok((_, info)) if !plays(want, takes_hevc, &info) => eprintln!(
-                "session: {imdb} skipped \"{}\": {} is beyond this player",
-                c.attributes.label,
-                info.codecs.as_deref().unwrap_or("its video")
-            ),
-            Ok(found) => {
-                chosen = Some((c, found, None));
-                break;
-            }
-            Err(why) => eprintln!(
-                "session: {imdb} skipped \"{}\": {}",
-                c.attributes.label,
-                crate::redact::scrub(&why, &secrets)
-            ),
+            f => ranked.push((f, c)),
         }
     }
+    let named_first = usize::from(ranked.first().is_some_and(|(_, c)| want.filename == Some(c.filename())));
+    ranked[named_first..].sort_by_key(|(f, _)| *f);
+    let mut no_transcode = false;
+    let (mut chosen, fallback) = {
+        let source = &source;
+        let started = Instant::now();
+        let mut queue = ranked.into_iter().peekable();
+        let mut opening = FuturesOrdered::new();
+        let mut tried = 0;
+        let mut chosen = None;
+        // The first release that plays only converted: the last resort, taken once nothing tried plays as it is.
+        let mut fallback = None;
+        loop {
+            while opening.len() < PARALLEL_OPENS && tried < MAX_TRIES && started.elapsed() < PICK_BUDGET {
+                // With a converted release in hand, one scout says plays only converted can't do better.
+                if fallback.is_some() && queue.peek().is_some_and(|(f, _)| *f == Fit::Convert) {
+                    break;
+                }
+                let Some((_, c)) = queue.next() else { break };
+                tried += 1;
+                opening.push_back(async move {
+                    let opened = tokio::time::timeout(OPEN_TIMEOUT, open(st, source, c)).await;
+                    (c, opened.unwrap_or_else(|_| Err(format!("not open after {}s", OPEN_TIMEOUT.as_secs()))))
+                });
+            }
+            // In the order they were started, which is rank order.
+            let Some((c, opened)) = opening.next().await else { break };
+            match opened {
+                // Dolby Vision profile 5 has no base layer to fall back to: stripped or transcoded, its picture is
+                // green and purple.
+                Ok((_, info)) if info.dolby_vision.is_some_and(|dv| !dv.has_fallback()) => eprintln!(
+                    "session: {imdb} skipped \"{}\": {} has no picture without Dolby Vision",
+                    c.attributes.label,
+                    info.dolby_vision.map(|dv| dv.to_string()).unwrap_or_default()
+                ),
+                // HEVC the player can't take as it is plays only converted on the GPU: kept as the last resort
+                // while the rest are looked through for one that plays untouched — unless the player named this
+                // release (another audio track of it), which it keeps.
+                Ok((r, info)) if info.video == VideoCodec::Hevc && !plays(want, takes_hevc, &info) => {
+                    eprintln!(
+                        "session: {imdb} \"{}\" ({}) plays here only converted",
+                        c.attributes.label,
+                        info.codecs.as_deref().unwrap_or("HEVC")
+                    );
+                    let named = want.filename == Some(c.filename());
+                    if fallback.is_none() {
+                        fallback = Some((c, (r, info)));
+                    }
+                    if named {
+                        break;
+                    }
+                }
+                // H.264 beyond the player: nothing here makes it smaller.
+                Ok((_, info)) if !plays(want, takes_hevc, &info) => eprintln!(
+                    "session: {imdb} skipped \"{}\": {} is beyond this player",
+                    c.attributes.label,
+                    info.codecs.as_deref().unwrap_or("its video")
+                ),
+                Ok(found) => {
+                    chosen = Some((c, found, None));
+                    break;
+                }
+                Err(why) => eprintln!(
+                    "session: {imdb} skipped \"{}\": {}",
+                    c.attributes.label,
+                    crate::redact::scrub(&why, &secrets)
+                ),
+            }
+        }
+        (chosen, fallback)
+    };
     if chosen.is_none() {
         if let Some((c, found)) = fallback {
             match st.reserve_transcode() {
@@ -1257,6 +1351,35 @@ mod tests {
         assert!(firefox.takes(&info(VideoCodec::H264, "avc1.640029", false)));
         assert!(!firefox.takes(&hobbit) && !firefox.takes_hevc());
         assert!(!Playable { h264: 0x29, ..firefox }.takes(&info(VideoCodec::H264, "avc1.640033", false)));
+    }
+
+    #[test]
+    fn scouts_attributes_rank_releases_before_any_is_opened() {
+        let a = |codec: &str| scout::Attributes { codec: Some(codec.into()), ..scout::Attributes::default() };
+        let safari =
+            Playable { h264: 0x33, hevc_main: 153, hevc_main10: 153, hdr: true, ..Playable::default() };
+        let firefox = Playable { h264: 0x33, ..Playable::default() };
+        let p = Some(&safari);
+        assert_eq!(fit(&a("h264"), p, true), Fit::Copy);
+        let hi10p = scout::Attributes { bit_depth: 10, ..a("h264") };
+        assert_eq!(fit(&hi10p, p, true), Fit::Never, "10-bit H.264 and no High 10 decoder");
+        assert_eq!(fit(&hi10p, Some(&Playable { h264_high10: 0x33, ..safari }), true), Fit::Copy);
+        let hdr_word = scout::Attributes { bit_depth: 10, hdr: true, ..a("h264") };
+        assert_eq!(fit(&hdr_word, p, true), Fit::Copy, "a 10 inferred from an HDR word is not High 10");
+        let uhd_h264 = scout::Attributes { resolution: Some("2160p".into()), ..a("h264") };
+        assert_eq!(fit(&uhd_h264, Some(&Playable { h264: 0x29, ..firefox }), false), Fit::Never);
+        let p5 = scout::Attributes { dv_profile: 5, dolby_vision: true, hdr: true, ..a("hevc") };
+        assert_eq!(fit(&p5, p, true), Fit::Never, "no picture without Dolby Vision");
+        let uhd = scout::Attributes { resolution: Some("2160p".into()), ..a("hevc") };
+        let hd_only = Playable { hevc_main: 123, hevc_main10: 123, ..safari };
+        assert_eq!(fit(&uhd, Some(&hd_only), true), Fit::Convert, "4K past a 1080p decoder");
+        let hdr10 = scout::Attributes { hdr: true, bit_depth: 10, ..a("hevc") };
+        assert_eq!(fit(&hdr10, Some(&Playable { hdr: false, ..safari }), true), Fit::Convert);
+        assert_eq!(fit(&hdr10, p, true), Fit::Copy);
+        assert_eq!(fit(&a("hevc"), Some(&firefox), false), Fit::Convert);
+        assert_eq!(fit(&a("hevc"), None, false), Fit::Convert, "videoCodecs without HEVC");
+        let unknown = scout::Attributes::default();
+        assert_eq!(fit(&unknown, Some(&firefox), false), Fit::Copy, "unknown: the probe decides");
     }
 
     #[test]
