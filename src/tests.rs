@@ -967,6 +967,7 @@ async fn subtitles_are_webvtt_renditions_from_den_subtitles() {
 
     let master = call(&state, "GET", &format!("{base}master.m3u8"), None, "").await.text();
     assert!(master.contains("LANGUAGE=\"fi\"") && master.contains("SUBTITLES=\"subs\""), "{master}");
+    assert!(master.contains("LANGUAGE=\"en\",DEFAULT=YES,AUTOSELECT=YES"), "the first preference: {master}");
     let pl = call(&state, "GET", &format!("{base}sub0.m3u8"), None, "").await;
     assert_eq!(pl.status, StatusCode::OK);
     assert!(pl.text().contains("sub0.vtt"), "{}", pl.text());

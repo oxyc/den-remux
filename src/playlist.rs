@@ -58,7 +58,8 @@ pub fn media(segs: &[Segment], start: f64) -> String {
 }
 
 /// The master playlist: one variant, the copied video plus AAC-LC stereo, and a WebVTT rendition per
-/// `(language, name)` in `subs`.
+/// `(language, name)` in `subs`, most wanted first. The first is the default, so a player shows it without being
+/// asked; the rest are there to choose.
 pub fn master(
     video_codecs: &str,
     bandwidth: u64,
@@ -69,9 +70,10 @@ pub fn master(
     let res = resolution.filter(|(w, h)| *w > 0 && *h > 0).map(|(w, h)| format!(",RESOLUTION={w}x{h}"));
     let mut out = String::from("#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-INDEPENDENT-SEGMENTS\n");
     for (i, (lang, name)) in subs.iter().enumerate() {
+        let default = if i == 0 { "YES" } else { "NO" };
         out.push_str(&format!(
             "#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"subs\",NAME=\"{name}\",LANGUAGE=\"{lang}\",\
-             DEFAULT=NO,AUTOSELECT=YES,FORCED=NO,URI=\"sub{i}.m3u8\"\n"
+             DEFAULT={default},AUTOSELECT=YES,FORCED=NO,URI=\"sub{i}.m3u8\"\n"
         ));
     }
     out.push_str(&format!(
@@ -186,6 +188,9 @@ mod tests {
         let m = master("avc1.640028", 1, 1, None, &subs);
         assert!(m.contains("TYPE=SUBTITLES,GROUP-ID=\"subs\",NAME=\"Finnish\",LANGUAGE=\"fi\""), "{m}");
         assert!(m.contains("URI=\"sub1.m3u8\""));
+        assert!(m.contains("LANGUAGE=\"en\",DEFAULT=YES,AUTOSELECT=YES"), "the most wanted shows: {m}");
+        assert!(m.contains("LANGUAGE=\"fi\",DEFAULT=NO,AUTOSELECT=YES"), "{m}");
+        assert_eq!(m.matches("DEFAULT=YES").count(), 1, "one default in a group");
         assert!(m.contains(",SUBTITLES=\"subs\"\nmedia.m3u8"), "{m}");
         let s = subtitle_media(30.021, 1);
         assert!(
