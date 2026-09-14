@@ -65,6 +65,14 @@ pub enum Audio<'a> {
     Copy { codec: &'static str, channels: u32, language: Option<&'a str> },
 }
 
+/// Dolby Vision kept in a copied variant, named as RFC 8216bis and Apple's devices read it: a profile 8 base
+/// layer's `hvc1…` stays in CODECS with `dvh1.08.LL/<brand>` in SUPPLEMENTAL-CODECS; profile 5, which has no base
+/// layer, is its own `dvh1.05.LL` in CODECS and has none. VIDEO-RANGE is what the picture is: PQ, HLG or SDR.
+pub struct DolbyVision {
+    pub supplemental: Option<String>,
+    pub range: &'static str,
+}
+
 /// The master playlist: one variant — the copied video plus its audio — and a WebVTT rendition per
 /// `(language, name)` in `subs`, most wanted first. The first is the default, so a player shows it without being
 /// asked; the rest are there to choose.
@@ -73,6 +81,7 @@ pub enum Audio<'a> {
 /// the player learns its CHANNELS, which CODECS does not carry.
 pub fn master(
     video_codecs: &str,
+    dolby_vision: Option<&DolbyVision>,
     audio: &Audio<'_>,
     bandwidth: u64,
     average: u64,
@@ -102,8 +111,13 @@ pub fn master(
              DEFAULT={default},AUTOSELECT=YES,FORCED=NO,URI=\"sub{i}.m3u8\"\n"
         ));
     }
+    let dv = dolby_vision.map_or_else(String::new, |dv| {
+        let supplemental =
+            dv.supplemental.as_deref().map(|s| format!(",SUPPLEMENTAL-CODECS=\"{s}\"")).unwrap_or_default();
+        format!("{supplemental},VIDEO-RANGE={}", dv.range)
+    });
     out.push_str(&format!(
-        "#EXT-X-STREAM-INF:BANDWIDTH={bandwidth},AVERAGE-BANDWIDTH={average},CODECS=\"{video_codecs},{audio_codec}\"{}{}{}\n\
+        "#EXT-X-STREAM-INF:BANDWIDTH={bandwidth},AVERAGE-BANDWIDTH={average},CODECS=\"{video_codecs},{audio_codec}\"{dv}{}{}{}\n\
          media.m3u8\n",
         res.unwrap_or_default(),
         if matches!(audio, Audio::Aac) { "" } else { ",AUDIO=\"audio\"" },
@@ -200,19 +214,32 @@ mod tests {
         let (peak, avg) = bandwidth(Some(3_750_000), 30.0);
         assert_eq!(avg, 1_000_000);
         assert!(peak > avg);
-        let m = master("hvc1.1.6.L93.B0", &Audio::Aac, peak, avg, Some((320, 180)), &[]);
+        let m = master("hvc1.1.6.L93.B0", None, &Audio::Aac, peak, avg, Some((320, 180)), &[]);
         assert!(m.contains("CODECS=\"hvc1.1.6.L93.B0,mp4a.40.2\""), "{m}");
         assert!(m.contains("RESOLUTION=320x180"));
         assert!(m.contains(&format!("BANDWIDTH={peak},AVERAGE-BANDWIDTH={avg}")));
         assert!(m.ends_with("media.m3u8\n"));
         assert!(!m.contains("SUBTITLES") && !m.contains("TYPE=AUDIO") && !m.contains("AUDIO=\""));
-        assert!(!master("avc1.64001e", &Audio::Aac, 1, 1, None, &[]).contains("RESOLUTION"));
+        assert!(!master("avc1.64001e", None, &Audio::Aac, 1, 1, None, &[]).contains("RESOLUTION"));
+        assert!(!m.contains("VIDEO-RANGE"), "nothing kept, nothing named");
+    }
+
+    #[test]
+    fn kept_dolby_vision_is_named_beside_or_as_its_codec() {
+        let p81 = DolbyVision { supplemental: Some("dvh1.08.06/db1p".into()), range: "PQ" };
+        let m = master("hvc1.2.4.L153.B0", Some(&p81), &Audio::Aac, 1, 1, None, &[]);
+        let supplemental = ",SUPPLEMENTAL-CODECS=\"dvh1.08.06/db1p\",VIDEO-RANGE=PQ\n";
+        assert!(m.contains(&format!("CODECS=\"hvc1.2.4.L153.B0,mp4a.40.2\"{supplemental}")), "{m}");
+        let p5 = DolbyVision { supplemental: None, range: "PQ" };
+        let m = master("dvh1.05.06", Some(&p5), &Audio::Aac, 1, 1, None, &[]);
+        assert!(m.contains("CODECS=\"dvh1.05.06,mp4a.40.2\",VIDEO-RANGE=PQ\n"), "{m}");
+        assert!(!m.contains("SUPPLEMENTAL"), "{m}");
     }
 
     #[test]
     fn copied_dolby_audio_is_named_with_its_channels() {
         let eac3 = Audio::Copy { codec: "ec-3", channels: 6, language: Some("eng") };
-        let m = master("hvc1.2.4.L150.B0", &eac3, 1, 1, None, &[]);
+        let m = master("hvc1.2.4.L150.B0", None, &eac3, 1, 1, None, &[]);
         assert!(
             m.contains(
                 "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"audio\",NAME=\"English\",LANGUAGE=\"eng\",DEFAULT=YES,AUTOSELECT=YES,CHANNELS=\"6\"\n"
@@ -222,14 +249,14 @@ mod tests {
         assert!(m.contains("CODECS=\"hvc1.2.4.L150.B0,ec-3\",AUDIO=\"audio\"\nmedia.m3u8"), "{m}");
         assert!(!m.contains("URI="), "the audio is in the variant's own segments: {m}");
         let ac3 = Audio::Copy { codec: "ac-3", channels: 2, language: None };
-        let m = master("avc1.640028", &ac3, 1, 1, None, &[]);
+        let m = master("avc1.640028", None, &ac3, 1, 1, None, &[]);
         assert!(m.contains("NAME=\"Audio\",DEFAULT=YES") && m.contains(",ac-3\""), "{m}");
     }
 
     #[test]
     fn subtitles_are_renditions_of_one_group() {
         let subs = [("en".to_string(), "English".to_string()), ("fi".to_string(), "Finnish".to_string())];
-        let m = master("avc1.640028", &Audio::Aac, 1, 1, None, &subs);
+        let m = master("avc1.640028", None, &Audio::Aac, 1, 1, None, &subs);
         assert!(m.contains("TYPE=SUBTITLES,GROUP-ID=\"subs\",NAME=\"Finnish\",LANGUAGE=\"fi\""), "{m}");
         assert!(m.contains("URI=\"sub1.m3u8\""));
         assert!(m.contains("LANGUAGE=\"en\",DEFAULT=YES,AUTOSELECT=YES"), "the most wanted shows: {m}");

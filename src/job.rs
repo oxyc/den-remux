@@ -49,11 +49,10 @@ const STDERR_TAIL: usize = 2048;
 /// What happens to the video.
 pub enum Video {
     Copy {
-        hevc: bool,
-        /// Drop Dolby Vision — its RPU and enhancement-layer units, and its configuration record, so no `dvcC`
-        /// is written — leaving the base layer: HDR10 (or SDR, HLG), which a browser plays and a profile 7 or
-        /// 8 stream it would refuse is not.
-        strip_dovi: bool,
+        /// The sample entry to write: `hvc1` for HEVC (Safari plays HEVC in fMP4 only under it, not `hev1`), `dvh1`
+        /// for Dolby Vision profile 5 kept as it is; `None` leaves H.264's own.
+        tag: Option<&'static str>,
+        dovi: Dovi,
     },
     /// Decoded, scaled (and tone-mapped, for HDR) on the GPU and encoded to H.264 there, over VAAPI — for
     /// a player that cannot take the release's HEVC. `-force_key_frames source` puts an output keyframe on
@@ -66,6 +65,20 @@ pub enum Video {
         height: u32,
         tonemap: bool,
     },
+}
+
+/// What a copy does with the video's Dolby Vision.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Dovi {
+    /// The video carries none.
+    Absent,
+    /// Drop it — its RPU and enhancement-layer units, and its configuration record, so no `dvcC` is written —
+    /// leaving the base layer: HDR10 (or SDR, HLG), which a browser plays where a profile 7 or 8 stream it would
+    /// refuse is not.
+    Strip,
+    /// Keep it, RPU and configuration record, for a player that shows it. The mp4 muxer writes the `dvcC`/`dvvC`
+    /// box only below its default strictness, hence `-strict unofficial`.
+    Keep,
 }
 
 /// A transcode's H.264: High, level 4.1 — what every H.264 player takes, up to 1920 × 1080.
@@ -127,16 +140,17 @@ pub fn args(spec: &Spec<'_>, ca_file: Option<&str>) -> Vec<String> {
     a.push("-map".into());
     a.push(format!("0:a:{}", spec.audio));
     match &spec.video {
-        Video::Copy { hevc, strip_dovi } => {
+        Video::Copy { tag, dovi } => {
             a.extend(s(&["-c:v", "copy"]));
-            if *hevc {
-                // Safari plays HEVC in fMP4 only under the hvc1 tag, not hev1.
-                a.extend(s(&["-tag:v", "hvc1"]));
+            if let Some(tag) = tag {
+                a.extend(s(&["-tag:v", tag]));
             }
-            if *strip_dovi {
+            match dovi {
                 // dovi_rpu drops the configuration record (and a frame's last RPU); filter_units every Dolby
                 // Vision unit — 62 the RPU, 63 the enhancement layer, several of which a profile 7 frame carries.
-                a.extend(s(&["-bsf:v", "dovi_rpu=strip=1,filter_units=remove_types=62|63"]));
+                Dovi::Strip => a.extend(s(&["-bsf:v", "dovi_rpu=strip=1,filter_units=remove_types=62|63"])),
+                Dovi::Keep => a.extend(s(&["-strict", "unofficial"])),
+                Dovi::Absent => {}
             }
         }
         Video::Transcode { width, height, tonemap, .. } => {
@@ -377,7 +391,7 @@ mod tests {
         let spec = Spec {
             input: "https://cdn.example/f.mkv",
             seek: seek_for(13.0),
-            video: Video::Copy { hevc: true, strip_dovi: false },
+            video: Video::Copy { tag: Some("hvc1"), dovi: Dovi::Absent },
             audio: 1,
             audio_copy: false,
             dir,
@@ -385,7 +399,7 @@ mod tests {
         let a = args(&spec, Some(CA_BUNDLE));
         let joined = a.join(" ");
         assert!(!joined.contains("-bsf"), "{joined}");
-        let dovi = Spec { video: Video::Copy { hevc: true, strip_dovi: true }, ..spec };
+        let dovi = Spec { video: Video::Copy { tag: Some("hvc1"), dovi: Dovi::Strip }, ..spec };
         let d = args(&dovi, None).join(" ");
         assert!(
             d.contains("-tag:v hvc1 -bsf:v dovi_rpu=strip=1,filter_units=remove_types=62|63 "),
@@ -451,7 +465,7 @@ mod tests {
         let spec = Spec {
             input: "/tmp/f.mkv",
             seek: None,
-            video: Video::Copy { hevc: false, strip_dovi: false },
+            video: Video::Copy { tag: None, dovi: Dovi::Absent },
             audio: 0,
             audio_copy: false,
             dir: Path::new("/d"),
@@ -461,11 +475,26 @@ mod tests {
     }
 
     #[test]
+    fn kept_dolby_vision_keeps_its_configuration_record() {
+        let spec = Spec {
+            input: "/f.mkv",
+            seek: None,
+            video: Video::Copy { tag: Some("dvh1"), dovi: Dovi::Keep },
+            audio: 0,
+            audio_copy: false,
+            dir: Path::new("/d"),
+        };
+        let joined = args(&spec, None).join(" ");
+        assert!(joined.contains("-c:v copy -tag:v dvh1 -strict unofficial -c:a aac"), "{joined}");
+        assert!(!joined.contains("-bsf"), "the RPU stays: {joined}");
+    }
+
+    #[test]
     fn dolby_audio_for_a_player_that_plays_it_is_copied() {
         let spec = Spec {
             input: "/f.mkv",
             seek: seek_for(13.0),
-            video: Video::Copy { hevc: true, strip_dovi: false },
+            video: Video::Copy { tag: Some("hvc1"), dovi: Dovi::Absent },
             audio: 2,
             audio_copy: true,
             dir: Path::new("/d"),

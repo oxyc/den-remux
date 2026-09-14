@@ -67,11 +67,16 @@ anything else                           404 {"error":"not_found"}
   Chromecast); empty is H.264 and HEVC. Without HEVC, H.264 releases are tried first, and an HEVC-only
   title is transcoded to H.264 on the GPU (Hardware transcode, below) — or refused with
   `transcode_unavailable` while transcoding is off or in use.
-- **What the player decodes.** `playable` — `{h264, h264High10, hevcMain, hevcMain10, hevcHighTier, hdr}`, the
+- **What the player decodes.** `playable` — `{h264, h264High10, hevcMain, hevcMain10, hevcHighTier, hdr, eac3,
+  dolbyVision: {p5, p8}}`, the
   highest level it takes of 8-bit H.264 and of H.264 High 10 (`level_idc`, 0x33 is 5.1), of 8-bit and 10-bit HEVC
   (level × 30, 153 is 5.1) and of HEVC's High tier, 0 for none, and whether it decodes PQ HDR — decides over
   `videoCodecs` when given. A High 10 release (profile 110) is passed over unless `h264High10` reaches its level:
-  the box's GPU has no High 10 decoder to convert it. A UHD Blu-ray
+  the box's GPU has no High 10 decoder to convert it. `dolbyVision` says which Dolby Vision it shows as such. With
+  `p8`, a copied profile 8.1/8.2/8.4 keeps its RPU and configuration record and is named beside its base layer's
+  `hvc1…`: `SUPPLEMENTAL-CODECS="dvh1.08.LL/db1p|db2g|db4h"`, `VIDEO-RANGE=PQ|SDR|HLG`. With `p5`, profile 5 plays
+  as a copy tagged `dvh1` (`CODECS="dvh1.05.LL"`, `VIDEO-RANGE=PQ`) instead of being skipped. Profile 7, and every
+  transcode, plays its base layer alone. A UHD Blu-ray
   remux is often High tier, which Apple's decoders refuse whatever their tests say, so the web app reports 0 on
   them; a player that sends no `hevcHighTier` has it converted. The session's log line says what the player
   reported. A release is probed first and its own codec string
@@ -84,7 +89,7 @@ anything else                           404 {"error":"not_found"}
   the tailnet: 1080p before 720p or unnamed before 4K, and within each a web release before a remux and one
   without Dolby Vision before one with (scout's order holds within each). Before any is opened, scout's
   attributes (`codec`, `resolution`, `hdr`, `bitDepth`, `dvProfile`, `probed`) sort them for this player: those
-  that play as they are, then those that play only converted; one they rule out (Dolby Vision profile 5, H.264
+  that play as they are, then those that play only converted; one they rule out (Dolby Vision profile 5 without `dolbyVision.p5`, H.264
   beyond the player, 10-bit H.264 without `h264High10`) is never opened, and anything they don't say is left to
   the probe. Three are opened at a time and taken in rank order; the first that plays as it is wins, one that
   plays only converted is the last resort, and the search goes on — up to 12 releases, starting none after 30 s,
@@ -272,8 +277,9 @@ dependabot cannot bump it, so bump both lines by hand.
   no stereo alternate beside it (Apple's authoring spec asks for AC-3 beside E-AC-3 for devices without it).
 - **Text subtitles only**, from den-subtitles; the release's own tracks (PGS, ASS) are not carried.
 - **Dolby Vision profile 5** has no HDR10/SDR base layer: Safari shows it, Chrome cannot, and stripped or
-  transcoded its colours come out green and purple. A session skips it: the probe reads the profile, and a
-  release whose file says profile 5 is never chosen.
+  transcoded its colours come out green and purple. A session skips it — the probe reads the profile — unless
+  `playable.dolbyVision.p5` says the player shows profile 5 and it takes the release as it is: then it is copied,
+  tagged `dvh1`.
 - **Bandwidth**: at home this is fine. Away from home every byte crosses the home **upload** link, so a
   remote session is bounded by it — a 4K remux will not fit. A transcode is 8 Mbit/s at most 1080p, but
   nothing asks for one on bandwidth grounds yet.

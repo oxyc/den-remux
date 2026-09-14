@@ -368,7 +368,7 @@ mod tests {
             el(&[0xAE], &body)
         };
         let tracks = parse_tracks(&track(b"dvvC"));
-        assert_eq!(tracks[0].dovi, Some(super::super::DolbyVision { profile: 8, compat: 1 }));
+        assert_eq!(tracks[0].dovi, Some(super::super::DolbyVision { profile: 8, compat: 1, level: 6 }));
         assert_eq!(parse_tracks(&track(b"mvcC"))[0].dovi, None, "another block addition");
     }
 }

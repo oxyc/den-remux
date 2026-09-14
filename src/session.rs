@@ -138,6 +138,8 @@ pub struct Session {
     pub audio_copy: Option<&'static str>,
     /// Subtitle renditions, when the browser asked for any.
     pub subs: Option<crate::subs::Subs>,
+    /// What a copy does with the video's Dolby Vision: kept for a player that shows it, else stripped.
+    pub dovi: job::Dovi,
     /// The HEVC is transcoded to H.264 on the GPU, for a player that cannot take it.
     pub transcoded: bool,
     pub segments: Vec<Segment>,
@@ -330,10 +332,17 @@ impl Session {
                     tonemap: tonemaps(&self.info),
                 }
             }
-            false => job::Video::Copy {
-                hevc: self.info.video == VideoCodec::Hevc,
-                strip_dovi: self.info.dolby_vision.is_some(),
-            },
+            false => {
+                // Profile 5 kept as it is goes under its own sample entry; its HEVC has no other picture.
+                let p5 =
+                    self.dovi == job::Dovi::Keep && self.info.dolby_vision.is_some_and(|dv| dv.profile == 5);
+                let tag = match self.info.video {
+                    VideoCodec::Hevc if p5 => Some("dvh1"),
+                    VideoCodec::Hevc => Some("hvc1"),
+                    _ => None,
+                };
+                job::Video::Copy { tag, dovi: self.dovi }
+            }
         }
     }
 
@@ -788,6 +797,17 @@ pub struct Playable {
     pub hdr: bool,
     /// Plays E-AC-3 and AC-3 in fMP4 HLS — Safari and Apple's receivers: such a track is copied, not converted.
     pub eac3: bool,
+    /// Which Dolby Vision the player shows as Dolby Vision rather than as its base layer. Absent is neither.
+    pub dolby_vision: DolbyVisionPlay,
+}
+
+/// `playable.dolbyVision`: profile 5 (no base layer at all; Safari shows it, Chrome can't) and profile 8.x shown as
+/// Dolby Vision.
+#[derive(serde::Deserialize, Clone, Copy, Debug, Default)]
+#[serde(default)]
+pub struct DolbyVisionPlay {
+    pub p5: bool,
+    pub p8: bool,
 }
 
 impl std::fmt::Display for Playable {
@@ -800,7 +820,14 @@ impl std::fmt::Display for Playable {
         };
         let (h264, high10) = (self.h264, self.h264_high10);
         let (main, main10, high) = (self.hevc_main, self.hevc_main10, self.hevc_high_tier);
-        write!(f, "H.264 L{h264}, High 10 L{high10}, HEVC L{main}, 10-bit L{main10}, High tier L{high}{hdr}")
+        write!(f, "H.264 L{h264}, High 10 L{high10}, HEVC L{main}, 10-bit L{main10}, High tier L{high}")?;
+        let dv = match (self.dolby_vision.p5, self.dolby_vision.p8) {
+            (true, true) => ", Dolby Vision 5 and 8",
+            (true, false) => ", Dolby Vision 5",
+            (false, true) => ", Dolby Vision 8",
+            (false, false) => "",
+        };
+        write!(f, "{hdr}{dv}")
     }
 }
 
@@ -832,6 +859,45 @@ impl Playable {
     fn takes_hevc(&self) -> bool {
         self.hevc_main > 0 || self.hevc_main10 > 0
     }
+}
+
+/// Whether a copy keeps the release's Dolby Vision: profile 5 for a player that shows profile 5, profile 8 with an
+/// HDR10, SDR or HLG base layer (8.1, 8.2, 8.4) for one that shows profile 8. Profile 7's enhancement layer is
+/// always dropped, and so is anything HLS has no name for.
+pub(crate) fn keeps_dolby_vision(dv: crate::probe::DolbyVision, playable: Option<&Playable>) -> bool {
+    let Some(p) = playable.filter(|_| dolby_vision_signal(dv).is_some()) else { return false };
+    match dv.profile {
+        5 => p.dolby_vision.p5,
+        8 => p.dolby_vision.p8,
+        _ => false,
+    }
+}
+
+/// How kept Dolby Vision is named in the master playlist: CODECS to use in place of the base layer's (profile 5,
+/// `dvh1.05.LL`), SUPPLEMENTAL-CODECS (profile 8, `dvh1.08.LL/` and the brand of what its base layer is — `db1p`
+/// HDR10, `db2g` SDR, `db4h` HLG) and VIDEO-RANGE. `None` for a profile HLS does not name.
+pub(crate) fn dolby_vision_signal(
+    dv: crate::probe::DolbyVision,
+) -> Option<(Option<String>, Option<String>, &'static str)> {
+    let (brand, range) = match (dv.profile, dv.compat) {
+        (5, _) => return Some((Some(format!("dvh1.05.{:02}", dv.level)), None, "PQ")),
+        (8, 1) => ("db1p", "PQ"),
+        (8, 2) => ("db2g", "SDR"),
+        (8, 4) => ("db4h", "HLG"),
+        _ => return None,
+    };
+    Some((None, Some(format!("dvh1.08.{:02}/{brand}", dv.level)), range))
+}
+
+/// Whether a release would play with no picture: Dolby Vision profile 5, which has no base layer, so stripped or
+/// transcoded it comes out green and purple — unless the player shows profile 5 and takes the release as it is.
+fn no_picture(want: &Want<'_>, takes_hevc: bool, info: &MediaInfo) -> bool {
+    info.dolby_vision.is_some_and(|dv| {
+        if dv.has_fallback() {
+            return false;
+        }
+        !(keeps_dolby_vision(dv, want.playable) && plays(want, takes_hevc, info))
+    })
 }
 
 /// The HLS codec a Dolby track is copied as, from the container's name for it — Matroska's `A_EAC3`/`A_AC3`
@@ -874,9 +940,9 @@ pub(crate) enum Fit {
 /// A release's `Fit` from scout's attributes, only where they say so. The probe still has the last word on
 /// whatever is tried; this decides the order, and which not to try.
 pub(crate) fn fit(a: &scout::Attributes, playable: Option<&Playable>, takes_hevc: bool) -> Fit {
-    // Dolby Vision profile 5 has no base layer: stripped or converted, its picture is green and purple. Only
-    // scout's probe reads the profile, so it is the file's.
-    if a.dv_profile == 5 {
+    // Dolby Vision profile 5 has no base layer: stripped or converted, its picture is green and purple — unless the
+    // player shows profile 5 itself. Only scout's probe reads the profile, so it is the file's.
+    if a.dv_profile == 5 && !playable.is_some_and(|p| p.dolby_vision.p5) {
         return Fit::Never;
     }
     let uhd =
@@ -1112,8 +1178,8 @@ pub async fn create(
             let Some((c, opened)) = opening.next().await else { break };
             match opened {
                 // Dolby Vision profile 5 has no base layer to fall back to: stripped or transcoded, its picture is
-                // green and purple.
-                Ok((_, info)) if info.dolby_vision.is_some_and(|dv| !dv.has_fallback()) => eprintln!(
+                // green and purple. Only a player that shows profile 5 plays it, and only as it is.
+                Ok((_, info)) if no_picture(want, takes_hevc, &info) => eprintln!(
                     "session: {imdb} skipped \"{}\": {} has no picture without Dolby Vision",
                     c.attributes.label,
                     info.dolby_vision.map(|dv| dv.to_string()).unwrap_or_default()
@@ -1228,6 +1294,21 @@ pub async fn create(
         ),
         None => (codecs, (info.width, info.height), (peak, avg)),
     };
+    // Dolby Vision stays in a copy for a player that shows it; everywhere else, and in every transcode, the base
+    // layer plays alone.
+    let kept_dv =
+        info.dolby_vision.filter(|dv| transcode.is_none() && keeps_dolby_vision(*dv, want.playable));
+    let dovi = match (info.dolby_vision, kept_dv) {
+        (None, _) => job::Dovi::Absent,
+        (Some(_), None) => job::Dovi::Strip,
+        (Some(_), Some(_)) => job::Dovi::Keep,
+    };
+    let (codecs, dv_signal) = match kept_dv.and_then(dolby_vision_signal) {
+        Some((own, supplemental, range)) => {
+            (own.unwrap_or(codecs), Some(playlist::DolbyVision { supplemental, range }))
+        }
+        None => (codecs, None),
+    };
     let subs = sub_base.map(|base| crate::subs::Subs {
         base,
         langs: sub_langs,
@@ -1242,6 +1323,7 @@ pub async fn create(
     let session = Arc::new(Session {
         master: playlist::master(
             &codecs,
+            dv_signal.as_ref(),
             &match audio_copy {
                 Some(codec) => playlist::Audio::Copy {
                     codec,
@@ -1271,6 +1353,7 @@ pub async fn create(
         info,
         audio,
         audio_copy,
+        dovi,
         subs,
         transcoded: transcode.is_some(),
         inner: Mutex::new(Inner {
@@ -1292,7 +1375,10 @@ pub async fn create(
     });
     st.insert_session(session.clone());
     st.sessions_started.fetch_add(1, Relaxed);
-    let dv = session.info.dolby_vision.map(|dv| format!(", {dv} stripped to its base layer"));
+    let dv = session.info.dolby_vision.map(|dv| match session.dovi {
+        job::Dovi::Keep => format!(", {dv} kept"),
+        _ => format!(", {dv} stripped to its base layer"),
+    });
     let player = want.playable.map_or_else(|| "no capability report".to_string(), |p| p.to_string());
     eprintln!(
         "session {}: {imdb} \"{}\" ({}, {:?} {}{}{}, {:.0}s, {} keyframes, {} segments, audio {} {}{}; player: {player})",
@@ -1382,9 +1468,9 @@ mod tests {
     fn dolby_vision_counts_as_hdr_unless_its_base_layer_is_sdr() {
         let mut release = info(VideoCodec::Hevc, "hvc1.2.4.L153.B0", false);
         assert!(!tonemaps(&release));
-        release.dolby_vision = Some(crate::probe::DolbyVision { profile: 8, compat: 1 });
+        release.dolby_vision = Some(crate::probe::DolbyVision { profile: 8, compat: 1, level: 6 });
         assert!(tonemaps(&release), "a remux often names no transfer in its header");
-        release.dolby_vision = Some(crate::probe::DolbyVision { profile: 8, compat: 2 });
+        release.dolby_vision = Some(crate::probe::DolbyVision { profile: 8, compat: 2, level: 6 });
         assert!(!tonemaps(&release), "profile 8.2's base layer is SDR already");
         assert!(tonemaps(&info(VideoCodec::Hevc, "hvc1.2.4.L153.B0", true)));
     }
@@ -1417,6 +1503,28 @@ mod tests {
     }
 
     #[test]
+    fn dolby_vision_is_kept_and_named_where_the_player_shows_it() {
+        use crate::probe::DolbyVision as Dv;
+        let shows = |p5, p8| Playable { dolby_vision: DolbyVisionPlay { p5, p8 }, ..Playable::default() };
+        let p81 = Dv { profile: 8, compat: 1, level: 6 };
+        let p5 = Dv { profile: 5, compat: 0, level: 6 };
+        let p76 = Dv { profile: 7, compat: 6, level: 6 };
+        assert!(keeps_dolby_vision(p81, Some(&shows(false, true))));
+        assert!(!keeps_dolby_vision(p81, Some(&shows(true, false))) && !keeps_dolby_vision(p81, None));
+        assert!(keeps_dolby_vision(p5, Some(&shows(true, false))));
+        assert!(!keeps_dolby_vision(p5, Some(&shows(false, true))));
+        assert!(!keeps_dolby_vision(p76, Some(&shows(true, true))), "profile 7 always plays its base layer");
+        let p86 = Dv { compat: 6, ..p81 };
+        assert!(!keeps_dolby_vision(p86, Some(&shows(true, true))), "8.6 has no HLS brand");
+        assert_eq!(dolby_vision_signal(p81), Some((None, Some("dvh1.08.06/db1p".into()), "PQ")));
+        let sdr = Dv { compat: 2, level: 9, ..p81 };
+        assert_eq!(dolby_vision_signal(sdr), Some((None, Some("dvh1.08.09/db2g".into()), "SDR")));
+        assert_eq!(dolby_vision_signal(Dv { compat: 4, ..p81 }).map(|s| s.2), Some("HLG"));
+        assert_eq!(dolby_vision_signal(p5), Some((Some("dvh1.05.06".into()), None, "PQ")));
+        assert_eq!(dolby_vision_signal(p76), None);
+    }
+
+    #[test]
     fn only_dolby_tracks_are_copied() {
         assert_eq!(dolby_codec("A_EAC3"), Some("ec-3"));
         assert_eq!(dolby_codec("ec-3"), Some("ec-3"));
@@ -1445,6 +1553,8 @@ mod tests {
         assert_eq!(fit(&uhd_h264, Some(&Playable { h264: 0x29, ..firefox }), false), Fit::Never);
         let p5 = scout::Attributes { dv_profile: 5, dolby_vision: true, hdr: true, ..a("hevc") };
         assert_eq!(fit(&p5, p, true), Fit::Never, "no picture without Dolby Vision");
+        let shows_p5 = Playable { dolby_vision: DolbyVisionPlay { p5: true, p8: false }, ..safari };
+        assert_eq!(fit(&p5, Some(&shows_p5), true), Fit::Copy, "a player that shows profile 5 opens it");
         let uhd = scout::Attributes { resolution: Some("2160p".into()), ..a("hevc") };
         let hd_only = Playable { hevc_main: 123, hevc_main10: 123, ..safari };
         assert_eq!(fit(&uhd, Some(&hd_only), true), Fit::Convert, "4K past a 1080p decoder");

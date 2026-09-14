@@ -91,6 +91,8 @@ pub struct DolbyVision {
     /// The base layer's compatibility id: 0 none (profile 5, whose picture needs the RPU), 1 HDR10, 2 SDR, 4 HLG,
     /// 6 a UHD Blu-ray's HDR10.
     pub compat: u8,
+    /// Dolby Vision's own level (1–13), which its HLS codec string names: `dvh1.08.06`.
+    pub level: u8,
 }
 
 impl DolbyVision {
@@ -108,10 +110,11 @@ impl fmt::Display for DolbyVision {
 }
 
 /// A `DOVIDecoderConfigurationRecord` (the `dvcC`/`dvvC` payload, or Matroska's BlockAddIDExtraData): two version
-/// bytes, the profile in the top 7 bits of the third, the compatibility id in the top 4 bits of the fifth.
+/// bytes, the profile in the top 7 bits of the third, the level in its last bit and the top 5 of the fourth, the
+/// compatibility id in the top 4 bits of the fifth.
 pub fn dovi_config(record: &[u8]) -> Option<DolbyVision> {
     let b = record.get(..5)?;
-    Some(DolbyVision { profile: b[2] >> 1, compat: b[4] >> 4 })
+    Some(DolbyVision { profile: b[2] >> 1, compat: b[4] >> 4, level: ((b[2] & 1) << 5) | (b[3] >> 3) })
 }
 
 /// The largest single structure we will read: a `moov` or `Cues` for a long film is a few MB, and
@@ -276,11 +279,15 @@ mod tests {
     fn a_dolby_vision_record_names_its_profile_and_base_layer() {
         // Profile 7 (a UHD Blu-ray's dual layer), level 6, RPU + EL + BL present, compatibility 6.
         let bluray = dovi_config(&[1, 0, 7 << 1, (6 << 3) | 0b111, 6 << 4, 0, 0, 0]).unwrap();
-        assert_eq!(bluray, DolbyVision { profile: 7, compat: 6 });
+        assert_eq!(bluray, DolbyVision { profile: 7, compat: 6, level: 6 });
         assert!(bluray.has_fallback());
         assert_eq!(bluray.to_string(), "Dolby Vision 7.6");
         let web = dovi_config(&[1, 0, 5 << 1, (6 << 3) | 0b101, 0, 0]).unwrap();
         assert!(!web.has_fallback(), "profile 5 needs its RPU");
+        // Level 9 at 8.1, and a level with its top bit in the third byte.
+        let hdr10 = dovi_config(&[1, 0, 8 << 1, (9 << 3) | 0b101, 1 << 4]).unwrap();
+        assert_eq!(hdr10, DolbyVision { profile: 8, compat: 1, level: 9 });
+        assert_eq!(dovi_config(&[1, 0, (8 << 1) | 1, 1 << 3, 1 << 4]).unwrap().level, 33);
         assert_eq!(dovi_config(&[1, 0, 16]), None, "truncated");
     }
 }
