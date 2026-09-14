@@ -100,13 +100,14 @@ pub fn parse(body: &[u8]) -> Result<Vec<Stream>, String> {
 }
 
 /// Could the browser take this release with only the audio re-encoded? Cached — an uncached one would
-/// start a debrid download and play nothing — and H.264 or HEVC, or a codec the title does not name
-/// (the probe decides those). AV1, VP9, MPEG-4 Part 2 and VC-1 need the video re-encoded, which this
-/// service does not do. Containers other than Matroska and MP4 are left out by name.
-fn remuxable(s: &Stream) -> bool {
+/// start a debrid download and play nothing — and H.264 or HEVC, AV1 for a player that decodes it (`av1`),
+/// or a codec the title does not name (the probe decides those). AV1 for any other player, VP9, MPEG-4
+/// Part 2 and VC-1 need the video re-encoded, which this service does not do. Containers other than
+/// Matroska and MP4 are left out by name.
+fn remuxable(s: &Stream, av1: bool) -> bool {
     let codec_ok = match s.attributes.codec.as_deref().map(str::to_ascii_lowercase) {
         None => true,
-        Some(c) => c == "h264" || c == "hevc",
+        Some(c) => c == "h264" || c == "hevc" || (av1 && c == "av1"),
     };
     let name = s.filename().to_ascii_lowercase();
     let container_ok = ![".avi", ".ts", ".m2ts", ".iso", ".wmv", ".mpg", ".mpeg", ".vob", ".webm"]
@@ -116,9 +117,9 @@ fn remuxable(s: &Stream) -> bool {
 }
 
 /// The releases worth trying, in the order to try them: the one the browser named first when it is
-/// playable here, then scout's order as `phone_first` ranks it.
-pub fn candidates(streams: &[Stream], filename: Option<&str>) -> Vec<Stream> {
-    let mut out: Vec<Stream> = streams.iter().filter(|s| remuxable(s)).cloned().collect();
+/// playable here, then scout's order as `phone_first` ranks it. `av1`: the player decodes AV1.
+pub fn candidates(streams: &[Stream], filename: Option<&str>, av1: bool) -> Vec<Stream> {
+    let mut out: Vec<Stream> = streams.iter().filter(|s| remuxable(s, av1)).cloned().collect();
     phone_first(&mut out);
     if let Some(want) = filename {
         if let Some(i) = out.iter().position(|s| s.filename() == want) {
@@ -148,11 +149,12 @@ pub fn phone_first(c: &mut [Stream]) {
     });
 }
 
-/// For a player that cannot take HEVC: H.264 releases first, then those scout named no codec for, then
-/// HEVC, which needs the GPU. Stable, so scout's order holds within each.
+/// For a player that cannot take HEVC: H.264 releases first — and AV1, a candidate only for a player that
+/// decodes it, so copied like H.264 — then those scout named no codec for, then HEVC, which needs the GPU.
+/// Stable, so scout's order holds within each.
 pub fn h264_first(c: &mut [Stream]) {
     c.sort_by_key(|s| match s.attributes.codec.as_deref().map(str::to_ascii_lowercase).as_deref() {
-        Some("h264") => 0,
+        Some("h264" | "av1") => 0,
         None => 1,
         _ => 2,
     });
@@ -332,7 +334,7 @@ mod tests {
     #[test]
     fn only_cached_remuxable_releases_are_candidates() {
         let names: Vec<String> =
-            candidates(&fixture(), None).iter().map(|s| s.filename().to_string()).collect();
+            candidates(&fixture(), None, false).iter().map(|s| s.filename().to_string()).collect();
         assert_eq!(
             names,
             [
@@ -379,7 +381,7 @@ mod tests {
 
     #[test]
     fn a_player_without_hevc_gets_h264_releases_first() {
-        let mut c = candidates(&fixture(), None);
+        let mut c = candidates(&fixture(), None, false);
         h264_first(&mut c);
         assert_eq!(c[0].filename(), "Film.2019.1080p.WEB-DL.DDP5.1.H.264.mkv");
         assert_eq!(c.last().unwrap().filename(), "Film.2019.2160p.UHD.BluRay.REMUX.HEVC.TrueHD.7.1.mkv");
@@ -387,15 +389,47 @@ mod tests {
 
     #[test]
     fn a_named_release_goes_first_when_it_is_playable() {
-        let pick = candidates(&fixture(), Some("Film.2019.1080p.BluRay.mkv"));
+        let pick = candidates(&fixture(), Some("Film.2019.1080p.BluRay.mkv"), false);
         assert_eq!(pick[0].filename(), "Film.2019.1080p.BluRay.mkv");
         assert_eq!(pick.len(), 3, "the others stay as fallbacks");
         // Named but uncached: the best cached one for a phone instead.
-        let pick = candidates(&fixture(), Some("Film.2019.1080p.WEB.x264-UNCACHED.mkv"));
+        let pick = candidates(&fixture(), Some("Film.2019.1080p.WEB.x264-UNCACHED.mkv"), false);
         assert_eq!(pick[0].filename(), "Film.2019.1080p.WEB-DL.DDP5.1.H.264.mkv");
         // Named 4K: it still goes first, ahead of the ranking.
-        let pick = candidates(&fixture(), Some("Film.2019.2160p.UHD.BluRay.REMUX.HEVC.TrueHD.7.1.mkv"));
+        let pick =
+            candidates(&fixture(), Some("Film.2019.2160p.UHD.BluRay.REMUX.HEVC.TrueHD.7.1.mkv"), false);
         assert_eq!(pick[0].filename(), "Film.2019.2160p.UHD.BluRay.REMUX.HEVC.TrueHD.7.1.mkv");
+    }
+
+    #[test]
+    fn av1_is_a_candidate_only_for_a_player_that_decodes_it() {
+        let names = |av1| -> Vec<String> {
+            candidates(&fixture(), None, av1).iter().map(|s| s.filename().to_string()).collect()
+        };
+        assert!(!names(false).contains(&"Film.2019.2160p.WEB-DL.AV1.mkv".to_string()));
+        assert_eq!(
+            names(true),
+            [
+                "Film.2019.1080p.WEB-DL.DDP5.1.H.264.mkv",
+                "Film.2019.1080p.BluRay.mkv",
+                "Film.2019.2160p.WEB-DL.AV1.mkv",
+                "Film.2019.2160p.UHD.BluRay.REMUX.HEVC.TrueHD.7.1.mkv",
+            ],
+            "a 4K web release, ranked with the other 4K"
+        );
+        // A player with AV1 and no HEVC: AV1 isn't put behind the unnamed releases as HEVC is.
+        let mut c = candidates(&fixture(), None, true);
+        h264_first(&mut c);
+        let order: Vec<&str> = c.iter().map(|s| s.filename()).collect();
+        assert_eq!(
+            order,
+            [
+                "Film.2019.1080p.WEB-DL.DDP5.1.H.264.mkv",
+                "Film.2019.2160p.WEB-DL.AV1.mkv",
+                "Film.2019.1080p.BluRay.mkv",
+                "Film.2019.2160p.UHD.BluRay.REMUX.HEVC.TrueHD.7.1.mkv",
+            ]
+        );
     }
 
     #[test]

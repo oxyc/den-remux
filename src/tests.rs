@@ -180,6 +180,8 @@ type OriginBody = http_body_util::combinators::BoxBody<Bytes, Infallible>;
 static NEVER_OPENED: AtomicU32 = AtomicU32::new(0);
 /// Play URLs the fake scout was asked to follow under `/p/counted/`.
 static COUNTED_PLAYS: AtomicU32 = AtomicU32::new(0);
+/// Play URLs the fake scout was asked to follow under `/p/av1/`.
+static AV1_PLAYS: AtomicU32 = AtomicU32::new(0);
 
 /// The fake scout's scope=availability config segment ("scoped", base64url) and the service key it
 /// asks for.
@@ -268,6 +270,18 @@ async fn origin_handle(
             ]});
             return origin_full(200, body.to_string());
         }
+        if imdb == "tt0000012" {
+            // Scout names the first release AV1: opened only for a player that decodes it.
+            let body = serde_json::json!({"streams": [
+                {"url": format!("http://{addr}/{p}/av1/av1.mkv"),
+                 "attributes": {"cached": true, "codec": "av1", "hdr": true, "bitDepth": 10, "label": "AV1"},
+                 "behaviorHints": {"filename": "av1-named.mkv"}},
+                {"url": format!("http://{addr}/{p}/h264.mkv"),
+                 "attributes": {"cached": true, "codec": "h264", "label": "H.264"},
+                 "behaviorHints": {"filename": "h264.mkv"}}
+            ]});
+            return origin_full(200, body.to_string());
+        }
         if imdb == "tt0000008" {
             // Four releases that won't open, ahead of one that does.
             let release = |url: String, filename: String| {
@@ -284,6 +298,7 @@ async fn origin_handle(
             "tt0000002" => "hevc.mkv",
             "tt0000003" => "h264.mp4",
             "tt0000009" => "slow/h264.mkv",
+            "tt0000011" => "av1.mkv",
             "tt0000004:1:2" if path.contains("/stream/series/") => "h264.mkv",
             _ => return origin_full(200, r#"{"streams":[]}"#),
         };
@@ -308,6 +323,13 @@ async fn origin_handle(
         let rest = match rest.strip_prefix("counted/") {
             Some(r) => {
                 COUNTED_PLAYS.fetch_add(1, Relaxed);
+                r
+            }
+            None => rest,
+        };
+        let rest = match rest.strip_prefix("av1/") {
+            Some(r) => {
+                AV1_PLAYS.fetch_add(1, Relaxed);
                 r
             }
             None => rest,
@@ -465,15 +487,22 @@ fn extinfs(media: &str) -> Vec<f64> {
 
 /// The whole path for one fixture: log in, create a session against the fake scout, fetch the
 /// playlists, then fetch segments out of order so the job has to restart — first mid-file, then
-/// behind itself, then at zero — and check every segment with ffprobe.
-async fn end_to_end(imdb: &str, fixture_name: &str, codec_prefix: &str, scoped: bool) {
+/// behind itself, then at zero — and check every segment with ffprobe. `extra` goes into the request
+/// (`,"playable":{…}`); the master playlist and the init come back for codec-specific checks.
+async fn end_to_end(
+    imdb: &str,
+    fixture_name: &str,
+    codec_prefix: &str,
+    scoped: bool,
+    extra: &str,
+) -> (String, Bytes) {
     let origin = origin().await;
     let state = test_state(&origin, 2, Duration::from_secs(600));
     let cookie = login(&state, "phone-key").await;
     // The scoped scout URL is the primary path; without one the server's own install is the fallback.
     let body = match scoped {
-        true => format!(r#"{{"imdb":"{imdb}","scout":"{origin}/{SCOPED}"}}"#),
-        false => format!(r#"{{"imdb":"{imdb}"}}"#),
+        true => format!(r#"{{"imdb":"{imdb}","scout":"{origin}/{SCOPED}"{extra}}}"#),
+        false => format!(r#"{{"imdb":"{imdb}"{extra}}}"#),
     };
     let r = call(&state, "POST", "/remux/session", Some(&cookie), &body).await;
     assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
@@ -597,6 +626,7 @@ async fn end_to_end(imdb: &str, fixture_name: &str, codec_prefix: &str, scoped: 
     assert_eq!(call(&state, "GET", &playlist, None, "").await.status, StatusCode::GONE);
     assert!(!dir.exists(), "scratch left behind");
     assert_eq!(state.scratch_bytes.load(Relaxed), 0);
+    (master.text(), init.body)
 }
 
 #[tokio::test]
@@ -617,19 +647,91 @@ async fn the_releases_list_names_and_labels_never_a_url() {
 #[tokio::test]
 #[ignore]
 async fn h264_matroska_end_to_end() {
-    end_to_end("tt0000001", "h264.mkv", "avc1.64", true).await;
+    end_to_end("tt0000001", "h264.mkv", "avc1.64", true, "").await;
 }
 
 #[tokio::test]
 #[ignore]
 async fn hevc_matroska_end_to_end() {
-    end_to_end("tt0000002", "hevc.mkv", "hvc1.1.6.L", false).await;
+    end_to_end("tt0000002", "hevc.mkv", "hvc1.1.6.L", false, "").await;
 }
 
 #[tokio::test]
 #[ignore]
 async fn mp4_end_to_end() {
-    end_to_end("tt0000003", "h264.mp4", "avc1.64", true).await;
+    end_to_end("tt0000003", "h264.mp4", "avc1.64", true, "").await;
+}
+
+/// AV1 copied: an `av01` sample entry with its `av1C` and HDR10's colours in the init, the same keyframe cuts and
+/// continuous timestamps as H.264 and HEVC, and a master naming the long codec string and PQ.
+#[tokio::test]
+#[ignore]
+async fn av1_matroska_end_to_end() {
+    let playable = r#","playable":{"h264":51,"av1":13,"av1Main10":13,"av1Hdr":true}"#;
+    let (master, init) = end_to_end("tt0000011", "av1.mkv", "av01.0.", true, playable).await;
+    assert!(master.contains("M.10.0.110.09.16.09.0,mp4a.40.2\",VIDEO-RANGE=PQ,"), "{master}");
+    let has = |fourcc: &[u8]| init.windows(4).any(|w| w == fourcc);
+    assert!(has(b"av01") && has(b"av1C") && has(b"colr"), "the av01 sample entry, its av1C and colr");
+    assert!(!has(b"hvc1") && !has(b"dvcC"));
+    let file = temp_dir().join("init.mp4");
+    std::fs::write(&file, &init).unwrap();
+    let stream = ffprobe(
+        &["-select_streams", "v:0", "-show_entries", "stream=codec_name,color_transfer", "-of", "csv=p=0"],
+        &file,
+    );
+    assert_eq!(stream.trim(), "av1,smpte2084", "the init alone describes AV1 in PQ");
+}
+
+/// An AV1 release plays for a player whose report says it decodes it — its level, its 10 bits, its PQ — named so in
+/// the master; for any other player it's passed over, never converted, and one scout names AV1 isn't even opened.
+/// Creating a session starts no ffmpeg.
+#[tokio::test]
+async fn av1_plays_only_for_a_player_that_reports_it() {
+    let origin = origin().await;
+    let state = test_state(&origin, 4, Duration::from_secs(600));
+    state.transcode_ok.store(true, Relaxed);
+    let body =
+        |imdb: &str, playable: &str| format!(r#"{{"imdb":"{imdb}","scout":"{origin}/cfg"{playable}}}"#);
+    let chrome = r#","playable":{"h264":51,"av1":13,"av1Main10":13,"av1Hdr":true}"#;
+    let r = call(&state, "POST", "/remux/session", None, &body("tt0000011", chrome)).await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let j = r.json();
+    let copied = serde_json::json!({
+        "codec": "av1", "transcoded": false, "width": 320, "height": 180, "tonemapped": false
+    });
+    assert_eq!(j["video"], copied);
+    let master = call(&state, "GET", j["playlist"].as_str().unwrap(), None, "").await.text();
+    assert!(
+        master.contains("CODECS=\"av01.0.") && master.contains(",VIDEO-RANGE=PQ,RESOLUTION=320x180"),
+        "{master}"
+    );
+    state.end_all("test").await;
+
+    // Found by the probe alone — scout names no codec — and beyond the player: nothing plays.
+    for refused in [
+        r#","playable":{"h264":51,"av1":13,"av1Main10":13}"#,
+        r#","playable":{"h264":51,"av1":13,"av1Hdr":true}"#,
+        r#","playable":{"h264":51,"hevcMain10":153,"hdr":true}"#,
+        "",
+    ] {
+        let r = call(&state, "POST", "/remux/session", None, &body("tt0000011", refused)).await;
+        assert_eq!(r.status, StatusCode::NOT_FOUND, "{refused}: {}", r.text());
+        assert_eq!(r.json()["error"], "no_playable_release", "{refused}");
+    }
+
+    // Named AV1 by scout: unopened for a player without AV1, which gets the H.264 release; first for one with it.
+    let r =
+        call(&state, "POST", "/remux/session", None, &body("tt0000012", r#","playable":{"h264":51}"#)).await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    assert_eq!(r.json()["release"]["filename"], "h264.mkv");
+    assert_eq!(AV1_PLAYS.load(Relaxed), 0, "the AV1 release was opened for a player without AV1");
+    state.end_all("test").await;
+    let r = call(&state, "POST", "/remux/session", None, &body("tt0000012", chrome)).await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    // Its own name: the release tt0000011 opened above is remembered, and would be taken without following /p/av1/.
+    assert_eq!(r.json()["release"]["filename"], "av1-named.mkv");
+    assert_eq!(AV1_PLAYS.load(Relaxed), 1);
+    state.end_all("test").await;
 }
 
 #[tokio::test]

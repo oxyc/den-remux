@@ -158,6 +158,21 @@ pub fn av1_codecs(av1c: &[u8], colour: Colour) -> Option<String> {
     Some(s)
 }
 
+/// An AV1 codec string's bit depth: `av01.0.13M.10` is 10.
+pub fn av1_bit_depth(codecs: &str) -> Option<u8> {
+    codecs.strip_prefix("av01.")?.split('.').nth(2)?.parse().ok()
+}
+
+/// HLS's VIDEO-RANGE for an AV1 codec string that names its transfer: PQ (16) or HLG (18). `None` for SDR, and for a
+/// string that doesn't say.
+pub fn av1_video_range(codecs: &str) -> Option<&'static str> {
+    match codecs.strip_prefix("av01.")?.split('.').nth(6)? {
+        "16" => Some("PQ"),
+        "18" => Some("HLG"),
+        _ => None,
+    }
+}
+
 /// Bits of an OBU, most significant first.
 struct Bits<'a> {
     b: &'a [u8],
@@ -532,6 +547,10 @@ mod tests {
         let pq = Colour { primaries: 9, transfer: 16, matrix: 9, full_range: Some(false) };
         let hdr10 = av1_codecs(&[0x81, 13, 0x4C, 0], pq).unwrap();
         assert_eq!(hdr10, "av01.0.13M.10.0.110.09.16.09.0");
+        assert_eq!((av1_bit_depth(&hdr10), av1_video_range(&hdr10)), (Some(10), Some("PQ")));
+        assert_eq!(av1_video_range("av01.0.13M.10.0.110.09.18.09.0"), Some("HLG"));
+        assert_eq!((av1_bit_depth("av01.0.08M.08"), av1_video_range("av01.0.08M.08")), (Some(8), None));
+        assert_eq!(av1_bit_depth("hvc1.2.4.L150.B0"), None);
     }
 
     #[test]

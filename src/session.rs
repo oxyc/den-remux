@@ -739,10 +739,8 @@ async fn open(
     let info = crate::probe::probe(&Source::Http { client: &st.http, url: &r.url }, &r.head)
         .await
         .map_err(|e| e.to_string())?;
-    match &info.video {
-        VideoCodec::Other(c) => return Err(format!("video is {c}, which needs a re-encode")),
-        VideoCodec::Av1 => return Err("video is AV1, which needs a re-encode".into()),
-        _ => {}
+    if let VideoCodec::Other(c) = &info.video {
+        return Err(format!("video is {c}, which needs a re-encode"));
     }
     if info.audio.is_empty() {
         return Err("no audio track".into());
@@ -782,8 +780,9 @@ pub struct Want<'a> {
 
 /// What the player decodes, as its own tests found (`playable` in `POST /remux/session`): the highest level it
 /// takes of 8-bit H.264 and of H.264 High 10 (`level_idc`), 8-bit and 10-bit HEVC (`general_level_idc`, level ×
-/// 30) and HEVC's High tier, 0 for none, and whether it decodes PQ HDR. An HEVC release beyond it is transcoded on
-/// the GPU; an H.264 one is passed over.
+/// 30) and HEVC's High tier, and of 8-bit and 10-bit AV1 at Main profile (`seq_level_idx`), 0 for none, and whether
+/// it decodes PQ HDR in HEVC and in AV1. An HEVC release beyond it is transcoded on the GPU; an H.264 or AV1 one is
+/// passed over.
 #[derive(serde::Deserialize, Clone, Copy, Debug, Default)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Playable {
@@ -801,6 +800,13 @@ pub struct Playable {
     pub eac3: bool,
     /// Which Dolby Vision the player shows as Dolby Vision rather than as its base layer. Absent is neither.
     pub dolby_vision: DolbyVisionPlay,
+    /// 8-bit AV1's highest `seq_level_idx` at Main profile and tier (8 is level 4.0, 13 is 5.1). Nothing on the box
+    /// converts AV1, so where this and `av1_main10` are 0 an AV1 release isn't tried at all.
+    pub av1: u16,
+    /// 10-bit AV1's.
+    pub av1_main10: u16,
+    /// Decodes 10-bit AV1 with PQ.
+    pub av1_hdr: bool,
 }
 
 /// `playable.dolbyVision`: profile 5 (no base layer at all; Safari shows it, Chrome can't) and profile 8.x shown as
@@ -829,7 +835,8 @@ impl std::fmt::Display for Playable {
             (false, true) => ", Dolby Vision 8",
             (false, false) => "",
         };
-        write!(f, "{hdr}{dv}")
+        let av1_hdr = if self.av1_hdr { ", AV1 HDR" } else { "" };
+        write!(f, "{hdr}, AV1 L{}, AV1 10-bit L{}{av1_hdr}{dv}", self.av1, self.av1_main10)
     }
 }
 
@@ -854,12 +861,26 @@ impl Playable {
                 };
                 fits(max) && (!info.hdr || self.hdr)
             }
-            VideoCodec::Av1 | VideoCodec::Other(_) => false,
+            VideoCodec::Av1 => {
+                // Main profile at Main tier is all a player is asked about; a Main decoder takes 8-bit and 10-bit.
+                let max = match (named, info.codecs.as_deref().and_then(crate::probe::av1_bit_depth)) {
+                    (Some((profile, _, high_tier)), _) if profile != 0 || high_tier => 0,
+                    (_, Some(10)) => self.av1_main10,
+                    (_, Some(8) | None) => self.av1.max(self.av1_main10),
+                    _ => 0,
+                };
+                fits(max) && (!info.hdr || self.av1_hdr)
+            }
+            VideoCodec::Other(_) => false,
         }
     }
 
     fn takes_hevc(&self) -> bool {
         self.hevc_main > 0 || self.hevc_main10 > 0
+    }
+
+    fn takes_av1(&self) -> bool {
+        self.av1 > 0 || self.av1_main10 > 0
     }
 }
 
@@ -920,11 +941,15 @@ pub(crate) fn tonemaps(info: &crate::probe::MediaInfo) -> bool {
 }
 
 /// Whether the player takes the release's video as it is: by `playable`, else by `videoCodecs`, which can only say
-/// that it takes no HEVC.
+/// that it takes no HEVC — and never that it takes AV1, which only `playable` reports.
 fn plays(want: &Want<'_>, takes_hevc: bool, info: &crate::probe::MediaInfo) -> bool {
     match want.playable {
         Some(p) => p.takes(info),
-        None => info.video != VideoCodec::Hevc || takes_hevc,
+        None => match info.video {
+            VideoCodec::Hevc => takes_hevc,
+            VideoCodec::Av1 => false,
+            _ => true,
+        },
     }
 }
 
@@ -966,6 +991,15 @@ pub(crate) fn fit(a: &scout::Attributes, playable: Option<&Playable>, takes_hevc
             // 3840 × 2160 needs level 5.0.
             if max == 0 || (uhd && max < 150) || (a.hdr && !p.hdr) {
                 Fit::Convert
+            } else {
+                Fit::Copy
+            }
+        }
+        (Some("av1"), p) => {
+            let max = p.map_or(0, |p| if ten_bit { p.av1_main10 } else { p.av1.max(p.av1_main10) });
+            // 3840 × 2160 needs level 5.0, `seq_level_idx` 12. Nothing converts AV1: what won't play isn't opened.
+            if max == 0 || (uhd && max < 12) || (a.hdr && !p.is_some_and(|p| p.av1_hdr)) {
+                Fit::Never
             } else {
                 Fit::Copy
             }
@@ -1068,7 +1102,8 @@ pub async fn releases(
         Admission::Install => None,
     };
     let source = scout::ScoutSource { base: scout_base(st, scout)?, key };
-    Ok(scout::candidates(&scout_list(st, &source, id, by_install).await?, None))
+    // No capability report comes with this request, so no AV1: nothing says the player decodes it.
+    Ok(scout::candidates(&scout_list(st, &source, id, by_install).await?, None, false))
 }
 
 /// `POST /remux/session`: pick and probe a release, choose its audio track, and set up its session.
@@ -1117,7 +1152,8 @@ pub async fn create(
     };
     let secrets = [source.base.as_str()];
     let list = scout_list(st, &source, imdb, by_install).await?;
-    let mut candidates = scout::candidates(&list, want.filename);
+    let mut candidates =
+        scout::candidates(&list, want.filename, want.playable.is_some_and(Playable::takes_av1));
     if candidates.is_empty() {
         return Err(api(
             StatusCode::NOT_FOUND,
@@ -1203,7 +1239,7 @@ pub async fn create(
                         break;
                     }
                 }
-                // H.264 beyond the player: nothing here makes it smaller.
+                // H.264 or AV1 beyond the player: nothing here makes H.264 smaller, or converts AV1 at all.
                 Ok((_, info)) if !plays(want, takes_hevc, &info) => eprintln!(
                     "session: {imdb} skipped \"{}\": {} is beyond this player",
                     c.attributes.label,
@@ -1282,6 +1318,7 @@ pub async fn create(
         // A file without a codec configuration record; name the commonest profile rather than none.
         match info.video {
             VideoCodec::Hevc => "hvc1.1.6.L150.90",
+            VideoCodec::Av1 => "av01.0.08M.08",
             _ => "avc1.640028",
         }
         .to_string()
@@ -1308,6 +1345,11 @@ pub async fn create(
     let (codecs, dv_signal) = match kept_dv.and_then(dolby_vision_signal) {
         Some((own, supplemental, range)) => {
             (own.unwrap_or(codecs), Some(playlist::DolbyVision { supplemental, range }))
+        }
+        // A copied HDR AV1 names its range, which its codec string's transfer gives.
+        None if transcode.is_none() && info.video == VideoCodec::Av1 => {
+            let range = crate::probe::av1_video_range(&codecs);
+            (codecs, range.map(|range| playlist::DolbyVision { supplemental: None, range }))
         }
         None => (codecs, None),
     };
@@ -1492,7 +1534,10 @@ mod tests {
         let bluray = info(VideoCodec::Hevc, "hvc1.2.4.H153.B0", true);
         assert!(!phone.takes(&bluray), "High tier, which an iPhone doesn't decode");
         assert!(Playable { hevc_high_tier: 153, ..phone }.takes(&bluray), "an Android phone that does");
-        assert_eq!(phone.to_string(), "H.264 L51, High 10 L0, HEVC L153, 10-bit L153, High tier L0, HDR");
+        assert_eq!(
+            phone.to_string(),
+            "H.264 L51, High 10 L0, HEVC L153, 10-bit L153, High tier L0, HDR, AV1 L0, AV1 10-bit L0"
+        );
         assert!(!Playable { hdr: false, ..phone }.takes(&hobbit), "HDR it can't decode is converted");
         assert!(!Playable { hevc_main10: 0, ..phone }.takes(&hobbit), "8-bit HEVC only");
         assert!(!Playable { hevc_main10: 123, ..phone }.takes(&hobbit), "1080p at most");
@@ -1502,6 +1547,27 @@ mod tests {
         assert!(firefox.takes(&info(VideoCodec::H264, "avc1.640029", false)));
         assert!(!firefox.takes(&hobbit) && !firefox.takes_hevc());
         assert!(!Playable { h264: 0x29, ..firefox }.takes(&info(VideoCodec::H264, "avc1.640033", false)));
+    }
+
+    #[test]
+    fn av1_plays_as_it_is_at_the_levels_depth_and_hdr_the_player_reports() {
+        let chrome = Playable { h264: 0x33, av1: 13, av1_main10: 13, av1_hdr: true, ..Playable::default() };
+        let hdr10 = info(VideoCodec::Av1, "av01.0.12M.10.0.110.09.16.09.0", true);
+        assert!(chrome.takes(&hdr10));
+        assert!(!Playable { av1_hdr: false, ..chrome }.takes(&hdr10), "PQ it can't decode is passed over");
+        assert!(!Playable { av1_main10: 0, ..chrome }.takes(&hdr10), "8-bit AV1 only");
+        assert!(!Playable { av1_main10: 9, ..chrome }.takes(&hdr10), "1080p at most");
+        let sdr = info(VideoCodec::Av1, "av01.0.08M.08", false);
+        assert!(Playable { av1: 0, av1_main10: 8, ..chrome }.takes(&sdr), "a 10-bit decoder takes 8-bit");
+        assert!(!Playable { av1: 0, av1_main10: 0, ..chrome }.takes(&sdr));
+        assert!(
+            !chrome.takes(&info(VideoCodec::Av1, "av01.0.13H.10", false)),
+            "High tier: never asked about"
+        );
+        let high = info(VideoCodec::Av1, "av01.1.08M.08.0.000.01.01.01.0", false);
+        assert!(!chrome.takes(&high), "High profile, 4:4:4");
+        assert!(!chrome.takes(&info(VideoCodec::Av1, "av01.2.08M.12", false)), "12-bit");
+        assert!(chrome.to_string().ends_with("AV1 L13, AV1 10-bit L13, AV1 HDR"), "{chrome}");
     }
 
     #[test]
@@ -1567,6 +1633,26 @@ mod tests {
         assert_eq!(fit(&a("hevc"), None, false), Fit::Convert, "videoCodecs without HEVC");
         let unknown = scout::Attributes::default();
         assert_eq!(fit(&unknown, Some(&firefox), false), Fit::Copy, "unknown: the probe decides");
+        let chrome = Playable { h264: 0x33, av1: 13, av1_main10: 13, ..Playable::default() };
+        assert_eq!(fit(&a("av1"), Some(&chrome), false), Fit::Copy, "AV1 the player decodes is copied");
+        assert_eq!(fit(&a("av1"), Some(&firefox), false), Fit::Never, "and never converted");
+        assert_eq!(fit(&a("av1"), None, true), Fit::Never, "without a report nothing says it plays");
+        let ten_bit_av1 = scout::Attributes { bit_depth: 10, ..a("av1") };
+        assert_eq!(
+            fit(&ten_bit_av1, Some(&Playable { av1_main10: 0, ..chrome }), false),
+            Fit::Never,
+            "8-bit only"
+        );
+        let uhd_av1 = scout::Attributes { resolution: Some("2160p".into()), ..ten_bit_av1 };
+        assert_eq!(
+            fit(&uhd_av1, Some(&Playable { av1_main10: 9, ..chrome }), false),
+            Fit::Never,
+            "1080p at most"
+        );
+        assert_eq!(fit(&uhd_av1, Some(&chrome), false), Fit::Copy);
+        let hdr_av1 = scout::Attributes { hdr: true, ..uhd_av1 };
+        assert_eq!(fit(&hdr_av1, Some(&chrome), false), Fit::Never, "HDR without av1Hdr");
+        assert_eq!(fit(&hdr_av1, Some(&Playable { av1_hdr: true, ..chrome }), false), Fit::Copy);
     }
 
     #[test]

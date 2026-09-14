@@ -39,7 +39,9 @@ WORKDIR /tmp/ffmpeg-${FFMPEG_VERSION}
 #              (to learn the B-frame reorder delay — without them ffmpeg guesses every copied packet's
 #              DTS), and a transcode decodes through them with the VAAPI hwaccels below.
 #   encoders   aac (ffmpeg's native, stereo 192k); h264_vaapi for a transcode
-#   parsers    for the codecs the demuxers hand over unparsed
+#   parsers    for the codecs the demuxers hand over unparsed. av1: Matroska asks for AV1's headers parsed, and
+#              the parser reads the pixel format and colours from the sequence header. A copy of AV1 needs no
+#              decoder: its packets are never reordered, so there is no delay to learn by probing
 #   filters    the audio graph -ac 2 builds (resample/downmix, format negotiation, the buffer
 #              endpoints every graph has); scale_vaapi and tonemap_vaapi for a transcode
 #   bsfs       dovi_rpu and filter_units: a copied Dolby Vision stream loses its RPU and enhancement layer
@@ -58,7 +60,7 @@ RUN ./configure \
       --enable-decoder=h264,hevc,aac,ac3,eac3,dca,truehd,mlp,flac,opus,mp3,mp2,vorbis,pcm_s16le,pcm_s24le,pcm_s32le,pcm_f32le,pcm_s16be,pcm_s24be \
       --enable-hwaccel=h264_vaapi,hevc_vaapi \
       --enable-encoder=aac,h264_vaapi \
-      --enable-parser=h264,hevc,aac,ac3,dca,mlp,flac,opus,mpegaudio,vorbis \
+      --enable-parser=av1,h264,hevc,aac,ac3,dca,mlp,flac,opus,mpegaudio,vorbis \
       --enable-filter=aresample,aformat,anull,atrim,abuffer,abuffersink,null,trim,buffer,buffersink,format,scale_vaapi,tonemap_vaapi \
       --enable-bsf=dovi_rpu,filter_units \
       --enable-swresample \

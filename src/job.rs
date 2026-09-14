@@ -50,7 +50,7 @@ const STDERR_TAIL: usize = 2048;
 pub enum Video {
     Copy {
         /// The sample entry to write: `hvc1` for HEVC (Safari plays HEVC in fMP4 only under it, not `hev1`), `dvh1`
-        /// for Dolby Vision profile 5 kept as it is; `None` leaves H.264's own.
+        /// for Dolby Vision profile 5 kept as it is; `None` leaves the muxer's own: `avc1` for H.264, `av01` for AV1.
         tag: Option<&'static str>,
         dovi: Dovi,
     },
