@@ -38,6 +38,10 @@ const TICK: Duration = Duration::from_millis(500);
 /// Timestamps within this of each other name the same keyframe. Keyframes are at least a few frames
 /// apart; ffmpeg's playlist rounds durations to the microsecond.
 const SNAP: f64 = 0.05;
+/// A resume's first job starts at the segment this far before `startAt`, not the one `startAt` falls in: a
+/// player may ask for the segment before when the point is near a boundary (hls.js allows a quarter second),
+/// and a job already behind that request is kept, where one ahead of it would be restarted.
+const START_SLACK: f64 = 1.0;
 /// ffmpeg runs in a row that produced nothing before the session gives up on its source.
 const MAX_FAILURES: u32 = 3;
 /// How many releases to resolve and probe before giving up on a title.
@@ -164,6 +168,13 @@ fn seg_at(segments: &[Segment], t: f64) -> usize {
     segments.partition_point(|s| s.start <= t + SNAP).saturating_sub(1)
 }
 
+/// The segment a session's first job heads for: the one a resume at `start_at` plays, less `START_SLACK`. The
+/// init request starts that job, so a resume runs ffmpeg once, from there, instead of from zero and again
+/// after the player's seek.
+pub(crate) fn start_segment(segments: &[Segment], start_at: f64) -> usize {
+    seg_at(segments, (start_at - START_SLACK).max(0.0))
+}
+
 /// The GOPs that make up `seg`, in order, when they are all on disk: a GOP starting on the segment's
 /// first keyframe, then its job's following GOPs until the segment's end is covered — or until the
 /// job's last GOP, when that job ran to the end of the file.
@@ -214,6 +225,12 @@ impl Session {
 
     pub fn touch(&self) {
         self.lock().last_seen = Instant::now();
+    }
+
+    /// The segment production follows. Tests use it to see where a resume's first job will start.
+    #[cfg(test)]
+    pub fn wanted(&self) -> usize {
+        self.lock().want
     }
 
     /// Take what the job has finished since the last look: its exit, and the GOPs in its playlist.
@@ -712,6 +729,8 @@ pub struct Want<'a> {
     pub video_codecs: &'a [String],
     /// What the player decodes, level by level; when given, it decides over `video_codecs`.
     pub playable: Option<&'a Playable>,
+    /// Seconds into the title the player starts at: a resume. 0 from the start.
+    pub start_at: f64,
 }
 
 /// What the player decodes, as its own tests found (`playable` in `POST /remux/session`): the highest level it
@@ -1041,6 +1060,9 @@ pub async fn create(
     }
     st.scratch_ok.store(true, Relaxed);
     let segments = playlist::segments(&info.keyframes, info.duration, playlist::TARGET_SECS);
+    // A resume at or past the end starts the title over.
+    let start_at = Some(want.start_at).filter(|t| *t > 0.0 && *t < info.duration).unwrap_or(0.0);
+    let first_segment = start_segment(&segments, start_at);
     let codecs = info.codecs.clone().unwrap_or_else(|| {
         // A file without a codec configuration record; name the commonest profile rather than none.
         match info.video {
@@ -1071,7 +1093,7 @@ pub async fn create(
         .unwrap_or_default();
     let session = Arc::new(Session {
         master: playlist::master(&codecs, peak, avg, Some(resolution), &renditions),
-        media: playlist::media(&segments),
+        media: playlist::media(&segments, start_at),
         sid: sid.clone(),
         sig,
         exp,
@@ -1094,7 +1116,7 @@ pub async fn create(
             finished: Vec::new(),
             init: None,
             last_seen: Instant::now(),
-            want: 0,
+            want: first_segment,
             ended: false,
             bytes: 0,
             failures: 0,
@@ -1278,6 +1300,16 @@ mod tests {
         assert_eq!(seg_index("seg99999999.m4s"), None);
         assert!(is_session_file("init.mp4") && is_session_file("media.m3u8"));
         assert!(!is_session_file("../gops.m3u8"));
+    }
+
+    #[test]
+    fn a_resume_starts_its_job_a_little_before_the_point() {
+        let segs =
+            playlist::segments(&[0.0, 2.5, 5.0, 8.0, 10.5, 13.0, 16.0, 19.5, 22.0, 24.0, 27.5], 30.021, 6.0);
+        assert_eq!(start_segment(&segs, 0.0), 0);
+        assert_eq!(start_segment(&segs, 17.0), 2, "13 → 19.5 plays 17");
+        assert_eq!(start_segment(&segs, 13.5), 1, "near 13 a player may ask for the segment before it");
+        assert_eq!(start_segment(&segs, 0.5), 0);
     }
 
     #[test]

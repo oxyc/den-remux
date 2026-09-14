@@ -491,14 +491,19 @@ where
         #[serde(default)]
         video_codecs: Vec<String>,
         playable: Option<session::Playable>,
+        start_at: Option<f64>,
     }
     let Some(req) = read_body(body).await.and_then(|b| serde_json::from_slice::<Create>(&b).ok()) else {
         return bad_request(
             "Expected {\"imdb\": \"tt…\", \"season\"?: n, \"episode\"?: n, \"filename\"?: \"…\", \"scout\"?: \"…\", \
              \"audio\"?: [\"en\", …], \"audioTrack\"?: n, \"subtitles\"?: \"…\", \"subtitleLanguages\"?: [\"en\", …], \
-             \"videoCodecs\"?: [\"h264\", \"hevc\"], \"playable\"?: {\"h264\", \"hevcMain\", \"hevcMain10\", \"hevcHighTier\", \"hdr\"}}.",
+             \"videoCodecs\"?: [\"h264\", \"hevc\"], \"playable\"?: {\"h264\", \"hevcMain\", \"hevcMain10\", \"hevcHighTier\", \"hdr\"}, \
+             \"startAt\"?: seconds}.",
         );
     };
+    if req.start_at.is_some_and(|t| !t.is_finite() || t < 0.0) {
+        return bad_request("startAt is seconds into the title, 0 or more.");
+    }
     // A logged-in browser, or — with no cookie — whoever holds the scout install the request names: that
     // URL is the credential, as every addon's is. Without either there is nothing to play with.
     let admission = match (browser, &req.scout) {
@@ -535,6 +540,7 @@ where
         subtitle_languages: &req.subtitle_languages,
         video_codecs: &req.video_codecs,
         playable: req.playable.as_ref(),
+        start_at: req.start_at.unwrap_or(0.0),
     };
     match session::create(state, admission, &want).await {
         Ok(s) => httputil::json(

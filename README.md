@@ -17,7 +17,7 @@ This is the MVP ("phase 2") of oxyc/den#11: movies and episodes, cached releases
 ```
 POST   /remux/login                     {key} → 204 + Set-Cookie + X-Den-Browser-Token; 401 bad_key · 429 rate_limited
 POST   /remux/session                   {imdb, season?, episode?, filename?, scout?, audio?, audioTrack?,
-                                         subtitles?, subtitleLanguages?, videoCodecs?, playable?} (a full scout install,
+                                         subtitles?, subtitleLanguages?, videoCodecs?, playable?, startAt?} (a full scout install,
                                          or browser cookie/bearer) → 201
                                         {sid, playlist, release:{label,filename,size}, duration, expiresAt,
                                          video:{codec,transcoded}, audioTrack, audioTracks, subtitles}
@@ -29,7 +29,8 @@ POST   /remux/releases                  {imdb, season?, episode?, scout?} (a ful
                                         → 200 {releases:[{label,filename,size}]}: what a session could play, in the
                                         order it would try them, for a player to name one as `filename`. No URLs
 GET    /remux/s/<sid>/<sig>/master.m3u8 one variant: CODECS "<avc1…|hvc1…>,mp4a.40.2", BANDWIDTH from size/duration
-GET    /remux/s/<sid>/<sig>/media.m3u8  VOD, #EXT-X-MAP init.mp4, segments on real keyframes, #EXT-X-ENDLIST
+GET    /remux/s/<sid>/<sig>/media.m3u8  VOD, #EXT-X-MAP init.mp4, segments on real keyframes, #EXT-X-ENDLIST;
+                                        #EXT-X-START:TIME-OFFSET=<startAt>,PRECISE=YES for a resume
 GET    /remux/s/<sid>/<sig>/init.mp4
 GET    /remux/s/<sid>/<sig>/seg<N>.m4s  200 when made (waits up to 20 s), else 503 + Retry-After: 2
 GET    /remux/s/<sid>/<sig>/sub<N>.m3u8 a subtitle rendition: one WebVTT segment spanning the film
@@ -69,6 +70,9 @@ anything else                           404 {"error":"not_found"}
   reported. A release is probed first and its own codec string
   compared: an HEVC one beyond the player (10-bit, 4K, or HDR it can't decode) is transcoded, an H.264 one passed
   over.
+- **Resume.** `startAt` is the second the player starts at. The media playlist names it (`EXT-X-START`, so
+  Safari's native player starts there), and the first job starts a segment before it rather than at zero, so a
+  resume runs ffmpeg once instead of twice. Negative is a 400; at or past the end starts from zero.
 - **Which release.** Scout ranks for a TV, best first; here it is re-ranked for a phone or a laptop, often over
   the tailnet: 1080p before 720p or unnamed before 4K, and within each a web release before a remux and one
   without Dolby Vision before one with (scout's order holds within each). Of the first three that probe, the

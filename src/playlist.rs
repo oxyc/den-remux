@@ -38,13 +38,18 @@ pub fn segments(keyframes: &[f64], duration: f64, target: f64) -> Vec<Segment> {
 }
 
 /// The media playlist. VOD, so the player knows the whole timeline up front and can seek anywhere
-/// before a single segment exists.
-pub fn media(segs: &[Segment]) -> String {
+/// before a single segment exists. A `start` past zero is a resume: `EXT-X-START` with `PRECISE=YES`
+/// has a native HLS player (Safari's) begin there instead of at zero and then seeking.
+pub fn media(segs: &[Segment], start: f64) -> String {
     let target = segs.iter().map(|s| s.end - s.start).fold(0.0, f64::max).ceil().max(1.0) as u64;
     let mut out = format!(
         "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:{target}\n#EXT-X-MEDIA-SEQUENCE:0\n\
-         #EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-INDEPENDENT-SEGMENTS\n#EXT-X-MAP:URI=\"init.mp4\"\n"
+         #EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-INDEPENDENT-SEGMENTS\n"
     );
+    if start > 0.0 {
+        out.push_str(&format!("#EXT-X-START:TIME-OFFSET={start:.3},PRECISE=YES\n"));
+    }
+    out.push_str("#EXT-X-MAP:URI=\"init.mp4\"\n");
     for (i, s) in segs.iter().enumerate() {
         out.push_str(&format!("#EXTINF:{:.6},\nseg{i}.m4s\n", s.end - s.start));
     }
@@ -137,7 +142,8 @@ mod tests {
     #[test]
     fn the_media_playlist_sums_to_the_duration() {
         let segs = segments(&KF, 30.021, TARGET_SECS);
-        let m = media(&segs);
+        let m = media(&segs, 0.0);
+        assert!(!m.contains("EXT-X-START"), "a start from zero names no start point");
         let total: f64 = m
             .lines()
             .filter_map(|l| l.strip_prefix("#EXTINF:"))
@@ -151,6 +157,13 @@ mod tests {
         assert!(m.contains("#EXT-X-TARGETDURATION:8\n"), "{m}");
         assert_eq!(m.matches(".m4s").count(), segs.len());
         assert!(m.contains("seg0.m4s") && m.contains("seg4.m4s"));
+    }
+
+    #[test]
+    fn a_resume_names_its_start_point() {
+        let m = media(&segments(&KF, 30.021, TARGET_SECS), 14.25);
+        let start = "#EXT-X-INDEPENDENT-SEGMENTS\n#EXT-X-START:TIME-OFFSET=14.250,PRECISE=YES\n#EXT-X-MAP";
+        assert!(m.contains(start), "{m}");
     }
 
     #[test]

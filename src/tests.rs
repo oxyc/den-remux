@@ -915,6 +915,36 @@ async fn the_audio_track_follows_the_browsers_languages() {
     state.end_all("test").await;
 }
 
+/// A resume names its point: the media playlist starts a native player there, and the session's first job heads
+/// for the segment it plays (h264.mkv's 13 → 19.5 for 14.5, less the slack of a second). Past the end, or
+/// without `startAt`, it starts from zero; a negative point is refused. Creating a session starts no ffmpeg.
+#[tokio::test]
+async fn a_resume_starts_where_the_player_does() {
+    let origin = origin().await;
+    let state = test_state(&origin, 2, Duration::from_secs(600));
+    let cookie = login(&state, "phone-key").await;
+    let cases = [(Some(14.5), Some("14.500"), 2), (Some(90.0), None, 0), (None, None, 0)];
+    for (start, offset, segment) in cases {
+        let extra = start.map(|s| format!(r#","startAt":{s}"#)).unwrap_or_default();
+        let body = format!(r#"{{"imdb":"tt0000001"{extra}}}"#);
+        let r = call(&state, "POST", "/remux/session", Some(&cookie), &body).await;
+        assert_eq!(r.status, StatusCode::CREATED, "{extra}: {}", r.text());
+        let j = r.json();
+        let base = j["playlist"].as_str().unwrap().trim_end_matches("master.m3u8").to_string();
+        let media = call(&state, "GET", &format!("{base}media.m3u8"), None, "").await.text();
+        let named = offset.map(|o| format!("#EXT-X-START:TIME-OFFSET={o},PRECISE=YES\n"));
+        match named {
+            Some(tag) => assert!(media.contains(&tag), "{media}"),
+            None => assert!(!media.contains("EXT-X-START"), "{extra}: {media}"),
+        }
+        assert_eq!(state.session(j["sid"].as_str().unwrap()).unwrap().wanted(), segment, "{extra}");
+    }
+    let negative = r#"{"imdb":"tt0000001","startAt":-3}"#;
+    let r = call(&state, "POST", "/remux/session", Some(&cookie), negative).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    state.end_all("test").await;
+}
+
 /// Subtitle renditions: named in the master, one WebVTT segment each, fetched from den-subtitles with the
 /// release's hash; a language whose subtitle is on another origin serves an empty document, and an install
 /// off `SUBTITLE_ORIGINS` is refused up front.
