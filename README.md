@@ -63,9 +63,11 @@ anything else                           404 {"error":"not_found"}
   Chromecast); empty is H.264 and HEVC. Without HEVC, H.264 releases are tried first, and an HEVC-only
   title is transcoded to H.264 on the GPU (Hardware transcode, below) — or refused with
   `transcode_unavailable` while transcoding is off or in use.
-- **What the player decodes.** `playable` — `{h264, hevcMain, hevcMain10, hevcHighTier, hdr}`, the highest level
-  it takes of H.264 (`level_idc`, 0x33 is 5.1), of 8-bit and 10-bit HEVC (level × 30, 153 is 5.1) and of HEVC's
-  High tier, 0 for none, and whether it decodes PQ HDR — decides over `videoCodecs` when given. A UHD Blu-ray
+- **What the player decodes.** `playable` — `{h264, h264High10, hevcMain, hevcMain10, hevcHighTier, hdr}`, the
+  highest level it takes of 8-bit H.264 and of H.264 High 10 (`level_idc`, 0x33 is 5.1), of 8-bit and 10-bit HEVC
+  (level × 30, 153 is 5.1) and of HEVC's High tier, 0 for none, and whether it decodes PQ HDR — decides over
+  `videoCodecs` when given. A High 10 release (profile 110) is passed over unless `h264High10` reaches its level:
+  the box's GPU has no High 10 decoder to convert it. A UHD Blu-ray
   remux is often High tier, which Apple's decoders refuse whatever their tests say, so the web app reports 0 on
   them; a player that sends no `hevcHighTier` has it converted. The session's log line says what the player
   reported. A release is probed first and its own codec string

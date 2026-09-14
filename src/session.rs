@@ -734,13 +734,16 @@ pub struct Want<'a> {
 }
 
 /// What the player decodes, as its own tests found (`playable` in `POST /remux/session`): the highest level it
-/// takes of H.264 (`level_idc`), 8-bit and 10-bit HEVC (`general_level_idc`, level × 30) and HEVC's High tier, 0
-/// for none, and whether it decodes PQ HDR. An HEVC release beyond it is transcoded on the GPU; an H.264 one is
-/// passed over.
+/// takes of 8-bit H.264 and of H.264 High 10 (`level_idc`), 8-bit and 10-bit HEVC (`general_level_idc`, level ×
+/// 30) and HEVC's High tier, 0 for none, and whether it decodes PQ HDR. An HEVC release beyond it is transcoded on
+/// the GPU; an H.264 one is passed over.
 #[derive(serde::Deserialize, Clone, Copy, Debug, Default)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Playable {
     pub h264: u16,
+    /// 10-bit H.264 (High 10, profile 110) — almost only anime Hi10P. Safari decodes none; Chrome decodes it in
+    /// software. Not transcoded when it's 0: the box's GPU has no High 10 decoder.
+    pub h264_high10: u16,
     pub hevc_main: u16,
     pub hevc_main10: u16,
     /// A UHD Blu-ray remux is often High tier. Apple's decoders refuse it, whatever their tests say, so the web app
@@ -752,8 +755,9 @@ pub struct Playable {
 impl std::fmt::Display for Playable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let hdr = if self.hdr { ", HDR" } else { "" };
-        let (h264, main, main10, high) = (self.h264, self.hevc_main, self.hevc_main10, self.hevc_high_tier);
-        write!(f, "H.264 L{h264}, HEVC L{main}, 10-bit L{main10}, High tier L{high}{hdr}")
+        let (h264, high10) = (self.h264, self.h264_high10);
+        let (main, main10, high) = (self.hevc_main, self.hevc_main10, self.hevc_high_tier);
+        write!(f, "H.264 L{h264}, High 10 L{high10}, HEVC L{main}, 10-bit L{main10}, High tier L{high}{hdr}")
     }
 }
 
@@ -764,7 +768,11 @@ impl Playable {
         let named = info.codecs.as_deref().and_then(crate::probe::profile_level);
         let fits = |max: u16| max > 0 && named.is_none_or(|(_, level, _)| level <= max);
         match info.video {
-            VideoCodec::H264 => fits(self.h264),
+            // High 10 is its own decoder, reported at its own level; every other H.264 profile is 8-bit here.
+            VideoCodec::H264 => match named {
+                Some((110, _, _)) => fits(self.h264_high10),
+                _ => fits(self.h264),
+            },
             VideoCodec::Hevc => {
                 let max = match named {
                     Some((_, _, true)) => self.hevc_high_tier,
@@ -1226,13 +1234,20 @@ mod tests {
 
     #[test]
     fn a_player_takes_what_its_levels_and_hdr_allow() {
-        let phone = Playable { h264: 0x33, hevc_main: 153, hevc_main10: 153, hevc_high_tier: 0, hdr: true };
+        let phone = Playable {
+            h264: 0x33,
+            hevc_main: 153,
+            hevc_main10: 153,
+            hevc_high_tier: 0,
+            hdr: true,
+            ..Playable::default()
+        };
         let hobbit = info(VideoCodec::Hevc, "hvc1.2.4.L153.B0", true);
         assert!(phone.takes(&hobbit));
         let bluray = info(VideoCodec::Hevc, "hvc1.2.4.H153.B0", true);
         assert!(!phone.takes(&bluray), "High tier, which an iPhone doesn't decode");
         assert!(Playable { hevc_high_tier: 153, ..phone }.takes(&bluray), "an Android phone that does");
-        assert_eq!(phone.to_string(), "H.264 L51, HEVC L153, 10-bit L153, High tier L0, HDR");
+        assert_eq!(phone.to_string(), "H.264 L51, High 10 L0, HEVC L153, 10-bit L153, High tier L0, HDR");
         assert!(!Playable { hdr: false, ..phone }.takes(&hobbit), "HDR it can't decode is converted");
         assert!(!Playable { hevc_main10: 0, ..phone }.takes(&hobbit), "8-bit HEVC only");
         assert!(!Playable { hevc_main10: 123, ..phone }.takes(&hobbit), "1080p at most");
@@ -1242,6 +1257,17 @@ mod tests {
         assert!(firefox.takes(&info(VideoCodec::H264, "avc1.640029", false)));
         assert!(!firefox.takes(&hobbit) && !firefox.takes_hevc());
         assert!(!Playable { h264: 0x29, ..firefox }.takes(&info(VideoCodec::H264, "avc1.640033", false)));
+    }
+
+    #[test]
+    fn ten_bit_h264_plays_only_where_high_10_is_decoded() {
+        let hi10p = info(VideoCodec::H264, "avc1.6e0028", false);
+        let safari = Playable { h264: 0x33, ..Playable::default() };
+        assert!(!safari.takes(&hi10p), "8-bit H.264 at any level is not High 10");
+        let chrome = Playable { h264_high10: 0x33, ..safari };
+        assert!(chrome.takes(&hi10p));
+        assert!(!Playable { h264_high10: 0x1f, ..chrome }.takes(&hi10p), "level 4.0 is past 3.1");
+        assert!(chrome.takes(&info(VideoCodec::H264, "avc1.640028", false)), "8-bit High still by `h264`");
     }
 
     #[test]
