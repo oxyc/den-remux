@@ -5,7 +5,7 @@ laptop cannot play what den-scout returns: Matroska, and Dolby/DTS/TrueHD audio.
 video, re-encodes the audio to AAC stereo, and serves HLS (fMP4) cut on the file's own keyframes.
 
 ```
-browser ──POST /remux/session {imdb, scout}───►  scout (the library's install URL, its credential) → cached H.264/HEVC release
+browser ──POST /remux/session {imdb, scout}───►  scout (the library's install URL, its credential) → cached H.264/HEVC/AV1 release
         ◄──{ playlist: /remux/s/<sid>/<sig>/master.m3u8 }       probe: duration, tracks, keyframe index
 <video> ──GET /remux/s/<sid>/<sig>/seg<N>.m4s─►  ffmpeg: -c:v copy -c:a aac, one fMP4 file per GOP
 ```
@@ -20,7 +20,7 @@ POST   /remux/session                   {imdb, season?, episode?, filename?, sco
                                          subtitles?, subtitleLanguages?, videoCodecs?, playable?, startAt?} (a full scout install,
                                          or browser cookie/bearer) → 201
                                         {sid, playlist, release:{label,filename,size}, duration, expiresAt,
-                                         video:{codec,transcoded}, audioTrack, audioTracks, subtitles}
+                                         video:{codec: h264|hevc|av1, transcoded}, audioTrack, audioTracks, subtitles}
                                         401 not_logged_in · 403 scout_refused
                                         400 bad_request/bad_scout/bad_subtitles/bad_audio_track
                                         404 no_release/no_playable_release · 429 too_many_sessions/rate_limited
@@ -28,8 +28,9 @@ POST   /remux/session                   {imdb, season?, episode?, filename?, sco
 POST   /remux/releases                  {imdb, season?, episode?, scout?} (a full scout install, or browser cookie/bearer)
                                         → 200 {releases:[{label,filename,size}]}: what a session could play, in the
                                         order it would try them, for a player to name one as `filename`. No URLs
-GET    /remux/s/<sid>/<sig>/master.m3u8 one variant: CODECS "<avc1…|hvc1…>,mp4a.40.2", BANDWIDTH from size/duration;
-                                        copied Dolby audio: CODECS "…,ec-3|ac-3" and an AUDIO rendition with CHANNELS
+GET    /remux/s/<sid>/<sig>/master.m3u8 one variant: CODECS "<avc1…|hvc1…|av01…>,mp4a.40.2", BANDWIDTH from size/duration;
+                                        copied Dolby audio: CODECS "…,ec-3|ac-3" and an AUDIO rendition with CHANNELS;
+                                        HDR AV1: VIDEO-RANGE=PQ|HLG
 GET    /remux/s/<sid>/<sig>/media.m3u8  VOD, #EXT-X-MAP init.mp4, segments on real keyframes, #EXT-X-ENDLIST;
                                         #EXT-X-START:TIME-OFFSET=<startAt>,PRECISE=YES for a resume
 GET    /remux/s/<sid>/<sig>/init.mp4
@@ -82,6 +83,16 @@ anything else                           404 {"error":"not_found"}
   reported. A release is probed first and its own codec string
   compared: an HEVC one beyond the player (10-bit, 4K, or HDR it can't decode) is transcoded, an H.264 one passed
   over.
+- **AV1.** `playable.av1` and `av1Main10` are the highest `seq_level_idx` the player decodes at Main profile, 8-bit
+  and 10-bit (8 is level 4.0, 13 is 5.1), and `av1Hdr` whether it decodes 10-bit AV1 in PQ; absent is 0 and false.
+  An AV1 release is only ever copied — the box's UHD 630 has no AV1 decoder — so for a player that doesn't report
+  it at the release's level, depth and HDR it is passed over, never converted: scout's `codec: "av1"` keeps it
+  unopened, and the probe refuses one scout didn't name. A player sending no `playable` gets no AV1 at all, and
+  neither does `/remux/releases`, which carries no report. A release at another profile or at High tier plays
+  nowhere: the web app asks about Main profile and Main tier only. The copy keeps its `av01` sample entry and
+  `av1C`; the master names the AV1-ISOBMFF codec string — with its colour fields whenever the stream describes its
+  colours, so HDR10 is `av01.0.13M.10.0.110.09.16.09.0` — and `VIDEO-RANGE=PQ` (or `HLG`) for HDR. The colours come
+  from Matroska's Colour element or MP4's `colr`, and where those are silent from the sequence header in `av1C`.
 - **Resume.** `startAt` is the second the player starts at. The media playlist names it (`EXT-X-START`, so
   Safari's native player starts there), and the first job starts a segment before it rather than at zero, so a
   resume runs ffmpeg once instead of twice. Negative is a 400; at or past the end starts from zero.
@@ -90,7 +101,7 @@ anything else                           404 {"error":"not_found"}
   without Dolby Vision before one with (scout's order holds within each). Before any is opened, scout's
   attributes (`codec`, `resolution`, `hdr`, `bitDepth`, `dvProfile`, `probed`) sort them for this player: those
   that play as they are, then those that play only converted; one they rule out (Dolby Vision profile 5 without `dolbyVision.p5`, H.264
-  beyond the player, 10-bit H.264 without `h264High10`) is never opened, and anything they don't say is left to
+  beyond the player, 10-bit H.264 without `h264High10`, AV1 beyond the player) is never opened, and anything they don't say is left to
   the probe. Three are opened at a time and taken in rank order; the first that plays as it is wins, one that
   plays only converted is the last resort, and the search goes on — up to 12 releases, starting none after 30 s,
   20 s each — while a release that may play as it is remains. An opened release — its debrid link and probe — is remembered
@@ -188,12 +199,15 @@ The hard part is making ffmpeg cut there. What was tried, on ffmpeg 9.0.1 agains
    with its keyframe at pts 13.000.
 5. **A copy still needs the video decoders in the build.** Without them stream probing cannot learn the
    B-frame reorder delay, and the minimal ffmpeg guessed every copied packet's DTS (`Invalid DTS …
-   replacing by guess`, dts past pts). The image enables the h264/hevc decoders for probing only.
+   replacing by guess`, dts past pts). The image enables the h264/hevc decoders for probing only. AV1 needs no
+   decoder — its packets are never reordered — but it does need the `av1` parser: without it, a Matroska file with
+   no Colour element came out of the minimal build with no `colr` box in its init, its PQ and BT.2020 lost; with it
+   they are read from the sequence header.
 
 The integration tests hold all of it: they fetch segments out of order (3, then 1 — behind that run — then
 0) so the job restarts twice, and check with ffprobe that every segment starts with a keyframe at its
 playlist time (±1 frame), ends before the next, carries audio, and that the segments joined back-to-back
-hold every source frame exactly once over the full duration — for H.264 and HEVC Matroska and for MP4.
+hold every source frame exactly once over the full duration — for H.264, HEVC and AV1 Matroska and for MP4.
 
 ## Resource use
 
@@ -271,7 +285,8 @@ dependabot cannot bump it, so bump both lines by hand.
 ## Limits (MVP)
 
 - **Cached releases only** (an uncached one would start a debrid download).
-- **H.264 and HEVC sources only.** AV1, VP9, MPEG-4 Part 2/XviD and VC-1 are skipped. Files without a
+- **H.264, HEVC and AV1 sources only.** AV1 plays only as a copy, for a player whose `playable` says it decodes
+  it; there is no conversion to fall back on. VP9, MPEG-4 Part 2/XviD and VC-1 are skipped. Files without a
   keyframe index (Matroska with no Cues) are skipped.
 - **Audio is AAC stereo**, one track per session — or, for a player that plays them, E-AC-3/AC-3 copied with
   no stereo alternate beside it (Apple's authoring spec asks for AC-3 beside E-AC-3 for devices without it).
@@ -326,7 +341,7 @@ The cookie is `Secure`: a browser keeps it over HTTPS (tailscale serve) or on `l
 `cargo test` is hermetic: parsers against the fixtures in `testdata/` (see its README), playlists,
 signing, cookies, redaction, release picking, the scoped-scout validation, and a session created against a
 fake scout that refuses a scoped config without the key and a file host that fails if it ever sees the
-key. The `#[ignore]`d tests drive the whole path with real ffmpeg: three end-to-end remuxes (H.264 and HEVC
+key. The `#[ignore]`d tests drive the whole path with real ffmpeg: four end-to-end remuxes (H.264, HEVC and AV1
 Matroska, MP4), the session cap, the idle kill (ffmpeg killed and reaped), and `DELETE` → 410. They
 run in the Dockerfile's `test` stage, against the ffmpeg the image ships — another version seeks
 differently (ffmpeg 8.0 lands a restarted H.264 Matroska run one keyframe early), and the alignment
