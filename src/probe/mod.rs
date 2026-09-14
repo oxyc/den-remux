@@ -50,6 +50,8 @@ pub struct MediaInfo {
     pub height: u32,
     /// HDR by what the container says of the colours (`is_hdr`): a conversion to SDR H.264 tone-maps it.
     pub hdr: bool,
+    /// Whether the container names the transfer HLG (18). An HDR stream that doesn't is taken as PQ.
+    pub hlg: bool,
     /// The video's Dolby Vision configuration, when it carries one.
     pub dolby_vision: Option<DolbyVision>,
     pub audio: Vec<AudioTrack>,

@@ -305,6 +305,7 @@ fn parse_moov(moov: &[u8]) -> Result<MediaInfo, ProbeError> {
         width: u16_at(video.entry, 24).unwrap_or(0) as u32,
         height: u16_at(video.entry, 26).unwrap_or(0) as u32,
         hdr,
+        hlg: of(6) == 18,
         dolby_vision: [b"dvcC", b"dvvC", b"dvwC"].into_iter().find_map(config).and_then(super::dovi_config),
         audio,
         keyframes,

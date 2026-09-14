@@ -68,7 +68,7 @@ pub enum Audio<'a> {
 /// Dolby Vision kept in a copied variant, named as RFC 8216bis and Apple's devices read it: a profile 8 base
 /// layer's `hvc1…` stays in CODECS with `dvh1.08.LL/<brand>` in SUPPLEMENTAL-CODECS; profile 5, which has no base
 /// layer, is its own `dvh1.05.LL` in CODECS and has none. VIDEO-RANGE is what the picture is: PQ, HLG or SDR. A
-/// copied HDR AV1 is named the same way, by its range alone.
+/// copied HDR AV1 or HEVC is named the same way, by its range alone.
 pub struct DolbyVision {
     pub supplemental: Option<String>,
     pub range: &'static str,

@@ -354,6 +354,7 @@ pub async fn probe(src: &Source<'_>, head: &[u8]) -> Result<MediaInfo, ProbeErro
         width: video.width,
         height: video.height,
         hdr,
+        hlg: video.transfer == 18,
         dolby_vision: video.dovi,
         audio,
         keyframes,

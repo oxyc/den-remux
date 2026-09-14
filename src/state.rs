@@ -353,6 +353,7 @@ mod tests {
             width: 0,
             height: 0,
             hdr: false,
+            hlg: false,
             dolby_vision: None,
             audio: Vec::new(),
             keyframes: vec![0.0],

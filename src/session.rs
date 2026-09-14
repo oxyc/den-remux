@@ -912,6 +912,18 @@ pub(crate) fn dolby_vision_signal(
     Some((None, Some(format!("dvh1.08.{:02}/{brand}", dv.level)), range))
 }
 
+/// The VIDEO-RANGE a copied variant names when it keeps no Dolby Vision. Without one a player takes the stream as
+/// SDR, so an HDR copy has to say so: an AV1 by the transfer its codec string names, an HEVC by HLG where the
+/// container says so and PQ otherwise, since an HDR release that names only its Rec. 2020 colours is HDR10. `None`
+/// for SDR.
+fn copied_range(info: &MediaInfo, codecs: &str) -> Option<&'static str> {
+    match info.video {
+        VideoCodec::Av1 => crate::probe::av1_video_range(codecs),
+        VideoCodec::Hevc if info.hdr => Some(if info.hlg { "HLG" } else { "PQ" }),
+        _ => None,
+    }
+}
+
 /// Whether a release would play with no picture: Dolby Vision profile 5, which has no base layer, so stripped or
 /// transcoded it comes out green and purple — unless the player shows profile 5 and takes the release as it is.
 fn no_picture(want: &Want<'_>, takes_hevc: bool, info: &MediaInfo) -> bool {
@@ -1346,9 +1358,8 @@ pub async fn create(
         Some((own, supplemental, range)) => {
             (own.unwrap_or(codecs), Some(playlist::DolbyVision { supplemental, range }))
         }
-        // A copied HDR AV1 names its range, which its codec string's transfer gives.
-        None if transcode.is_none() && info.video == VideoCodec::Av1 => {
-            let range = crate::probe::av1_video_range(&codecs);
+        None if transcode.is_none() => {
+            let range = copied_range(&info, &codecs);
             (codecs, range.map(|range| playlist::DolbyVision { supplemental: None, range }))
         }
         None => (codecs, None),
@@ -1502,10 +1513,28 @@ mod tests {
             width: 3840,
             height: 2160,
             hdr,
+            hlg: false,
             dolby_vision: None,
             audio: Vec::new(),
             keyframes: vec![0.0],
         }
+    }
+
+    #[test]
+    fn a_copied_hdr_variant_names_its_range() {
+        let hdr10 = info(VideoCodec::Hevc, "hvc1.2.4.L153.B0", true);
+        assert_eq!(
+            copied_range(&hdr10, "hvc1.2.4.L153.B0"),
+            Some("PQ"),
+            "HDR HEVC without a transfer is HDR10"
+        );
+        let hlg = crate::probe::MediaInfo { hlg: true, ..hdr10.clone() };
+        assert_eq!(copied_range(&hlg, "hvc1.2.4.L153.B0"), Some("HLG"));
+        let sdr = info(VideoCodec::Hevc, "hvc1.1.6.L120.90", false);
+        assert_eq!(copied_range(&sdr, "hvc1.1.6.L120.90"), None, "SDR names no range");
+        let av1 = info(VideoCodec::Av1, "av01.0.13M.10.0.110.09.16.09.0", true);
+        assert_eq!(copied_range(&av1, "av01.0.13M.10.0.110.09.16.09.0"), Some("PQ"));
+        assert_eq!(copied_range(&info(VideoCodec::H264, "avc1.640028", false), "avc1.640028"), None);
     }
 
     #[test]
