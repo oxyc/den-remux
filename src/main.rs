@@ -15,6 +15,7 @@
 //! is served as a VOD playlist cut on its own keyframes.
 
 mod auth;
+mod client;
 mod config;
 mod httputil;
 mod job;
@@ -526,13 +527,15 @@ where
         playable: Option<session::Playable>,
         start_at: Option<f64>,
         max_bitrate: Option<u64>,
+        /// The page's HLS player, `native` or `hls.js`: for the log only.
+        player: Option<String>,
     }
     let Some(req) = read_body(body).await.and_then(|b| serde_json::from_slice::<Create>(&b).ok()) else {
         return bad_request(
             "Expected {\"imdb\": \"tt…\", \"season\"?: n, \"episode\"?: n, \"filename\"?: \"…\", \"scout\"?: \"…\", \
              \"audio\"?: [\"en\", …], \"audioTrack\"?: n, \"subtitles\"?: \"…\", \"subtitleLanguages\"?: [\"en\", …], \
              \"videoCodecs\"?: [\"h264\", \"hevc\"], \"playable\"?: {\"h264\", \"h264High10\", \"hevcMain\", \"hevcMain10\", \"hevcHighTier\", \"hdr\", \"eac3\", \"aacMultichannel\", \"dolbyVision\": {\"p5\", \"p8\"}, \"av1\", \"av1Main10\", \"av1Hdr\"}, \
-             \"startAt\"?: seconds, \"maxBitrate\"?: bits a second}.",
+             \"startAt\"?: seconds, \"maxBitrate\"?: bits a second, \"player\"?: \"native\" | \"hls.js\"}.",
         );
     };
     if req.start_at.is_some_and(|t| !t.is_finite() || t < 0.0) {
@@ -579,6 +582,7 @@ where
         playable: req.playable.as_ref(),
         start_at: req.start_at.unwrap_or(0.0),
         max_bitrate: req.max_bitrate,
+        client: client::label(parts.headers.get(hyper::header::USER_AGENT), req.player.as_deref()),
     };
     match session::create(state, admission, &want).await {
         Ok(s) => httputil::json(

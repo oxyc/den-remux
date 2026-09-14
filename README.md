@@ -18,7 +18,7 @@ This is the MVP ("phase 2") of oxyc/den#11: movies and episodes, cached releases
 ```
 POST   /remux/login                     {key} → 204 + Set-Cookie + X-Den-Browser-Token; 401 bad_key · 429 rate_limited
 POST   /remux/session                   {imdb, season?, episode?, filename?, scout?, audio?, audioTrack?,
-                                         subtitles?, subtitleLanguages?, videoCodecs?, playable?, startAt?, maxBitrate?} (a full scout install,
+                                         subtitles?, subtitleLanguages?, videoCodecs?, playable?, startAt?, maxBitrate?, player?} (a full scout install,
                                          or browser cookie/bearer) → 201
                                         {sid, playlist, release:{label,filename,size}, duration, expiresAt,
                                          video:{codec: h264|hevc|av1, transcoded}, audioTrack, audioChannels,
@@ -52,6 +52,9 @@ anything else                           404 {"error":"not_found"}
 
 `scout` is the scout install URL the web app reads from the library's `set:plugins` group
 (`http://<scout>:8080/<config>`); without it — for a logged-in browser — the server's `SCOUT_INSTALL_URL` is used. `filename` prefers that release when it is playable here.
+`player` (`native` or `hls.js`) is the HLS player the page chose; it only reaches the session's log line, which ends
+`client: Chrome 151 · macOS · hls.js` — browser and OS read from the User-Agent, which itself is never logged. Brave on
+iOS sends Safari's User-Agent, so it reads as Safari.
 
 - **Audio.** `audio` is the player's languages, most wanted first, in any spelling a release or a browser
   uses (`en-US`, `eng`, `fin`). The first language a track is in wins — the default-flagged track among

@@ -786,6 +786,8 @@ pub struct Want<'a> {
     /// The bits a second the player's link carries, as it measured them: a remote player's. A copy needing more is
     /// taken only when nothing fits, after a transcode at the preset the link takes. `None` is a player at home.
     pub max_bitrate: Option<u64>,
+    /// Which browser asked, for the log (`client::label`): `Chrome 151 · macOS · hls.js`.
+    pub client: String,
 }
 
 /// What the player decodes, as its own tests found (`playable` in `POST /remux/session`): the highest level it
@@ -1515,8 +1517,9 @@ pub async fn create(
     });
     let player = want.playable.map_or_else(|| "no capability report".to_string(), |p| p.to_string());
     let link = want.max_bitrate.map(|b| format!(", link {} kbit/s", b / 1000)).unwrap_or_default();
+    let client = &want.client;
     eprintln!(
-        "session {}: {imdb} \"{}\" ({}, {:?} {}{}{}, {:.0}s, {} keyframes, {} segments, audio {} {}{}; player: {player}{link})",
+        "session {}: {imdb} \"{}\" ({}, {:?} {}{}{}, {:.0}s, {} keyframes, {} segments, audio {} {}{}; player: {player}{link}; client: {client})",
         session.short(),
         session.release.label,
         session.info.container,
