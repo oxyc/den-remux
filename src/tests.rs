@@ -739,7 +739,9 @@ async fn surround_matroska_end_to_end() {
         assert_eq!(stream.trim(), "aac,6,5.1", "track {track}: the init alone describes 5.1 AAC");
         let profile =
             ffprobe(&["-select_streams", "a:0", "-show_entries", "stream=profile", "-of", "csv=p=0"], &whole);
-        assert_eq!(profile.trim(), "LC", "track {track}");
+        // A full ffprobe names the profile; the image's restricted build, with no profile names compiled in, prints
+        // its number, and AAC-LC is profile 1 (`AV_PROFILE_AAC_LOW`). Either says the same thing.
+        assert!(matches!(profile.trim(), "LC" | "1"), "track {track}: AAC-LC, got {profile}");
     }
 }
 
