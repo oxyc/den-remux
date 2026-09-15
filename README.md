@@ -111,9 +111,10 @@ itself is never logged. Brave on iOS sends Safari's User-Agent, so it reads as S
   colours, so HDR10 is `av01.0.13M.10.0.110.09.16.09.0` — and `VIDEO-RANGE=PQ` (or `HLG`) for HDR. The colours come
   from Matroska's Colour element or MP4's `colr`, and where those are silent from the sequence header in `av1C`.
 - **VP9.** `playable.vp9` and `vp9Profile2` say the player decodes VP9 profile 0 (8-bit) and profile 2 (10-bit) in
-  fMP4 HLS; absent is false. They count only for a session that names `player: "hls.js"`: Safari's native HLS player
-  refuses VP9 in fMP4 (MediaError 3) where hls.js on the same Safari plays it, so for a native session, or one that
-  names no player, both are cleared — in the report sent to scout too. Like AV1, a VP9 release is only ever copied:
+  fMP4 HLS; absent is false. Safari's own HLS player plays profile 0 at 1080p30 and 1080p60 on iPhone and Mac (codec
+  lab, 2026-09-15), but profile 2 there is unmeasured, so `vp9Profile2` counts only for a session that names
+  `player: "hls.js"`: for a native session, or one that names no player, it is cleared — in the report sent to scout
+  too. Like AV1, a VP9 release is only ever copied:
   for a player that doesn't take its profile it is passed over, unopened where scout's `codec: "vp9"` and `bitDepth`
   say so. 12-bit, and profiles 1 and 3, play nowhere. The copy keeps its `vp09` sample entry; the master names
   `vp09.PP.LL.DD`, with the colour fields whenever the stream describes its colours, from MP4's `vpcC` or Matroska's
@@ -334,7 +335,7 @@ dependabot cannot bump it, so bump both lines by hand.
 
 - **Cached releases only** (an uncached one would start a debrid download).
 - **H.264, HEVC, AV1 and VP9 sources only.** AV1 and VP9 play only as a copy, for a player whose `playable` says it
-  decodes them (VP9 through hls.js alone); there is no conversion to fall back on. MPEG-4 Part 2/XviD and VC-1 are
+  decodes them (10-bit VP9 through hls.js alone); there is no conversion to fall back on. MPEG-4 Part 2/XviD and VC-1 are
   skipped. Files without a keyframe index (Matroska with no Cues) are skipped.
 - **Audio is AAC**, one track per session: 7.1 for a player that reports `aac71`, 5.1 for one that reports
   `aacMultichannel` (a 7.1 track folds down to it), stereo for every other — or, for a player that plays them,

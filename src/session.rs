@@ -912,10 +912,9 @@ pub struct Playable {
     /// Plays 8-channel AAC-LC: a converted track of eight channels or more stays 7.1 rather than folding down to 5.1.
     pub aac71: bool,
     /// Decodes VP9 profile 0 (8-bit) in fMP4 HLS. Nothing on the box converts VP9, so where this and `vp9_profile2` are
-    /// false a VP9 release isn't tried at all — nor, whatever they say, for a session Safari's native player plays
-    /// (`through`).
+    /// false a VP9 release isn't tried at all.
     pub vp9: bool,
-    /// Decodes VP9 profile 2 (10-bit).
+    /// Decodes VP9 profile 2 (10-bit) — never, whatever it says, for a session Safari's native player plays (`through`).
     pub vp9_profile2: bool,
 }
 
@@ -1001,13 +1000,14 @@ impl Playable {
         }
     }
 
-    /// The report as it holds for the page's HLS player (`player` in `POST /remux/session`): no VP9 but through hls.js.
-    /// Safari's native player refuses VP9 in fMP4 HLS (MediaError 3) where hls.js on the same Safari plays it, so a
-    /// session that is native, or doesn't say, gets no VP9 — and neither does scout's ranking for it.
+    /// The report as it holds for the page's HLS player (`player` in `POST /remux/session`): no 10-bit VP9 but through
+    /// hls.js. Safari's own player plays VP9 profile 0 in fMP4 HLS at 1080p30 and 1080p60 on iPhone and Mac (codec lab,
+    /// 2026-09-15), but profile 2 there is unmeasured — the clip that failed carried Opus, which fails on its own — so
+    /// a session that is native, or doesn't say, gets no profile 2, and neither does scout's ranking for it.
     pub fn through(self, player: Option<&str>) -> Playable {
         match player {
             Some("hls.js") => self,
-            _ => Playable { vp9: false, vp9_profile2: false, ..self },
+            _ => Playable { vp9_profile2: false, ..self },
         }
     }
 
@@ -1789,7 +1789,7 @@ mod tests {
     }
 
     #[test]
-    fn vp9_plays_as_it_is_in_the_profile_the_player_reports_through_hls_js() {
+    fn vp9_plays_as_it_is_in_the_profile_the_player_reports() {
         let chrome = Playable { h264: 0x33, vp9: true, vp9_profile2: true, ..Playable::default() };
         let p0 = info(VideoCodec::Vp9, "vp09.00.41.08", false);
         let p2 = info(VideoCodec::Vp9, "vp09.02.51.10.01.09.16.09.00", true);
@@ -1800,11 +1800,12 @@ mod tests {
         assert!(!chrome.takes(&info(VideoCodec::Vp9, "vp09.01.41.08.03.01.01.01.00", false)), "profile 1");
         assert_eq!(chrome.through(Some("hls.js")).to_string(), chrome.to_string());
         let native = chrome.through(Some("native"));
-        assert!(!native.takes(&p0) && !native.takes(&p2), "Safari's native player refuses VP9 in fMP4");
-        assert!(!chrome.through(None).takes_vp9(), "nor does a session that doesn't say which player");
+        assert!(native.takes(&p0), "Safari's own player plays VP9 profile 0 in fMP4");
+        assert!(!native.takes(&p2), "profile 2 there is unmeasured");
+        assert!(!chrome.through(None).vp9_profile2, "nor for a session that doesn't say which player");
         assert_eq!(native.h264, 0x33, "the rest of the report stands");
         let sent = serde_json::to_value(native).unwrap();
-        assert!(sent["vp9"] == false && sent["vp9Profile2"] == false, "scout is sent it cleared: {sent}");
+        assert!(sent["vp9"] == true && sent["vp9Profile2"] == false, "scout is sent it as it holds: {sent}");
         assert!(chrome.to_string().ends_with("AV1 10-bit L0, VP9, VP9 profile 2"), "{chrome}");
 
         let a = |bit_depth| scout::Attributes { codec: Some("vp9".into()), bit_depth, ..Default::default() };
@@ -1821,7 +1822,8 @@ mod tests {
             Fit::Copy,
             "a depth nobody read: the probe decides"
         );
-        assert_eq!(fit(&a(0), Some(&native), false), Fit::Never, "and never converted");
+        let no_vp9 = Playable { vp9: false, vp9_profile2: false, ..chrome };
+        assert_eq!(fit(&a(0), Some(&no_vp9), false), Fit::Never, "and never converted");
         assert_eq!(fit(&a(0), None, true), Fit::Never, "without a report nothing says it plays");
     }
 

@@ -21,7 +21,7 @@ pub enum VideoCodec {
     Hevc,
     /// Copied only, for a player that decodes it: nothing on the box converts AV1.
     Av1,
-    /// Copied only, as AV1 is — and only through hls.js: Safari's native player refuses VP9 in fMP4.
+    /// Copied only, as AV1 is — and 10-bit only through hls.js, since it is unmeasured in Safari's native player.
     Vp9,
     Other(String),
 }
