@@ -361,14 +361,40 @@ impl Session {
         }
     }
 
+    /// Whether a running job — started at `start`, its next GOP at `next_start` — gives segment `n`: it began at or
+    /// before the segment, is no more than `RESTART_GAP_SEGMENTS` short of it, and hasn't gone past the segment's
+    /// end with none of its GOPs there still kept. A job past it doesn't come back for it: a segment's GOPs are
+    /// pruned once later ones are served, so a player asking for it again — a seek back, a player with no cache of
+    /// its own — used to wait on that job until its request timed out.
+    ///
+    /// Segment 0 starts at 0 whatever the file's first keyframe says, and a job for it starts at that keyframe
+    /// (`restart_point`), so `first_keyframe` is where "at or before" is counted from there.
+    fn heads_for(
+        segments: &[Segment],
+        n: usize,
+        first_keyframe: f64,
+        job: u32,
+        start: f64,
+        next_start: f64,
+        gops: &[Gop],
+    ) -> bool {
+        let seg = segments[n];
+        let passed = next_start >= seg.end - SNAP;
+        let kept = gops
+            .iter()
+            .any(|g| g.job == job && g.start < seg.end - SNAP && g.start + g.dur > seg.start + SNAP);
+        start <= seg.start.max(first_keyframe) + SNAP
+            && n <= seg_at(segments, next_start) + RESTART_GAP_SEGMENTS
+            && (!passed || kept)
+    }
+
     /// Make sure a job is heading for segment `n`: leave a running job that will reach it soon, start
     /// one at `n` otherwise. `Err` when the source has failed too often to try again.
     fn ensure_job(&self, i: &mut Inner, n: usize, st: &AppState) -> Result<(), ()> {
-        let seg = self.segments[n];
+        let first_keyframe = self.info.keyframes.first().copied().unwrap_or(0.0);
         let keep = i.job.as_ref().is_some_and(|j| {
             j.exit.is_none()
-                && j.start <= seg.start + SNAP
-                && n <= seg_at(&self.segments, j.next_start) + RESTART_GAP_SEGMENTS
+                && Self::heads_for(&self.segments, n, first_keyframe, j.id, j.start, j.next_start, &i.gops)
         });
         if keep {
             return Ok(());
@@ -570,6 +596,12 @@ impl Session {
             }
             self.wake.notify_one();
             if Instant::now() >= deadline {
+                // The session is answered anyway, and Safari will likely give up on the map before it is written.
+                eprintln!(
+                    "session {}: init.mp4 not written after {}s; answering without it",
+                    self.short(),
+                    INIT_WAIT.as_secs()
+                );
                 return;
             }
             tokio::time::sleep(POLL).await;
@@ -1955,6 +1987,36 @@ mod tests {
         assert_eq!(start_segment(&segs, 17.0), 2, "13 → 19.5 plays 17");
         assert_eq!(start_segment(&segs, 13.5), 1, "near 13 a player may ask for the segment before it");
         assert_eq!(start_segment(&segs, 0.5), 0);
+    }
+
+    /// A segment asked for again after the job has gone past it and its GOPs were pruned — a seek back, or a player
+    /// with no cache of its own — gets a new job. It used to be left to the running one, which never came back, and
+    /// the request answered 503 after its full wait.
+    #[test]
+    fn a_job_past_a_pruned_segment_is_not_waited_on() {
+        let segs: Vec<Segment> =
+            (0..6).map(|k| Segment { start: k as f64 * 6.0, end: (k + 1) as f64 * 6.0 }).collect();
+        let heads = |n, start, next, gops: &[Gop]| Session::heads_for(&segs, n, 0.0, 1, start, next, gops);
+        let later = [gop(1, 7, 18.0, 6.0), gop(1, 8, 24.0, 6.0)];
+        assert!(!heads(1, 0.0, 30.0, &later), "past segment 1 with its GOPs pruned");
+        assert!(
+            heads(1, 0.0, 30.0, &[gop(1, 1, 6.0, 6.0), gop(1, 7, 18.0, 6.0)]),
+            "past it, but it is still kept"
+        );
+        assert!(heads(1, 0.0, 8.0, &[]), "part way through it");
+        assert!(heads(3, 0.0, 6.0, &[]), "a little short of it");
+        assert!(!heads(5, 0.0, 6.0, &[]), "too far short of it");
+        assert!(!heads(1, 12.0, 14.0, &[]), "started after it");
+        // The last segment: its end is the job's, and its GOPs stay kept while the job winds up.
+        assert!(heads(5, 0.0, 36.0, &[gop(1, 9, 30.0, 6.0)]), "the last segment waits for its job to finish");
+        // A file whose first keyframe is late: segment 0 still starts at 0, and a job begun on that keyframe is
+        // heading for it rather than restarted on every look.
+        assert!(
+            Session::heads_for(&segs, 0, 0.5, 1, 0.5, 0.5, &[]),
+            "segment 0 behind a late first keyframe"
+        );
+        assert!(!Session::heads_for(&segs, 0, 0.5, 1, 6.0, 6.0, &[]), "but not a job begun past it");
+        assert!(!heads(1, 0.0, 30.0, &[gop(2, 1, 6.0, 6.0)]), "a GOP of another job is not this job's");
     }
 
     #[test]

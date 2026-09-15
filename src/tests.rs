@@ -691,6 +691,9 @@ async fn end_to_end(
     assert_eq!(del.status, StatusCode::NO_CONTENT);
     assert_eq!(call(&state, "GET", &format!("{base}seg0.m4s"), None, "").await.status, StatusCode::GONE);
     assert_eq!(call(&state, "GET", &playlist, None, "").await.status, StatusCode::GONE);
+    // A player that ends its session as it reports why is still heard.
+    let late = call(&state, "POST", &format!("{base}report"), None, r#"{"code":3,"message":"DECODE"}"#).await;
+    assert_eq!(late.status, StatusCode::NO_CONTENT, "a report after the end is logged, not refused");
     assert!(!dir.exists(), "scratch left behind");
     assert_eq!(state.scratch_bytes.load(Relaxed), 0);
     (master.text(), init.body, whole)
@@ -1451,6 +1454,13 @@ async fn hevc_for_a_player_without_it_takes_the_one_transcode() {
     assert_eq!(r.json()["video"], copied, "copied");
 
     state.end_session(j["sid"].as_str().unwrap(), "test").await;
+    // A player that ends its session as it reports why is still heard; anything else under its URL is gone.
+    let ended = j["playlist"].as_str().unwrap();
+    let late =
+        call(&state, "POST", &ended.replace("master.m3u8", "report"), None, r#"{"code":3,"message":"x"}"#)
+            .await;
+    assert_eq!(late.status, StatusCode::NO_CONTENT, "a report after the end is logged, not refused");
+    assert_eq!(call(&state, "GET", ended, None, "").await.status, StatusCode::GONE);
     let r = call(&state, "POST", "/remux/session", Some(&laptop), h264_only).await;
     assert_eq!(r.status, StatusCode::CREATED, "the ended session gave its transcode back: {}", r.text());
     state.end_all("test").await;

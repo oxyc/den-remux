@@ -381,6 +381,30 @@ where
     http_body_util::Limited::new(body, 16 * 1024).collect().await.ok().map(|c| c.to_bytes())
 }
 
+/// A player's report of why it couldn't play the session `short`, into the log.
+async fn report<B>(short: &str, body: B) -> Response<Body>
+where
+    B: hyper::body::Body<Data = Bytes> + Send + 'static,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    #[derive(serde::Deserialize)]
+    struct Report {
+        code: u16,
+        message: String,
+    }
+    match read_body(body).await.and_then(|b| serde_json::from_slice::<Report>(&b).ok()) {
+        Some(r) => {
+            eprintln!(
+                "session {short}: the player couldn't play it: error {} \"{}\"",
+                r.code,
+                redact::player_message(&r.message)
+            );
+            Response::builder().status(StatusCode::NO_CONTENT).body(httputil::full("")).unwrap()
+        }
+        None => httputil::error(StatusCode::BAD_REQUEST, "bad_report", "Expected {code, message}."),
+    }
+}
+
 fn bad_request(detail: &str) -> Response<Body> {
     httputil::error(StatusCode::BAD_REQUEST, "bad_request", detail)
 }
@@ -656,7 +680,12 @@ where
         // An ended session answers 410 — but only to someone holding its URL; to anyone else it is as
         // absent as a session that never existed.
         return match state.tombstone(sid) {
-            Some(exp) if auth::url_sig_ok(key, sid, exp, sig) => session::gone(),
+            Some(exp) if auth::url_sig_ok(key, sid, exp, sig) => match (&parts.method, file) {
+                // A player that gives up often ends its session as it reports why, and the report can arrive
+                // second. It is still the only record of what the player saw.
+                (&Method::POST, Some("report")) => report(sid.get(..6).unwrap_or(sid), body).await,
+                _ => session::gone(),
+            },
             _ => httputil::not_found(),
         };
     };
@@ -675,25 +704,7 @@ where
         }
         // The player's verdict when it can't play what it was sent — a browser's MediaError, or hls.js's — which
         // no server log sees otherwise. Only the holder of the session's signed URL gets here.
-        (&Method::POST, Some("report")) => {
-            #[derive(serde::Deserialize)]
-            struct Report {
-                code: u16,
-                message: String,
-            }
-            match read_body(body).await.and_then(|b| serde_json::from_slice::<Report>(&b).ok()) {
-                Some(r) => {
-                    eprintln!(
-                        "session {}: the player couldn't play it: error {} \"{}\"",
-                        s.short(),
-                        r.code,
-                        redact::player_message(&r.message)
-                    );
-                    Response::builder().status(StatusCode::NO_CONTENT).body(httputil::full("")).unwrap()
-                }
-                None => httputil::error(StatusCode::BAD_REQUEST, "bad_report", "Expected {code, message}."),
-            }
-        }
+        (&Method::POST, Some("report")) => report(s.short(), body).await,
         (&Method::GET | &Method::HEAD, Some(f)) => {
             let resp = match f {
                 // VOD with an ENDLIST, fixed when the session was made: kept for its life. Idleness is judged by
