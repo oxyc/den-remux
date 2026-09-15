@@ -1231,6 +1231,43 @@ async fn a_resume_starts_where_the_player_does() {
     state.end_all("test").await;
 }
 
+/// Safari and Apple's other native players give up on an init.mp4 that takes more than about five seconds, so a
+/// native player's session is answered only once its init is written; hls.js's is answered at once, with no ffmpeg.
+#[tokio::test]
+#[ignore]
+async fn a_native_players_session_answers_with_its_init_ready() {
+    let origin = origin().await;
+    let state = test_state(&origin, 2, Duration::from_secs(600));
+    let cookie = login(&state, "phone-key").await;
+    let before = state.jobs_started.load(Relaxed);
+    let r =
+        call(&state, "POST", "/remux/session", Some(&cookie), r#"{"imdb":"tt0000001","player":"hls.js"}"#)
+            .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    assert_eq!(state.jobs_started.load(Relaxed), before, "hls.js waits for init.mp4 itself");
+    assert!(!state.session(r.json()["sid"].as_str().unwrap()).unwrap().init_ready());
+
+    let r =
+        call(&state, "POST", "/remux/session", Some(&cookie), r#"{"imdb":"tt0000001","player":"native"}"#)
+            .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let j = r.json();
+    assert!(
+        state.session(j["sid"].as_str().unwrap()).unwrap().init_ready(),
+        "the init is written before the answer"
+    );
+    let base = j["playlist"].as_str().unwrap().trim_end_matches("master.m3u8").to_string();
+    let started = std::time::Instant::now();
+    let init = call(&state, "GET", &format!("{base}init.mp4"), None, "").await;
+    assert_eq!(init.status, StatusCode::OK);
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "served from what was prepared: {:?}",
+        started.elapsed()
+    );
+    state.end_all("test").await;
+}
+
 /// A player that plays Dolby audio in fMP4 HLS gets an E-AC-3 (hevc.mkv) or AC-3 (h264.mkv's first track) track
 /// copied, named in the master with an audio rendition giving its channels. Another track, or a player that
 /// doesn't say so, gets AAC stereo. Creating a session starts no ffmpeg.

@@ -527,7 +527,8 @@ where
         playable: Option<session::Playable>,
         start_at: Option<f64>,
         max_bitrate: Option<u64>,
-        /// The page's HLS player, `native` or `hls.js`: for the log only.
+        /// The page's HLS player, `native` or `hls.js`: for the log, and a native player's session answers only
+        /// once its `init.mp4` is ready (`Session::prepare`).
         player: Option<String>,
     }
     let Some(req) = read_body(body).await.and_then(|b| serde_json::from_slice::<Create>(&b).ok()) else {
@@ -584,7 +585,12 @@ where
         max_bitrate: req.max_bitrate,
         client: client::label(parts.headers.get(hyper::header::USER_AGENT), req.player.as_deref()),
     };
-    match session::create(state, admission, &want).await {
+    let created = session::create(state, admission, &want).await;
+    // Apple's players give up on an init.mp4 that takes more than about five seconds; hls.js doesn't need this.
+    if let (Ok(s), Some("native")) = (&created, req.player.as_deref()) {
+        s.prepare(state).await;
+    }
+    match created {
         Ok(s) => httputil::json(
             StatusCode::CREATED,
             &serde_json::json!({

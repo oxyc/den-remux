@@ -33,6 +33,8 @@ const AHEAD_SEGMENTS: usize = 4;
 const RESTART_GAP_SEGMENTS: usize = 3;
 /// How long a segment request waits for ffmpeg before answering 503 with Retry-After.
 const SEGMENT_WAIT: Duration = Duration::from_secs(20);
+/// How long creating a session for a native player waits for its `init.mp4` (`Session::prepare`).
+const INIT_WAIT: Duration = Duration::from_secs(15);
 const POLL: Duration = Duration::from_millis(100);
 /// How often the supervisor looks at a RUNNING job. A paused one is not looked at at all.
 const TICK: Duration = Duration::from_millis(500);
@@ -539,6 +541,45 @@ impl Session {
             }
             tokio::time::sleep(POLL).await;
         }
+    }
+
+    /// Start the job for the segment the session opens on and wait, up to `INIT_WAIT`, for its `init.mp4`, so a
+    /// native player's first request for it is answered at once.
+    ///
+    /// Apple's players give up on the map after about five seconds — AVFoundation's "No response for map", which
+    /// Safari reports as "Media failed to decode" — and a job that seeks into a remote file, and perhaps starts a
+    /// transcode, takes longer than that to write one. hls.js waits as long as it takes. Whatever stops this early
+    /// (a run that fails, a job that won't start) is left to the player's own request, which handles it as before.
+    pub async fn prepare(&self, st: &AppState) {
+        let deadline = Instant::now() + INIT_WAIT;
+        loop {
+            {
+                let mut i = self.lock();
+                if i.ended {
+                    return;
+                }
+                self.refresh(&mut i, st);
+                if i.init.is_some() || i.failures > 0 {
+                    return;
+                }
+                let want = i.want;
+                if self.ensure_job(&mut i, want, st).is_err() {
+                    return;
+                }
+                self.gate(&mut i, st);
+            }
+            self.wake.notify_one();
+            if Instant::now() >= deadline {
+                return;
+            }
+            tokio::time::sleep(POLL).await;
+        }
+    }
+
+    /// Whether the session's `init.mp4` has been written. Tests use it to see what `prepare` left behind.
+    #[cfg(test)]
+    pub fn init_ready(&self) -> bool {
+        self.lock().init.is_some()
     }
 
     /// Rendition `n`'s playlist.

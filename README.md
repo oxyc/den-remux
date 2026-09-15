@@ -53,9 +53,11 @@ anything else                           404 {"error":"not_found"}
 
 `scout` is the scout install URL the web app reads from the library's `set:plugins` group
 (`http://<scout>:8080/<config>`); without it — for a logged-in browser — the server's `SCOUT_INSTALL_URL` is used. `filename` prefers that release when it is playable here.
-`player` (`native` or `hls.js`) is the HLS player the page chose; it only reaches the session's log line, which ends
-`client: Chrome 151 · macOS · hls.js` — browser and OS read from the User-Agent, which itself is never logged. Brave on
-iOS sends Safari's User-Agent, so it reads as Safari.
+`player` (`native` or `hls.js`) is the HLS player the page chose. A `native` session is answered only once its
+`init.mp4` is written (up to 15 s): Apple's players give up on the map after about five seconds ("No response for map",
+which Safari shows as "Media failed to decode"), and a job seeking into a remote file takes longer than that. It also
+ends the session's log line, `client: Chrome 151 · macOS · hls.js` — browser and OS read from the User-Agent, which
+itself is never logged. Brave on iOS sends Safari's User-Agent, so it reads as Safari.
 
 - **Audio.** `audio` is the player's languages, most wanted first, in any spelling a release or a browser
   uses (`en-US`, `eng`, `fin`). The first language a track is in wins — the default-flagged track among
