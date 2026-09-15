@@ -120,9 +120,10 @@ itself is never logged. Brave on iOS sends Safari's User-Agent, so it reads as S
 - **Resume.** `startAt` is the second the player starts at. The media playlist names it (`EXT-X-START`, so
   Safari's native player starts there), and the first job starts a segment before it rather than at zero, so a
   resume runs ffmpeg once instead of twice. Negative is a 400; at or past the end starts from zero.
-- **Which release.** Scout ranks for a TV, best first; here it is re-ranked for a phone or a laptop, often over
-  the tailnet: 1080p before 720p or unnamed before 4K, and within each a web release before a remux and one
-  without Dolby Vision before one with (scout's order holds within each). Before any is opened, scout's
+- **Which release.** The session passes the browser's `playable` on to scout in `X-Den-Playable`, and scout ranks
+  the list for that browser: releases it plays as they are first, then those this service converts, then those
+  it can't play (den-scout's README, "Ranked for a browser"). A player that sends no report gets scout's TV
+  ranking. Before any is opened, scout's
   attributes (`codec`, `resolution`, `hdr`, `bitDepth`, `dvProfile`, `probed`) sort them for this player: those
   that play as they are, then those that play only converted; one they rule out (Dolby Vision profile 5 without `dolbyVision.p5`, H.264
   beyond the player, 10-bit H.264 without `h264High10`, AV1 beyond the player) is never opened, and anything they don't say is left to

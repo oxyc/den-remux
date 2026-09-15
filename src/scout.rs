@@ -3,9 +3,9 @@
 //! A session's releases come from the scout install the web app names — its library's full install URL,
 //! or, for a logged-in browser, a scope=availability one that scout honours only with `X-Den-Remux-Key` —
 //! or, as a fallback, this service's own `SCOUT_INSTALL_URL`. The browser never gets a ticket or a debrid link: it asks for a
-//! title and gets back a signed session for one release. Scout's ranking is re-ranked for a phone
-//! (`phone_first`), and the first release that is cached on the debrid, probes cleanly and plays in the browser
-//! as it is wins; one it can only have converted is the last resort.
+//! title and gets back a signed session for one release. Scout ranks the list for the browser, from the capability
+//! report passed on in `X-Den-Playable`, and the first release that is cached on the debrid, probes cleanly and
+//! plays in the browser as it is wins; one it can only have converted is the last resort.
 
 use serde::Deserialize;
 
@@ -42,8 +42,6 @@ pub struct Attributes {
     /// HDR by the name or the file; Dolby Vision counts.
     #[serde(default)]
     pub hdr: bool,
-    #[serde(default, rename = "dolbyVision")]
-    pub dolby_vision: bool,
     /// 8 or 10, 0 when nobody read it. The name supplies 10 for "10bit"/"Hi10P" and for any HDR or Dolby Vision
     /// release; scout's probe replaces that with what the codec's configuration record says.
     #[serde(default, rename = "bitDepth")]
@@ -117,10 +115,10 @@ fn remuxable(s: &Stream, av1: bool) -> bool {
 }
 
 /// The releases worth trying, in the order to try them: the one the browser named first when it is
-/// playable here, then scout's order as `phone_first` ranks it. `av1`: the player decodes AV1.
+/// playable here, then scout's order — ranked for this browser when the session passed on what it plays.
+/// `av1`: the player decodes AV1.
 pub fn candidates(streams: &[Stream], filename: Option<&str>, av1: bool) -> Vec<Stream> {
     let mut out: Vec<Stream> = streams.iter().filter(|s| remuxable(s, av1)).cloned().collect();
-    phone_first(&mut out);
     if let Some(want) = filename {
         if let Some(i) = out.iter().position(|s| s.filename() == want) {
             let chosen = out.remove(i);
@@ -128,36 +126,6 @@ pub fn candidates(streams: &[Stream], filename: Option<&str>, av1: bool) -> Vec<
         }
     }
     out
-}
-
-/// Scout ranks for a TV, best first. Playback here is a phone's or a laptop's, often over the tailnet from outside
-/// the house, so a 1080p release comes before a 720p or unnamed one and those before 4K, and within each a web
-/// release before a remux and one without Dolby Vision before one with: smaller, and far more often in a form a
-/// browser plays as it is, where a UHD Blu-ray remux is High tier HEVC it can only have converted. Stable, so
-/// scout's order holds within each.
-pub fn phone_first(c: &mut [Stream]) {
-    c.sort_by_key(|s| {
-        let text = format!("{} {}", s.attributes.label, s.filename()).to_ascii_lowercase();
-        let has = |words: &[&str]| words.iter().any(|w| text.contains(w));
-        let resolution = match () {
-            _ if has(&["2160p", "4k", "uhd"]) => 2,
-            _ if has(&["1080p"]) => 0,
-            _ => 1,
-        };
-        let dolby_vision = s.attributes.dolby_vision || has(&["dolby vision", "dovi", ".dv.", " dv "]);
-        (resolution, has(&["remux"]), dolby_vision)
-    });
-}
-
-/// For a player that cannot take HEVC: H.264 releases first — and AV1, a candidate only for a player that
-/// decodes it, so copied like H.264 — then those scout named no codec for, then HEVC, which needs the GPU.
-/// Stable, so scout's order holds within each.
-pub fn h264_first(c: &mut [Stream]) {
-    c.sort_by_key(|s| match s.attributes.codec.as_deref().map(str::to_ascii_lowercase).as_deref() {
-        Some("h264" | "av1") => 0,
-        None => 1,
-        _ => 2,
-    });
 }
 
 /// How much of the file to read when resolving it. Enough for the Matroska SeekHead, Info and Tracks,
@@ -223,13 +191,25 @@ pub struct ListError {
     pub detail: String,
 }
 
-/// The stream list for `imdb`, with the service key when the source has one. `client` must not follow
-/// redirects: one would carry the key off scout's origin.
-pub async fn list(client: &reqwest::Client, src: &ScoutSource, imdb: &str) -> Result<Vec<Stream>, ListError> {
+/// The header carrying the browser's capability report to scout, which ranks the list for that browser.
+pub const PLAYABLE_HEADER: &str = "x-den-playable";
+
+/// The stream list for `imdb`, with the service key when the source has one, ranked for the browser whose report
+/// `playable` is. `client` must not follow redirects: one would carry the key off scout's origin.
+pub async fn list(
+    client: &reqwest::Client,
+    src: &ScoutSource,
+    imdb: &str,
+    playable: Option<&crate::session::Playable>,
+) -> Result<Vec<Stream>, ListError> {
     let fail = |status: Option<u16>, detail: String| ListError { status, detail };
     let mut req = client.get(stream_list_url(&src.base, imdb));
     if let Some(k) = &src.key {
         req = req.header(KEY_HEADER, k);
+    }
+    if let Some(p) = playable {
+        // Integers and booleans only: there is nothing in a Playable that fails to serialise.
+        req = req.header(PLAYABLE_HEADER, serde_json::to_string(p).expect("a Playable serialises"));
     }
     let resp = req.send().await.map_err(|e| fail(None, e.without_url().to_string()))?;
     if !resp.status().is_success() {
@@ -338,53 +318,12 @@ mod tests {
         assert_eq!(
             names,
             [
+                "Film.2019.2160p.UHD.BluRay.REMUX.HEVC.TrueHD.7.1.mkv",
                 "Film.2019.1080p.WEB-DL.DDP5.1.H.264.mkv",
                 "Film.2019.1080p.BluRay.mkv",
-                "Film.2019.2160p.UHD.BluRay.REMUX.HEVC.TrueHD.7.1.mkv",
             ],
-            "scout's order ranked for a phone, minus uncached, cache-unknown, AV1, XviD, AVI and 3D"
+            "scout's order, minus uncached, cache-unknown, AV1, XviD, AVI and 3D"
         );
-    }
-
-    #[test]
-    fn a_phone_gets_1080p_before_4k_and_web_before_remux_or_dolby_vision() {
-        let stream = |label: &str| Stream {
-            title: String::new(),
-            url: String::new(),
-            attributes: Attributes { label: label.into(), ..Attributes::default() },
-            hints: Hints::default(),
-        };
-        let mut c: Vec<Stream> = [
-            "4K • REMUX • Dolby Vision • Atmos • 75 GB",
-            "4K • WEB-DL • 18 GB",
-            "1080p • REMUX • 30 GB",
-            "1080p • WEB-DL • Dolby Vision • 6 GB",
-            "720p • WEB-DL • 2 GB",
-            "1080p • WEB-DL • 4 GB",
-        ]
-        .map(stream)
-        .to_vec();
-        phone_first(&mut c);
-        let labels: Vec<&str> = c.iter().map(|s| s.attributes.label.as_str()).collect();
-        assert_eq!(
-            labels,
-            [
-                "1080p • WEB-DL • 4 GB",
-                "1080p • WEB-DL • Dolby Vision • 6 GB",
-                "1080p • REMUX • 30 GB",
-                "720p • WEB-DL • 2 GB",
-                "4K • WEB-DL • 18 GB",
-                "4K • REMUX • Dolby Vision • Atmos • 75 GB",
-            ]
-        );
-    }
-
-    #[test]
-    fn a_player_without_hevc_gets_h264_releases_first() {
-        let mut c = candidates(&fixture(), None, false);
-        h264_first(&mut c);
-        assert_eq!(c[0].filename(), "Film.2019.1080p.WEB-DL.DDP5.1.H.264.mkv");
-        assert_eq!(c.last().unwrap().filename(), "Film.2019.2160p.UHD.BluRay.REMUX.HEVC.TrueHD.7.1.mkv");
     }
 
     #[test]
@@ -392,9 +331,9 @@ mod tests {
         let pick = candidates(&fixture(), Some("Film.2019.1080p.BluRay.mkv"), false);
         assert_eq!(pick[0].filename(), "Film.2019.1080p.BluRay.mkv");
         assert_eq!(pick.len(), 3, "the others stay as fallbacks");
-        // Named but uncached: the best cached one for a phone instead.
+        // Named but uncached: scout's first cached one instead.
         let pick = candidates(&fixture(), Some("Film.2019.1080p.WEB.x264-UNCACHED.mkv"), false);
-        assert_eq!(pick[0].filename(), "Film.2019.1080p.WEB-DL.DDP5.1.H.264.mkv");
+        assert_eq!(pick[0].filename(), "Film.2019.2160p.UHD.BluRay.REMUX.HEVC.TrueHD.7.1.mkv");
         // Named 4K: it still goes first, ahead of the ranking.
         let pick =
             candidates(&fixture(), Some("Film.2019.2160p.UHD.BluRay.REMUX.HEVC.TrueHD.7.1.mkv"), false);
@@ -410,25 +349,12 @@ mod tests {
         assert_eq!(
             names(true),
             [
+                "Film.2019.2160p.UHD.BluRay.REMUX.HEVC.TrueHD.7.1.mkv",
+                "Film.2019.2160p.WEB-DL.AV1.mkv",
                 "Film.2019.1080p.WEB-DL.DDP5.1.H.264.mkv",
                 "Film.2019.1080p.BluRay.mkv",
-                "Film.2019.2160p.WEB-DL.AV1.mkv",
-                "Film.2019.2160p.UHD.BluRay.REMUX.HEVC.TrueHD.7.1.mkv",
             ],
-            "a 4K web release, ranked with the other 4K"
-        );
-        // A player with AV1 and no HEVC: AV1 isn't put behind the unnamed releases as HEVC is.
-        let mut c = candidates(&fixture(), None, true);
-        h264_first(&mut c);
-        let order: Vec<&str> = c.iter().map(|s| s.filename()).collect();
-        assert_eq!(
-            order,
-            [
-                "Film.2019.1080p.WEB-DL.DDP5.1.H.264.mkv",
-                "Film.2019.2160p.WEB-DL.AV1.mkv",
-                "Film.2019.1080p.BluRay.mkv",
-                "Film.2019.2160p.UHD.BluRay.REMUX.HEVC.TrueHD.7.1.mkv",
-            ]
+            "in scout's order"
         );
     }
 

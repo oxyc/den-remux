@@ -881,7 +881,7 @@ pub struct Want<'a> {
 /// 30) and HEVC's High tier, and of 8-bit and 10-bit AV1 at Main profile (`seq_level_idx`), 0 for none, and whether
 /// it decodes PQ HDR in HEVC and in AV1. An HEVC release beyond it is transcoded on the GPU; an H.264 or AV1 one is
 /// passed over.
-#[derive(serde::Deserialize, Clone, Copy, Debug, Default)]
+#[derive(serde::Deserialize, serde::Serialize, Clone, Copy, Debug, Default)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Playable {
     pub h264: u16,
@@ -911,7 +911,7 @@ pub struct Playable {
 
 /// `playable.dolbyVision`: profile 5 (no base layer at all; Safari shows it, Chrome can't) and profile 8.x shown as
 /// Dolby Vision.
-#[derive(serde::Deserialize, Clone, Copy, Debug, Default)]
+#[derive(serde::Deserialize, serde::Serialize, Clone, Copy, Debug, Default)]
 #[serde(default)]
 pub struct DolbyVisionPlay {
     pub p5: bool,
@@ -1177,15 +1177,16 @@ fn scout_base(st: &AppState, scout: Option<&str>) -> Result<String, ApiError> {
     }
 }
 
-/// Scout's releases for `id`, its refusals put in this API's terms.
+/// Scout's releases for `id`, ranked for the browser that sent `playable`, its refusals put in this API's terms.
 async fn scout_list(
     st: &AppState,
     source: &scout::ScoutSource,
     id: &str,
     by_install: bool,
+    playable: Option<&Playable>,
 ) -> Result<Vec<scout::Stream>, ApiError> {
     let secrets = [source.base.as_str()];
-    scout::list(&st.scout_http, source, id).await.map_err(|e| match e.status {
+    scout::list(&st.scout_http, source, id, playable).await.map_err(|e| match e.status {
         // Out of scope: an availability-only install, which plays only with den-remux's key — sent for a
         // logged-in browser alone.
         Some(403) if by_install => api(
@@ -1226,7 +1227,7 @@ pub async fn releases(
     };
     let source = scout::ScoutSource { base: scout_base(st, scout)?, key };
     // No capability report comes with this request, so no AV1: nothing says the player decodes it.
-    Ok(scout::candidates(&scout_list(st, &source, id, by_install).await?, None, false))
+    Ok(scout::candidates(&scout_list(st, &source, id, by_install, None).await?, None, false))
 }
 
 /// `POST /remux/session`: pick and probe a release, choose its audio track, and set up its session.
@@ -1274,9 +1275,8 @@ pub async fn create(
         ));
     };
     let secrets = [source.base.as_str()];
-    let list = scout_list(st, &source, imdb, by_install).await?;
-    let mut candidates =
-        scout::candidates(&list, want.filename, want.playable.is_some_and(Playable::takes_av1));
+    let list = scout_list(st, &source, imdb, by_install, want.playable).await?;
+    let candidates = scout::candidates(&list, want.filename, want.playable.is_some_and(Playable::takes_av1));
     if candidates.is_empty() {
         return Err(api(
             StatusCode::NOT_FOUND,
@@ -1290,16 +1290,10 @@ pub async fn create(
             .iter()
             .any(|c| matches!(c.to_ascii_lowercase().as_str(), "hevc" | "h265" | "hvc1" | "hev1"));
     let takes_hevc = want.playable.map_or(takes_hevc, Playable::takes_hevc);
-    if !takes_hevc {
-        // An explicit release (also used when changing its audio track) takes priority over codec
-        // preferences. Only rank the alternatives; the named HEVC may need the GPU to stay itself.
-        let alternatives =
-            usize::from(candidates.first().is_some_and(|c| want.filename == Some(c.filename())));
-        scout::h264_first(&mut candidates[alternatives..]);
-    }
     // What scout says of each release decides, before any is opened, which are tried first — those that play as
-    // they are, then those that play only converted, the ranking above holding within each — and which aren't
-    // opened at all. The named release stays first unless it can't play.
+    // they are, then those that play only converted, scout's ranking holding within each — and which aren't
+    // opened at all. The named release stays first unless it can't play. Scout has already ranked a list for a
+    // browser that sent its report in the same order; this is what orders one for a player that sent none.
     let mut ranked: Vec<(Fit, &scout::Stream)> = Vec::new();
     for c in &candidates {
         match fit(&c.attributes, want.playable, takes_hevc) {
@@ -1823,7 +1817,7 @@ mod tests {
         assert_eq!(fit(&hdr_word, p, true), Fit::Copy, "a 10 inferred from an HDR word is not High 10");
         let uhd_h264 = scout::Attributes { resolution: Some("2160p".into()), ..a("h264") };
         assert_eq!(fit(&uhd_h264, Some(&Playable { h264: 0x29, ..firefox }), false), Fit::Never);
-        let p5 = scout::Attributes { dv_profile: 5, dolby_vision: true, hdr: true, ..a("hevc") };
+        let p5 = scout::Attributes { dv_profile: 5, hdr: true, ..a("hevc") };
         assert_eq!(fit(&p5, p, true), Fit::Never, "no picture without Dolby Vision");
         let shows_p5 = Playable { dolby_vision: DolbyVisionPlay { p5: true, p8: false }, ..safari };
         assert_eq!(fit(&p5, Some(&shows_p5), true), Fit::Copy, "a player that shows profile 5 opens it");
