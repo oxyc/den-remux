@@ -136,11 +136,11 @@ pub struct Session {
     pub info: MediaInfo,
     /// The audio track played, counting audio tracks only.
     pub audio: usize,
-    /// The track is copied as it is, as this codec (`ec-3`, `ac-3`); `None` re-encodes it to AAC.
+    /// The track is copied as it is, as this codec (`ec-3`, `ac-3`, `fLaC`); `None` re-encodes it to AAC.
     pub audio_copy: Option<&'static str>,
-    /// What happens to the track: copied, or AAC stereo or 5.1.
+    /// What happens to the track: copied, or AAC stereo, 5.1 or 7.1.
     pub audio_out: job::AudioOut,
-    /// The channels the session's audio carries: the track's own when copied, else 2 or 6.
+    /// The channels the session's audio carries: the track's own when copied, else 2, 6 or 8.
     pub audio_channels: u32,
     /// Subtitle renditions, when the browser asked for any.
     pub subs: Option<crate::subs::Subs>,
@@ -879,8 +879,8 @@ pub struct Want<'a> {
 /// What the player decodes, as its own tests found (`playable` in `POST /remux/session`): the highest level it
 /// takes of 8-bit H.264 and of H.264 High 10 (`level_idc`), 8-bit and 10-bit HEVC (`general_level_idc`, level ×
 /// 30) and HEVC's High tier, and of 8-bit and 10-bit AV1 at Main profile (`seq_level_idx`), 0 for none, and whether
-/// it decodes PQ HDR in HEVC and in AV1. An HEVC release beyond it is transcoded on the GPU; an H.264 or AV1 one is
-/// passed over.
+/// it decodes PQ HDR in HEVC and in AV1, which of VP9's profiles it decodes, and which audio it plays as it is. An HEVC
+/// release beyond it is transcoded on the GPU; an H.264, AV1 or VP9 one is passed over.
 #[derive(serde::Deserialize, serde::Serialize, Clone, Copy, Debug, Default)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Playable {
@@ -907,6 +907,16 @@ pub struct Playable {
     pub av1_main10: u16,
     /// Decodes 10-bit AV1 with PQ.
     pub av1_hdr: bool,
+    /// Plays FLAC in fMP4 HLS: such a track is copied, not converted.
+    pub flac: bool,
+    /// Plays 8-channel AAC-LC: a converted track of eight channels or more stays 7.1 rather than folding down to 5.1.
+    pub aac71: bool,
+    /// Decodes VP9 profile 0 (8-bit) in fMP4 HLS. Nothing on the box converts VP9, so where this and `vp9_profile2` are
+    /// false a VP9 release isn't tried at all — nor, whatever they say, for a session Safari's native player plays
+    /// (`through`).
+    pub vp9: bool,
+    /// Decodes VP9 profile 2 (10-bit).
+    pub vp9_profile2: bool,
 }
 
 /// `playable.dolbyVision`: profile 5 (no base layer at all; Safari shows it, Chrome can't) and profile 8.x shown as
@@ -937,7 +947,16 @@ impl std::fmt::Display for Playable {
         };
         let av1_hdr = if self.av1_hdr { ", AV1 HDR" } else { "" };
         let aac = if self.aac_multichannel { ", AAC 5.1" } else { "" };
-        write!(f, "{hdr}, AV1 L{}, AV1 10-bit L{}{av1_hdr}{dv}{aac}", self.av1, self.av1_main10)
+        let more: String = [
+            (self.aac71, ", AAC 7.1"),
+            (self.flac, ", FLAC"),
+            (self.vp9, ", VP9"),
+            (self.vp9_profile2, ", VP9 profile 2"),
+        ]
+        .into_iter()
+        .filter_map(|(on, name)| on.then_some(name))
+        .collect();
+        write!(f, "{hdr}, AV1 L{}, AV1 10-bit L{}{av1_hdr}{dv}{aac}{more}", self.av1, self.av1_main10)
     }
 }
 
@@ -972,7 +991,23 @@ impl Playable {
                 };
                 fits(max) && (!info.hdr || self.av1_hdr)
             }
+            // Profile 0 is 8-bit; profile 2 is 10-bit or 12-bit, and a player is asked about 10. No level is asked.
+            VideoCodec::Vp9 => match (named, info.codecs.as_deref().and_then(|c| c.split('.').nth(3))) {
+                (Some((0, _, _)), _) => self.vp9,
+                (Some((2, _, _)), Some("10")) => self.vp9_profile2,
+                _ => false,
+            },
             VideoCodec::Other(_) => false,
+        }
+    }
+
+    /// The report as it holds for the page's HLS player (`player` in `POST /remux/session`): no VP9 but through hls.js.
+    /// Safari's native player refuses VP9 in fMP4 HLS (MediaError 3) where hls.js on the same Safari plays it, so a
+    /// session that is native, or doesn't say, gets no VP9 — and neither does scout's ranking for it.
+    pub fn through(self, player: Option<&str>) -> Playable {
+        match player {
+            Some("hls.js") => self,
+            _ => Playable { vp9: false, vp9_profile2: false, ..self },
         }
     }
 
@@ -982,6 +1017,10 @@ impl Playable {
 
     fn takes_av1(&self) -> bool {
         self.av1 > 0 || self.av1_main10 > 0
+    }
+
+    fn takes_vp9(&self) -> bool {
+        self.vp9 || self.vp9_profile2
     }
 }
 
@@ -1015,12 +1054,12 @@ pub(crate) fn dolby_vision_signal(
 
 /// The VIDEO-RANGE a copied variant names when it keeps no Dolby Vision. Without one a player takes the stream as
 /// SDR, so an HDR copy has to say so: an AV1 by the transfer its codec string names, an HEVC by HLG where the
-/// container says so and PQ otherwise, since an HDR release that names only its Rec. 2020 colours is HDR10. `None`
-/// for SDR.
+/// container says so and PQ otherwise, since an HDR release that names only its Rec. 2020 colours is HDR10, and a VP9
+/// the same way — though it is HDR only by its transfer (`vp9_track`). `None` for SDR.
 fn copied_range(info: &MediaInfo, codecs: &str) -> Option<&'static str> {
     match info.video {
         VideoCodec::Av1 => crate::probe::av1_video_range(codecs),
-        VideoCodec::Hevc if info.hdr => Some(if info.hlg { "HLG" } else { "PQ" }),
+        VideoCodec::Hevc | VideoCodec::Vp9 if info.hdr => Some(if info.hlg { "HLG" } else { "PQ" }),
         _ => None,
     }
 }
@@ -1046,6 +1085,32 @@ pub(crate) fn dolby_codec(container_codec: &str) -> Option<&'static str> {
     }
 }
 
+/// The HLS codec a FLAC track is copied as, from Matroska's `A_FLAC` or MP4's `fLaC`; `None` for anything else.
+pub(crate) fn flac_codec(container_codec: &str) -> Option<&'static str> {
+    matches!(container_codec, "A_FLAC" | "fLaC").then_some("fLaC")
+}
+
+/// How a track of `channels` plays, by its container's codec name: copied as the HLS codec the player takes it as —
+/// E-AC-3 or AC-3 (`playable.eac3`), FLAC (`playable.flac`) — or converted to AAC-LC: 7.1 from eight channels or more
+/// where the player plays 8-channel AAC, 5.1 from six or more where it plays multichannel AAC, stereo otherwise.
+pub(crate) fn audio_plan(
+    container_codec: &str,
+    channels: u32,
+    playable: Option<&Playable>,
+) -> (Option<&'static str>, job::AudioOut) {
+    let p = playable.copied().unwrap_or_default();
+    let copy = dolby_codec(container_codec)
+        .filter(|_| p.eac3)
+        .or_else(|| flac_codec(container_codec).filter(|_| p.flac));
+    let out = match copy {
+        Some(_) => job::AudioOut::Copy,
+        None if channels >= 8 && p.aac71 => job::AudioOut::Surround71,
+        None if channels >= 6 && p.aac_multichannel => job::AudioOut::Surround,
+        None => job::AudioOut::Stereo,
+    };
+    (copy, out)
+}
+
 /// Whether a transcode of this release has to tone-map it to SDR. The container's transfer says so where it is
 /// written down — a UHD Blu-ray remux often leaves Matroska's Colour element out — and Dolby Vision says so too:
 /// its base layer is HDR10 or HLG, except profile 8.2's, which is already SDR.
@@ -1054,13 +1119,13 @@ pub(crate) fn tonemaps(info: &crate::probe::MediaInfo) -> bool {
 }
 
 /// Whether the player takes the release's video as it is: by `playable`, else by `videoCodecs`, which can only say
-/// that it takes no HEVC — and never that it takes AV1, which only `playable` reports.
+/// that it takes no HEVC — and never that it takes AV1 or VP9, which only `playable` reports.
 fn plays(want: &Want<'_>, takes_hevc: bool, info: &crate::probe::MediaInfo) -> bool {
     match want.playable {
         Some(p) => p.takes(info),
         None => match info.video {
             VideoCodec::Hevc => takes_hevc,
-            VideoCodec::Av1 => false,
+            VideoCodec::Av1 | VideoCodec::Vp9 => false,
             _ => true,
         },
     }
@@ -1115,6 +1180,19 @@ pub(crate) fn fit(a: &scout::Attributes, playable: Option<&Playable>, takes_hevc
                 Fit::Never
             } else {
                 Fit::Copy
+            }
+        }
+        (Some("vp9"), p) => {
+            // Nothing converts VP9 either. A 10 is profile 2's; a depth nobody read is left to the probe.
+            let takes = p.is_some_and(|p| match a.bit_depth {
+                0 => p.takes_vp9(),
+                d if d >= 10 => p.vp9_profile2,
+                _ => p.vp9,
+            });
+            if takes {
+                Fit::Copy
+            } else {
+                Fit::Never
             }
         }
         (Some("hevc"), None) if !takes_hevc => Fit::Convert,
@@ -1226,8 +1304,8 @@ pub async fn releases(
         Admission::Install => None,
     };
     let source = scout::ScoutSource { base: scout_base(st, scout)?, key };
-    // No capability report comes with this request, so no AV1: nothing says the player decodes it.
-    Ok(scout::candidates(&scout_list(st, &source, id, by_install, None).await?, None, false))
+    // No capability report comes with this request, so no AV1 or VP9: nothing says the player decodes them.
+    Ok(scout::candidates(&scout_list(st, &source, id, by_install, None).await?, None, false, false))
 }
 
 /// `POST /remux/session`: pick and probe a release, choose its audio track, and set up its session.
@@ -1276,7 +1354,12 @@ pub async fn create(
     };
     let secrets = [source.base.as_str()];
     let list = scout_list(st, &source, imdb, by_install, want.playable).await?;
-    let candidates = scout::candidates(&list, want.filename, want.playable.is_some_and(Playable::takes_av1));
+    let candidates = scout::candidates(
+        &list,
+        want.filename,
+        want.playable.is_some_and(Playable::takes_av1),
+        want.playable.is_some_and(Playable::takes_vp9),
+    );
     if candidates.is_empty() {
         return Err(api(
             StatusCode::NOT_FOUND,
@@ -1358,7 +1441,7 @@ pub async fn create(
                         break;
                     }
                 }
-                // H.264 or AV1 beyond the player: nothing here makes H.264 smaller, or converts AV1 at all.
+                // H.264, AV1 or VP9 beyond the player: nothing here makes H.264 smaller, or converts AV1 or VP9 at all.
                 Ok((_, info)) if !plays(want, takes_hevc, &info) => eprintln!(
                     "session: {imdb} skipped \"{}\": {} is beyond this player",
                     c.attributes.label,
@@ -1451,17 +1534,8 @@ pub async fn create(
         }
         None => crate::lang::pick_audio(&info.audio, want.audio),
     };
-    // E-AC-3 or AC-3 plays as it is where the player says so; everything else is AAC — 5.1 from six channels or more
-    // where the player plays multichannel AAC, stereo otherwise.
-    let audio_copy = dolby_codec(&info.audio[audio].codec).filter(|_| want.playable.is_some_and(|p| p.eac3));
     let source_channels = info.audio[audio].channels;
-    let audio_out = match audio_copy {
-        Some(_) => job::AudioOut::Copy,
-        None if source_channels >= 6 && want.playable.is_some_and(|p| p.aac_multichannel) => {
-            job::AudioOut::Surround
-        }
-        None => job::AudioOut::Stereo,
-    };
+    let (audio_copy, audio_out) = audio_plan(&info.audio[audio].codec, source_channels, want.playable);
 
     let sid = crate::auth::random_id();
     let exp = unix_now() + (info.duration.ceil() as u64 + SESSION_GRACE_SECS).min(SESSION_MAX_SECS);
@@ -1540,9 +1614,10 @@ pub async fn create(
                     channels: source_channels,
                     language: info.audio[audio].language.as_deref(),
                 },
-                (None, job::AudioOut::Surround) => {
-                    playlist::Audio::AacSurround { language: info.audio[audio].language.as_deref() }
-                }
+                (None, job::AudioOut::Surround | job::AudioOut::Surround71) => playlist::Audio::AacSurround {
+                    channels: audio_out.channels(source_channels),
+                    language: info.audio[audio].language.as_deref(),
+                },
                 (None, _) => playlist::Audio::Aac,
             },
             peak,
@@ -1621,6 +1696,7 @@ pub async fn create(
         match (session.audio_copy, session.audio_out) {
             (Some(c), _) => format!(" copied as {c}"),
             (None, job::AudioOut::Surround) => " as AAC 5.1".to_string(),
+            (None, job::AudioOut::Surround71) => " as AAC 7.1".to_string(),
             (None, _) => String::new(),
         },
     );
@@ -1704,6 +1780,74 @@ mod tests {
         let av1 = info(VideoCodec::Av1, "av01.0.13M.10.0.110.09.16.09.0", true);
         assert_eq!(copied_range(&av1, "av01.0.13M.10.0.110.09.16.09.0"), Some("PQ"));
         assert_eq!(copied_range(&info(VideoCodec::H264, "avc1.640028", false), "avc1.640028"), None);
+        let hlg_vp9 = crate::probe::MediaInfo {
+            hlg: true,
+            ..info(VideoCodec::Vp9, "vp09.02.51.10.01.09.18.09.00", true)
+        };
+        assert_eq!(copied_range(&hlg_vp9, "vp09.02.51.10.01.09.18.09.00"), Some("HLG"));
+        assert_eq!(copied_range(&info(VideoCodec::Vp9, "vp09.00.41.08", false), "vp09.00.41.08"), None);
+    }
+
+    #[test]
+    fn vp9_plays_as_it_is_in_the_profile_the_player_reports_through_hls_js() {
+        let chrome = Playable { h264: 0x33, vp9: true, vp9_profile2: true, ..Playable::default() };
+        let p0 = info(VideoCodec::Vp9, "vp09.00.41.08", false);
+        let p2 = info(VideoCodec::Vp9, "vp09.02.51.10.01.09.16.09.00", true);
+        assert!(chrome.takes(&p0) && chrome.takes(&p2));
+        assert!(!Playable { vp9: false, ..chrome }.takes(&p0), "profile 2 only");
+        assert!(!Playable { vp9_profile2: false, ..chrome }.takes(&p2), "profile 0 only");
+        assert!(!chrome.takes(&info(VideoCodec::Vp9, "vp09.02.51.12", false)), "12-bit: never asked about");
+        assert!(!chrome.takes(&info(VideoCodec::Vp9, "vp09.01.41.08.03.01.01.01.00", false)), "profile 1");
+        assert_eq!(chrome.through(Some("hls.js")).to_string(), chrome.to_string());
+        let native = chrome.through(Some("native"));
+        assert!(!native.takes(&p0) && !native.takes(&p2), "Safari's native player refuses VP9 in fMP4");
+        assert!(!chrome.through(None).takes_vp9(), "nor does a session that doesn't say which player");
+        assert_eq!(native.h264, 0x33, "the rest of the report stands");
+        let sent = serde_json::to_value(native).unwrap();
+        assert!(sent["vp9"] == false && sent["vp9Profile2"] == false, "scout is sent it cleared: {sent}");
+        assert!(chrome.to_string().ends_with("AV1 10-bit L0, VP9, VP9 profile 2"), "{chrome}");
+
+        let a = |bit_depth| scout::Attributes { codec: Some("vp9".into()), bit_depth, ..Default::default() };
+        assert_eq!(fit(&a(8), Some(&chrome), false), Fit::Copy, "VP9 the player decodes is copied");
+        assert_eq!(
+            fit(&a(10), Some(&Playable { vp9_profile2: false, ..chrome }), false),
+            Fit::Never,
+            "8-bit only"
+        );
+        assert_eq!(fit(&a(8), Some(&Playable { vp9: false, ..chrome }), false), Fit::Never, "10-bit only");
+        let ten_bit_only = Playable { vp9: false, ..chrome };
+        assert_eq!(
+            fit(&a(0), Some(&ten_bit_only), false),
+            Fit::Copy,
+            "a depth nobody read: the probe decides"
+        );
+        assert_eq!(fit(&a(0), Some(&native), false), Fit::Never, "and never converted");
+        assert_eq!(fit(&a(0), None, true), Fit::Never, "without a report nothing says it plays");
+    }
+
+    #[test]
+    fn flac_is_copied_and_7_1_stays_7_1_where_the_player_says_so() {
+        use job::AudioOut as Out;
+        let chrome =
+            Playable { h264: 0x33, aac_multichannel: true, flac: true, aac71: true, ..Playable::default() };
+        assert_eq!(audio_plan("A_FLAC", 6, Some(&chrome)), (Some("fLaC"), Out::Copy));
+        assert_eq!(audio_plan("fLaC", 2, Some(&chrome)), (Some("fLaC"), Out::Copy), "MP4's name for it");
+        assert_eq!(audio_plan("A_FLAC", 6, Some(&Playable { flac: false, ..chrome })), (None, Out::Surround));
+        assert_eq!(audio_plan("A_TRUEHD", 8, Some(&chrome)), (None, Out::Surround71));
+        let no_71 = Playable { aac71: false, ..chrome };
+        assert_eq!(audio_plan("A_DTS", 8, Some(&no_71)), (None, Out::Surround), "7.1 folds down to 5.1");
+        assert_eq!(audio_plan("A_DTS", 6, Some(&chrome)), (None, Out::Surround), "5.1 stays 5.1");
+        assert_eq!(
+            audio_plan("A_EAC3", 8, Some(&chrome)),
+            (None, Out::Surround71),
+            "no eac3, no E-AC-3 copy"
+        );
+        assert_eq!(
+            audio_plan("A_EAC3", 6, Some(&Playable { eac3: true, ..chrome })),
+            (Some("ec-3"), Out::Copy)
+        );
+        assert_eq!(audio_plan("A_FLAC", 8, None), (None, Out::Stereo), "no report: stereo, as before");
+        assert!(chrome.to_string().ends_with("AAC 5.1, AAC 7.1, FLAC"), "{chrome}");
     }
 
     #[test]

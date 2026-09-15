@@ -2,11 +2,12 @@
 
 Den's playback for browsers — and, through the same URLs, for AirPlay and Cast receivers. A phone or a
 laptop cannot play what den-scout returns: Matroska, and Dolby/DTS/TrueHD audio. den-remux copies the
-video, re-encodes the audio to AAC (stereo, or 5.1 where the player plays it), and serves HLS (fMP4) cut on the file's
+video, copies the audio where the player plays it as it is or re-encodes it to AAC (stereo, or 5.1 or 7.1 where the
+player plays it), and serves HLS (fMP4) cut on the file's
 own keyframes.
 
 ```
-browser ──POST /remux/session {imdb, scout}───►  scout (the library's install URL, its credential) → cached H.264/HEVC/AV1 release
+browser ──POST /remux/session {imdb, scout}───►  scout (the library's install URL, its credential) → cached H.264/HEVC/AV1/VP9 release
         ◄──{ playlist: /remux/s/<sid>/<sig>/master.m3u8 }       probe: duration, tracks, keyframe index
 <video> ──GET /remux/s/<sid>/<sig>/seg<N>.m4s─►  ffmpeg: -c:v copy -c:a aac, one fMP4 file per GOP
 ```
@@ -21,7 +22,7 @@ POST   /remux/session                   {imdb, season?, episode?, filename?, sco
                                          subtitles?, subtitleLanguages?, videoCodecs?, playable?, startAt?, maxBitrate?, player?} (a full scout install,
                                          or browser cookie/bearer) → 201
                                         {sid, playlist, release:{label,filename,size}, duration, expiresAt,
-                                         video:{codec: h264|hevc|av1, transcoded}, audioTrack, audioChannels,
+                                         video:{codec: h264|hevc|av1|vp9, transcoded}, audioTrack, audioChannels,
                                          audioTracks:[{language,name,channels,commentary}], subtitles}
                                         401 not_logged_in · 403 scout_refused
                                         400 bad_request/bad_scout/bad_subtitles/bad_audio_track
@@ -32,10 +33,10 @@ POST   /remux/releases                  {imdb, season?, episode?, scout?} (a ful
                                         order it would try them, for a player to name one as `filename`. No URLs
 GET    /remux/speed?bytes=<n>           200 application/octet-stream: n random bytes (2 MiB unnamed, 8 MiB at most),
                                         no-store, no credential; 400 for a count that isn't one · 429 rate_limited
-GET    /remux/s/<sid>/<sig>/master.m3u8 one variant: CODECS "<avc1…|hvc1…|av01…>,mp4a.40.2", BANDWIDTH from size/duration;
-                                        copied Dolby audio: CODECS "…,ec-3|ac-3" and an AUDIO rendition with CHANNELS;
-                                        5.1 AAC: an AUDIO rendition with CHANNELS="6";
-                                        HDR AV1: VIDEO-RANGE=PQ|HLG
+GET    /remux/s/<sid>/<sig>/master.m3u8 one variant: CODECS "<avc1…|hvc1…|av01…|vp09…>,mp4a.40.2", BANDWIDTH from size/duration;
+                                        copied Dolby or FLAC audio: CODECS "…,ec-3|ac-3|fLaC" and an AUDIO rendition with CHANNELS;
+                                        5.1 or 7.1 AAC: an AUDIO rendition with CHANNELS="6"|"8";
+                                        HDR AV1 or VP9: VIDEO-RANGE=PQ|HLG
 GET    /remux/s/<sid>/<sig>/media.m3u8  VOD, #EXT-X-MAP init.mp4, segments on real keyframes, #EXT-X-ENDLIST;
                                         #EXT-X-START:TIME-OFFSET=<startAt>,PRECISE=YES for a resume
 GET    /remux/s/<sid>/<sig>/init.mp4
@@ -66,10 +67,12 @@ itself is never logged. Brave on iOS sends Safari's User-Agent, so it reads as S
   earlier session's `audioTracks` (send that session's `filename` with it). One track per session, so
   switching language is a new session. For a player whose `playable.eac3` says it plays E-AC-3 and AC-3 in
   fMP4 HLS (Safari, Apple's receivers), such a track is copied as it is, channels and all, and the master names
-  it (`ec-3`/`ac-3`, an AUDIO rendition with `CHANNELS`). Every other track is converted to AAC-LC: 5.1 at 384 kbit/s
-  from a track of six channels or more (7.1 folds down to 5.1) for a player whose `playable.aacMultichannel` says it
-  plays multichannel AAC — named in the master by an AUDIO rendition with `CHANNELS="6"` — and stereo at 192 kbit/s
-  otherwise, byte for byte as before. `audioChannels` in the answer is what the session carries, beside the track's
+  it (`ec-3`/`ac-3`, an AUDIO rendition with `CHANNELS`); so is a FLAC track (`fLaC`) for a player whose
+  `playable.flac` says it plays FLAC in fMP4 HLS. Every other track is converted to AAC-LC: 7.1 at 512 kbit/s from a
+  track of eight channels or more for a player whose `playable.aac71` says it plays 8-channel AAC (`CHANNELS="8"`);
+  5.1 at 384 kbit/s from a track of six channels or more (7.1 folds down to 5.1) for a player whose
+  `playable.aacMultichannel` says it plays multichannel AAC — named in the master by an AUDIO rendition with
+  `CHANNELS="6"` — and stereo at 192 kbit/s otherwise, byte for byte as before. `audioChannels` in the answer is what the session carries, beside the track's
   own `channels` in `audioTracks`: fewer means the track plays downmixed to stereo.
 - **Subtitles.** `subtitles` is den-subtitles' install URL from the library, on `SUBTITLE_ORIGINS`;
   `subtitleLanguages` (up to 4, most wanted first) become WebVTT renditions in the master playlist — what AirPlay
@@ -83,7 +86,7 @@ itself is never logged. Brave on iOS sends Safari's User-Agent, so it reads as S
   title is transcoded to H.264 on the GPU (Hardware transcode, below) — or refused with
   `transcode_unavailable` while transcoding is off or in use.
 - **What the player decodes.** `playable` — `{h264, h264High10, hevcMain, hevcMain10, hevcHighTier, hdr, eac3,
-  aacMultichannel, dolbyVision: {p5, p8}}`, the
+  aacMultichannel, dolbyVision: {p5, p8}, av1, av1Main10, av1Hdr, flac, aac71, vp9, vp9Profile2}`, the
   highest level it takes of 8-bit H.264 and of H.264 High 10 (`level_idc`, 0x33 is 5.1), of 8-bit and 10-bit HEVC
   (level × 30, 153 is 5.1) and of HEVC's High tier, 0 for none, and whether it decodes PQ HDR — decides over
   `videoCodecs` when given. A High 10 release (profile 110) is passed over unless `h264High10` reaches its level:
@@ -107,6 +110,16 @@ itself is never logged. Brave on iOS sends Safari's User-Agent, so it reads as S
   `av1C`; the master names the AV1-ISOBMFF codec string — with its colour fields whenever the stream describes its
   colours, so HDR10 is `av01.0.13M.10.0.110.09.16.09.0` — and `VIDEO-RANGE=PQ` (or `HLG`) for HDR. The colours come
   from Matroska's Colour element or MP4's `colr`, and where those are silent from the sequence header in `av1C`.
+- **VP9.** `playable.vp9` and `vp9Profile2` say the player decodes VP9 profile 0 (8-bit) and profile 2 (10-bit) in
+  fMP4 HLS; absent is false. They count only for a session that names `player: "hls.js"`: Safari's native HLS player
+  refuses VP9 in fMP4 (MediaError 3) where hls.js on the same Safari plays it, so for a native session, or one that
+  names no player, both are cleared — in the report sent to scout too. Like AV1, a VP9 release is only ever copied:
+  for a player that doesn't take its profile it is passed over, unopened where scout's `codec: "vp9"` and `bitDepth`
+  say so. 12-bit, and profiles 1 and 3, play nowhere. The copy keeps its `vp09` sample entry; the master names
+  `vp09.PP.LL.DD`, with the colour fields whenever the stream describes its colours, from MP4's `vpcC` or Matroska's
+  CodecPrivate features and Colour element. What they don't record is assumed: 10-bit profile 2 where the transfer is
+  PQ or HLG and 8-bit profile 0 otherwise, and the lowest level whose picture size and sample rate cover the release at
+  its frame rate (60 fps where that isn't known). Profile 2 with a PQ or HLG transfer is HDR: `VIDEO-RANGE=PQ|HLG`.
 - **A remote player's link.** Away from home every byte crosses the home upload, so a player that reached den-remux
   off the LAN times its link with `GET /remux/speed` and sends `maxBitrate`, in bits a second (the web app sends 70 %
   of what it measured). A release that plays as it is but whose average bitrate — its size × 8 over its duration —
@@ -126,7 +139,7 @@ itself is never logged. Brave on iOS sends Safari's User-Agent, so it reads as S
   ranking. Before any is opened, scout's
   attributes (`codec`, `resolution`, `hdr`, `bitDepth`, `dvProfile`, `probed`) sort them for this player: those
   that play as they are, then those that play only converted; one they rule out (Dolby Vision profile 5 without `dolbyVision.p5`, H.264
-  beyond the player, 10-bit H.264 without `h264High10`, AV1 beyond the player) is never opened, and anything they don't say is left to
+  beyond the player, 10-bit H.264 without `h264High10`, AV1 or VP9 beyond the player) is never opened, and anything they don't say is left to
   the probe. Three are opened at a time and taken in rank order; the first that plays as it is wins, one that
   plays only converted is the last resort, and the search goes on — up to 12 releases, starting none after 30 s,
   20 s each — while a release that may play as it is remains. An opened release — its debrid link and probe — is remembered
@@ -320,13 +333,14 @@ dependabot cannot bump it, so bump both lines by hand.
 ## Limits (MVP)
 
 - **Cached releases only** (an uncached one would start a debrid download).
-- **H.264, HEVC and AV1 sources only.** AV1 plays only as a copy, for a player whose `playable` says it decodes
-  it; there is no conversion to fall back on. VP9, MPEG-4 Part 2/XviD and VC-1 are skipped. Files without a
-  keyframe index (Matroska with no Cues) are skipped.
-- **Audio is AAC**, one track per session: 5.1 at most (a 7.1 track folds down to it) and only for a player that
-  reports `aacMultichannel`, stereo for every other — or, for a player that plays them, E-AC-3/AC-3 copied with no
-  stereo alternate beside it (Apple's authoring spec asks for AC-3 beside E-AC-3 for devices without it). A 5.1
-  variant carries no stereo alternate either: the player downmixes it for stereo output.
+- **H.264, HEVC, AV1 and VP9 sources only.** AV1 and VP9 play only as a copy, for a player whose `playable` says it
+  decodes them (VP9 through hls.js alone); there is no conversion to fall back on. MPEG-4 Part 2/XviD and VC-1 are
+  skipped. Files without a keyframe index (Matroska with no Cues) are skipped.
+- **Audio is AAC**, one track per session: 7.1 for a player that reports `aac71`, 5.1 for one that reports
+  `aacMultichannel` (a 7.1 track folds down to it), stereo for every other — or, for a player that plays them,
+  E-AC-3/AC-3 or FLAC copied with no stereo alternate beside it (Apple's authoring spec asks for AC-3 beside E-AC-3 for
+  devices without it). A 5.1 or 7.1 variant carries no stereo alternate either: the player downmixes it for stereo
+  output.
 - **Text subtitles only**, from den-subtitles; the release's own tracks (PGS, ASS) are not carried.
 - **Dolby Vision profile 5** has no HDR10/SDR base layer: Safari shows it, Chrome cannot, and stripped or
   transcoded its colours come out green and purple. A session skips it — the probe reads the profile — unless

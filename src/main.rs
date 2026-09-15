@@ -11,7 +11,7 @@
 //!
 //! A release comes from den-scout — the full install the request names, which is its own credential; for a
 //! logged-in browser also a scope=availability install opened with this service's key, or this service's
-//! own install. Its video is copied, its audio re-encoded to AAC — stereo, or 5.1 for a player that plays it — and it
+//! own install. Its video is copied, its audio re-encoded to AAC — stereo, or 5.1 or 7.1 for a player that plays it — and it
 //! is served as a VOD playlist cut on its own keyframes.
 
 mod auth;
@@ -559,7 +559,7 @@ where
         return bad_request(
             "Expected {\"imdb\": \"tt…\", \"season\"?: n, \"episode\"?: n, \"filename\"?: \"…\", \"scout\"?: \"…\", \
              \"audio\"?: [\"en\", …], \"audioTrack\"?: n, \"subtitles\"?: \"…\", \"subtitleLanguages\"?: [\"en\", …], \
-             \"videoCodecs\"?: [\"h264\", \"hevc\"], \"playable\"?: {\"h264\", \"h264High10\", \"hevcMain\", \"hevcMain10\", \"hevcHighTier\", \"hdr\", \"eac3\", \"aacMultichannel\", \"dolbyVision\": {\"p5\", \"p8\"}, \"av1\", \"av1Main10\", \"av1Hdr\"}, \
+             \"videoCodecs\"?: [\"h264\", \"hevc\"], \"playable\"?: {\"h264\", \"h264High10\", \"hevcMain\", \"hevcMain10\", \"hevcHighTier\", \"hdr\", \"eac3\", \"aacMultichannel\", \"dolbyVision\": {\"p5\", \"p8\"}, \"av1\", \"av1Main10\", \"av1Hdr\", \"flac\", \"aac71\", \"vp9\", \"vp9Profile2\"}, \
              \"startAt\"?: seconds, \"maxBitrate\"?: bits a second, \"player\"?: \"native\" | \"hls.js\"}.",
         );
     };
@@ -595,6 +595,7 @@ where
         return bad_request("audio, subtitleLanguages and videoCodecs are at most 8 short tags each.");
     }
     let id = scout::title_id(&req.imdb, episode);
+    let playable = req.playable.map(|p| p.through(req.player.as_deref()));
     let want = session::Want {
         id: &id,
         filename: req.filename.as_deref(),
@@ -604,7 +605,7 @@ where
         subtitles: req.subtitles.as_deref(),
         subtitle_languages: &req.subtitle_languages,
         video_codecs: &req.video_codecs,
-        playable: req.playable.as_ref(),
+        playable: playable.as_ref(),
         start_at: req.start_at.unwrap_or(0.0),
         max_bitrate: req.max_bitrate,
         client: client::label(parts.headers.get(hyper::header::USER_AGENT), req.player.as_deref()),
@@ -624,6 +625,7 @@ where
                     "codec": match (s.transcoded, &s.info.video) {
                         (false, probe::VideoCodec::Hevc) => "hevc",
                         (false, probe::VideoCodec::Av1) => "av1",
+                        (false, probe::VideoCodec::Vp9) => "vp9",
                         _ => "h264",
                     },
                     "transcoded": s.transcoded,

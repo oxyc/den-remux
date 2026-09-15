@@ -23,6 +23,13 @@
     },
     {
       "name": "Den Scout",
+      "title": "Film.2019.2160p.WEB-DL.VP9.Opus.mkv",
+      "url": "http://scout.test/p/ticket-vp9",
+      "attributes": {"resolution": "2160p", "codec": "vp9", "cached": true, "sizeBytes": 7000000000, "label": "4K VP9"},
+      "behaviorHints": {"bingeGroup": "x", "notWebReady": true, "filename": "Film.2019.2160p.WEB-DL.VP9.Opus.mkv"}
+    },
+    {
+      "name": "Den Scout",
       "title": "Film.2019.1080p.WEB-DL.DDP5.1.H.264.mkv",
       "url": "http://scout.test/p/ticket-web",
       "attributes": {"resolution": "1080p", "codec": "h264", "cached": true, "sizeBytes": 6000000000, "label": "1080p WEB-DL"},

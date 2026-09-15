@@ -21,6 +21,8 @@ pub enum VideoCodec {
     Hevc,
     /// Copied only, for a player that decodes it: nothing on the box converts AV1.
     Av1,
+    /// Copied only, as AV1 is — and only through hls.js: Safari's native player refuses VP9 in fMP4.
+    Vp9,
     Other(String),
 }
 
@@ -43,8 +45,8 @@ pub struct MediaInfo {
     pub container: &'static str,
     pub duration: f64,
     pub video: VideoCodec,
-    /// The RFC 6381 string for the copied video — `avc1.640028`, `hvc1.2.4.L150.B0`, `av01.0.08M.08` — from the
-    /// codec configuration record. `None` when the file carries none.
+    /// The RFC 6381 string for the copied video — `avc1.640028`, `hvc1.2.4.L150.B0`, `av01.0.08M.08`, `vp09.00.41.08` —
+    /// from the codec configuration record. `None` when the file carries none; VP9's is always named (`vp9_track`).
     pub codecs: Option<String>,
     pub width: u32,
     pub height: u32,
@@ -177,6 +179,127 @@ pub fn av1_video_range(codecs: &str) -> Option<&'static str> {
         "18" => Some("HLG"),
         _ => None,
     }
+}
+
+/// What a VP9 stream records of itself — its profile, level (× 10), bit depth and chroma subsampling, as the VP codec
+/// ISO media binding numbers them — and of its colours. `None` where nothing records it.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Vp9Config {
+    pub profile: Option<u8>,
+    pub level: Option<u8>,
+    pub depth: Option<u8>,
+    pub chroma: Option<u8>,
+    pub colour: Colour,
+}
+
+/// A `vpcC` box's payload: version and flags, the profile, the level (0 names none) and the bit depth in 4 bits, then
+/// — in version 1, what muxers write — the chroma subsampling in 3, the full-range flag, and the primaries, transfer
+/// and matrix.
+pub fn vpcc_config(vpcc: &[u8]) -> Option<Vp9Config> {
+    let b = vpcc.get(..7)?;
+    let mut config = Vp9Config {
+        profile: Some(b[4]),
+        level: Some(b[5]).filter(|l| *l > 0),
+        depth: Some(b[6] >> 4),
+        ..Vp9Config::default()
+    };
+    if let (1, Some(c)) = (b[0], vpcc.get(7..10)) {
+        config.chroma = Some((b[6] >> 1) & 7);
+        config.colour = Colour {
+            primaries: c[0] as u64,
+            transfer: c[1] as u64,
+            matrix: c[2] as u64,
+            full_range: Some(b[6] & 1 == 1),
+        };
+    }
+    Some(config)
+}
+
+/// Matroska's CodecPrivate for `V_VP9`: WebM's codec features, each an id, a length and a value — 1 the profile, 2 the
+/// level, 3 the bit depth, 4 the chroma subsampling. Muxers often write none (ffmpeg's Matroska muxer didn't, for a
+/// libvpx encode), and then nothing is recorded.
+pub fn vp9_features(private: &[u8]) -> Vp9Config {
+    let mut config = Vp9Config::default();
+    let mut rest = private;
+    while let [id, len, tail @ ..] = rest {
+        let Some(value) = tail.get(..*len as usize) else { break };
+        let v = value.first().copied().filter(|_| *len == 1);
+        match *id {
+            1 => config.profile = v,
+            2 => config.level = v.filter(|l| *l > 0),
+            3 => config.depth = v,
+            4 => config.chroma = v,
+            _ => {}
+        }
+        rest = &tail[*len as usize..];
+    }
+    config
+}
+
+/// A VP9 track's codec string, whether it is HDR and whether that HDR is HLG, from what the file records of the stream
+/// and what the container says of its colours. VP9 is HDR in profile 2 with a PQ or HLG transfer, and not otherwise.
+///
+/// A player is asked about the whole string, so what nothing records is assumed rather than left out: a bit depth of
+/// 10 where the transfer is PQ or HLG (HDR VP9 is 10-bit) and 8 otherwise, the profile that depth needs (2 or 0), and
+/// the level the picture needs at its frame rate — at 60 frames a second where that isn't known, so the level named
+/// is never below what the release needs (`vp9_level`).
+pub fn vp9_track(
+    recorded: Vp9Config,
+    container: Colour,
+    width: u32,
+    height: u32,
+    frame_rate: Option<f64>,
+) -> (String, bool, bool) {
+    let colour = container.or(recorded.colour);
+    let hdr_transfer = matches!(colour.transfer, 16 | 18);
+    let depth = recorded.depth.unwrap_or(if hdr_transfer { 10 } else { 8 });
+    let profile = recorded.profile.unwrap_or(if depth > 8 { 2 } else { 0 });
+    let level = recorded.level.unwrap_or_else(|| vp9_level(width, height, frame_rate));
+    let mut s = format!("vp09.{profile:02}.{level:02}.{depth:02}");
+    // The optional fields — chroma subsampling, primaries, transfer, matrix, full range — go all together or not at
+    // all, and absent they mean 4:2:0 (sited with the luma, 1) in BT.709: so they're written whenever the stream says
+    // anything of its colours, or its chroma is otherwise. An HDR stream's string then names its PQ or HLG.
+    let chroma = recorded.chroma.unwrap_or(1);
+    if colour.says() || chroma != 1 {
+        let code = |c: u64| if c == 0 { 2 } else { c };
+        s.push_str(&format!(
+            ".{chroma:02}.{:02}.{:02}.{:02}.{:02}",
+            code(colour.primaries),
+            code(colour.transfer),
+            code(colour.matrix),
+            u8::from(colour.full_range == Some(true))
+        ));
+    }
+    (s, profile == 2 && hdr_transfer, profile == 2 && colour.transfer == 18)
+}
+
+/// The lowest VP9 level (× 10) whose largest picture and luma sample rate cover a `width` × `height` picture at
+/// `frame_rate` (VP9 bitstream spec, Annex A) — at 60 frames a second where the rate isn't known, and for a 1080p
+/// picture where the size isn't.
+fn vp9_level(width: u32, height: u32, frame_rate: Option<f64>) -> u8 {
+    // (level, largest picture, luma samples a second).
+    const LEVELS: [(u8, u64, u64); 14] = [
+        (10, 36_736, 829_440),
+        (11, 73_856, 2_764_800),
+        (20, 122_880, 4_608_000),
+        (21, 245_760, 9_216_000),
+        (30, 552_960, 20_736_000),
+        (31, 983_040, 36_864_000),
+        (40, 2_228_224, 83_558_400),
+        (41, 2_228_224, 160_432_128),
+        (50, 8_912_896, 311_951_360),
+        (51, 8_912_896, 588_251_136),
+        (52, 8_912_896, 1_176_502_272),
+        (60, 35_651_584, 1_176_502_272),
+        (61, 35_651_584, 2_353_004_544),
+        (62, 35_651_584, 4_706_009_088),
+    ];
+    let picture = match width as u64 * height as u64 {
+        0 => 1920 * 1080,
+        p => p,
+    };
+    let samples = picture as f64 * frame_rate.filter(|f| *f > 0.0).unwrap_or(60.0);
+    LEVELS.iter().find(|(_, size, rate)| picture <= *size && samples <= *rate as f64).map_or(62, |l| l.0)
 }
 
 /// Bits of an OBU, most significant first.
@@ -656,7 +779,8 @@ pub fn avc_codecs(avcc: &[u8]) -> Option<String> {
 
 /// The profile, level and tier an RFC 6381 string names: `avc1.640033` is (100, 51, false), level 5.1 as
 /// `level_idc`; `hvc1.2.4.H153.B0` is (2, 153, true), Main 10 at level 5.1 (`general_level_idc`, level × 30) in
-/// HEVC's High tier; `av01.0.13M.10` is (0, 13, false), Main profile at `seq_level_idx` 13 (level 5.1), Main tier.
+/// HEVC's High tier; `av01.0.13M.10` is (0, 13, false), Main profile at `seq_level_idx` 13 (level 5.1), Main tier;
+/// `vp09.02.51.10` is (2, 51, false), profile 2 at level 5.1 (level × 10), which has no tiers.
 pub fn profile_level(codecs: &str) -> Option<(u8, u16, bool)> {
     let mut parts = codecs.split('.');
     match parts.next()? {
@@ -677,6 +801,7 @@ pub fn profile_level(codecs: &str) -> Option<(u8, u16, bool)> {
             let level = level_tier.get(..2)?.parse().ok()?;
             Some((profile, level, level_tier.get(2..)? == "H"))
         }
+        "vp09" => Some((parts.next()?.parse().ok()?, parts.next()?.parse().ok()?, false)),
         _ => None,
     }
 }
@@ -735,6 +860,62 @@ mod tests {
         assert_eq!(profile_level("av01.0.13M.10.0.110.09.16.09.0"), Some((0, 13, false)));
         assert_eq!(profile_level("av01.0.14H.10"), Some((0, 14, true)));
         assert_eq!(profile_level("av01.0"), None);
+        assert_eq!(profile_level("vp09.02.51.10.01.09.16.09.00"), Some((2, 51, false)));
+        assert_eq!(profile_level("vp09.00"), None);
+    }
+
+    #[test]
+    fn a_vp9_stream_is_named_by_what_it_records_and_the_rest_is_assumed() {
+        // ffmpeg 8.0's own vpcC boxes for 640 × 360 at 24 fps: profile 0, 8-bit, unspecified colours; and profile 2,
+        // 10-bit, with only BT.2020's matrix.
+        let p0 = vpcc_config(&unhex("010000000015820202020000")).unwrap();
+        let unspecified = Colour { primaries: 2, transfer: 2, matrix: 2, full_range: Some(false) };
+        let recorded = Vp9Config {
+            profile: Some(0),
+            level: Some(21),
+            depth: Some(8),
+            chroma: Some(1),
+            colour: unspecified,
+        };
+        assert_eq!(p0, recorded);
+        assert_eq!(vp9_track(p0, Colour::default(), 640, 360, None), ("vp09.00.21.08".into(), false, false));
+        let p2 = vpcc_config(&unhex("010000000215a20202090000")).unwrap();
+        assert_eq!(vp9_track(p2, Colour::default(), 640, 360, None).0, "vp09.02.21.10.01.02.02.09.00");
+        let pq = Colour { primaries: 9, transfer: 16, matrix: 9, full_range: Some(false) };
+        assert_eq!(vp9_track(p2, pq, 640, 360, None), ("vp09.02.21.10.01.09.16.09.00".into(), true, false));
+        assert!(!vp9_track(p0, pq, 640, 360, None).1, "PQ in profile 0 is no HDR VP9 has");
+        assert_eq!(vpcc_config(&[1, 0, 0, 0, 2, 51]), None, "truncated");
+        let v0 = vpcc_config(&[0, 0, 0, 0, 2, 0, 0xa0]).unwrap();
+        assert_eq!((v0.profile, v0.level, v0.depth, v0.chroma), (Some(2), None, Some(10), None), "version 0");
+
+        let features = vp9_features(&[1, 1, 2, 2, 1, 51, 3, 1, 10, 4, 1, 1]);
+        assert_eq!(
+            (features.profile, features.level, features.depth, features.chroma),
+            (Some(2), Some(51), Some(10), Some(1))
+        );
+        assert_eq!(vp9_features(&[1, 1]), Vp9Config::default(), "truncated");
+        // Nothing recorded, as in most Matroska: 8-bit profile 0 at the level the picture needs, or 10-bit profile 2
+        // where the transfer is HDR's.
+        let none = Vp9Config::default();
+        assert_eq!(vp9_track(none, Colour::default(), 1920, 1080, Some(24.0)).0, "vp09.00.40.08");
+        assert_eq!(
+            vp9_track(none, Colour::default(), 1920, 1080, None).0,
+            "vp09.00.41.08",
+            "60 fps when unknown"
+        );
+        assert_eq!(
+            vp9_track(none, Colour::default(), 0, 0, Some(24.0)).0,
+            "vp09.00.40.08",
+            "an unknown size is 1080p"
+        );
+        let hlg = Colour { primaries: 9, transfer: 18, matrix: 9, full_range: None };
+        assert_eq!(
+            vp9_track(none, hlg, 3840, 2160, Some(24.0)),
+            ("vp09.02.50.10.01.09.18.09.00".into(), true, true)
+        );
+        assert_eq!(vp9_level(3840, 2160, Some(60.0)), 51);
+        assert_eq!(vp9_level(640, 360, Some(24.0)), 21, "as ffmpeg's muxer works it out");
+        assert_eq!(vp9_level(15360, 8640, Some(120.0)), 62, "past every level");
     }
 
     /// `fields` as (value, width) pairs, packed most significant bit first.

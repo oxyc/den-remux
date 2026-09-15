@@ -61,9 +61,9 @@ pub fn media(segs: &[Segment], start: f64) -> String {
 pub enum Audio<'a> {
     /// The track re-encoded to AAC-LC stereo.
     Aac,
-    /// The track re-encoded to AAC-LC 5.1, with its language.
-    AacSurround { language: Option<&'a str> },
-    /// A Dolby track copied as it is: `ec-3` or `ac-3`, with its channel count and language.
+    /// The track re-encoded to AAC-LC 5.1 or 7.1: its channels, 6 or 8, and its language.
+    AacSurround { channels: u32, language: Option<&'a str> },
+    /// A track copied as it is: `ec-3`, `ac-3` or `fLaC`, with its channel count and language.
     Copy { codec: &'static str, channels: u32, language: Option<&'a str> },
 }
 
@@ -80,7 +80,7 @@ pub struct DolbyVision {
 /// `(language, name)` in `subs`, most wanted first. The first is the default, so a player shows it without being
 /// asked; the rest are there to choose.
 ///
-/// Copied and 5.1 audio is also named by an AUDIO rendition with no URI — its media is in the variant's own segments —
+/// Copied and multichannel AAC audio is also named by an AUDIO rendition with no URI — its media is in the variant's own segments —
 /// so the player learns its CHANNELS, which CODECS does not carry. Stereo AAC, which every player assumes, is not.
 ///
 /// FRAME-RATE is named wherever the file says it: Safari passes over a VIDEO-RANGE=PQ variant without one, with no
@@ -101,7 +101,7 @@ pub fn master(
     let mut out = String::from("#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-INDEPENDENT-SEGMENTS\n");
     let (audio_codec, rendition) = match audio {
         Audio::Aac => ("mp4a.40.2", None),
-        Audio::AacSurround { language } => ("mp4a.40.2", Some((6, language))),
+        Audio::AacSurround { channels, language } => ("mp4a.40.2", Some((*channels, language))),
         Audio::Copy { codec, channels, language } => (*codec, Some((*channels, language))),
     };
     if let Some((channels, language)) = rendition {
@@ -275,8 +275,8 @@ mod tests {
 
     #[test]
     fn aac_5_1_is_named_with_its_channels_and_stereo_is_not() {
-        let m =
-            master("avc1.640028", None, &Audio::AacSurround { language: Some("swe") }, 1, 1, None, None, &[]);
+        let surround = Audio::AacSurround { channels: 6, language: Some("swe") };
+        let m = master("avc1.640028", None, &surround, 1, 1, None, None, &[]);
         assert!(
             m.contains(
                 "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"audio\",NAME=\"Swedish\",LANGUAGE=\"swe\",DEFAULT=YES,AUTOSELECT=YES,CHANNELS=\"6\"\n"
@@ -290,6 +290,24 @@ mod tests {
             "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-INDEPENDENT-SEGMENTS\n\
              #EXT-X-STREAM-INF:BANDWIDTH=1,AVERAGE-BANDWIDTH=1,CODECS=\"avc1.640028,mp4a.40.2\"\nmedia.m3u8\n",
             "stereo is as it always was"
+        );
+    }
+
+    #[test]
+    fn aac_7_1_and_copied_flac_are_named_with_their_channels() {
+        let aac71 = Audio::AacSurround { channels: 8, language: Some("eng") };
+        let m = master("vp09.00.41.08", None, &aac71, 1, 1, None, None, &[]);
+        assert!(m.contains("LANGUAGE=\"eng\",DEFAULT=YES,AUTOSELECT=YES,CHANNELS=\"8\"\n"), "{m}");
+        assert!(m.contains("CODECS=\"vp09.00.41.08,mp4a.40.2\",AUDIO=\"audio\"\nmedia.m3u8"), "{m}");
+        let flac = Audio::Copy { codec: "fLaC", channels: 6, language: None };
+        let hdr = DolbyVision { supplemental: None, range: "PQ" };
+        let m = master("vp09.02.51.10.01.09.16.09.00", Some(&hdr), &flac, 1, 1, None, None, &[]);
+        assert!(m.contains("NAME=\"Audio\",DEFAULT=YES,AUTOSELECT=YES,CHANNELS=\"6\"\n"), "{m}");
+        assert!(
+            m.contains(
+                "CODECS=\"vp09.02.51.10.01.09.16.09.00,fLaC\",VIDEO-RANGE=PQ,AUDIO=\"audio\"\nmedia.m3u8"
+            ),
+            "{m}"
         );
     }
 

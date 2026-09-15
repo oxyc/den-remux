@@ -15,7 +15,7 @@ unevenly, and the B-frames are what trigger ffmpeg's seek back-off (see `src/job
 | `av1.mkv` | AV1: SVT-AV1's 10-bit HDR10 (PQ, BT.2020), `V_AV1` with its `av1C` CodecPrivate, Colour element and sequence header; Opus audio | 0, 2.5, 6, 8.5, 12, 14, 18.5, 21, 24, 27.5 | 30.008 |
 | `av1.mp4` | `av1.mkv`'s video copied into MP4: the `av01` sample entry's `av1C` and `colr` | as `av1.mkv` | 29.999 |
 | `surround.mkv` | `h264.mkv`'s video copied, with a 5.1 AAC track (eng) and a 7.1 one (swe): converted to AAC 5.1 | as `h264.mkv` | 30.021 |
-| `scout-streams.json` | A den-scout stream list: uncached, AV1, XviD/AVI, 3D and cache-unknown releases to skip | — | — |
+| `scout-streams.json` | A den-scout stream list: uncached, AV1, VP9, XviD/AVI, 3D and cache-unknown releases to skip | — | — |
 
 ## Regenerating
 

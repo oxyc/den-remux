@@ -36,6 +36,7 @@ const TRANSFER_CHARACTERISTICS: u32 = 0x55BA;
 const PRIMARIES: u32 = 0x55BB;
 const MATRIX_COEFFICIENTS: u32 = 0x55B1;
 const RANGE: u32 = 0x55B9;
+const BITS_PER_CHANNEL: u32 = 0x55B2;
 const AUDIO: u32 = 0xE1;
 const CHANNELS: u32 = 0x9F;
 const BLOCK_ADDITION_MAPPING: u32 = 0x41E4;
@@ -130,6 +131,8 @@ struct Track {
     matrix: u64,
     /// Matroska's Range: 1 broadcast, 2 full; 0 (and 3, "defined by the matrix and transfer") says neither.
     range: u64,
+    /// The Colour element's BitsPerChannel; 0 where it says nothing.
+    bits: u8,
     channels: u32,
     dovi: Option<super::DolbyVision>,
 }
@@ -162,6 +165,7 @@ fn parse_tracks(b: &[u8]) -> Vec<Track> {
                         t.primaries = of(PRIMARIES);
                         t.matrix = of(MATRIX_COEFFICIENTS);
                         t.range = of(RANGE);
+                        t.bits = of(BITS_PER_CHANNEL).min(255) as u8;
                     }
                     AUDIO => t.channels = child(v, CHANNELS).map(uint).unwrap_or(1) as u32,
                     BLOCK_ADDITION_MAPPING => {
@@ -337,6 +341,17 @@ pub async fn probe(src: &Source<'_>, head: &[u8]) -> Result<MediaInfo, ProbeErro
         let (codecs, av1_hdr) = super::av1_track(&video.private, colour(video));
         hdr = av1_hdr;
         (VideoCodec::Av1, codecs)
+    } else if video.codec_id == "V_VP9" {
+        // V_VP9's CodecPrivate, where there is one, is WebM's codec features; BitsPerChannel speaks for a depth they
+        // don't record.
+        let features = super::vp9_features(&video.private);
+        let recorded =
+            super::Vp9Config { depth: features.depth.or(Some(video.bits).filter(|b| *b > 0)), ..features };
+        let rate = (video.default_duration > 0).then(|| 1e9 / video.default_duration as f64);
+        let (codecs, vp9_hdr, vp9_hlg) =
+            super::vp9_track(recorded, colour(video), video.width, video.height, rate);
+        (hdr, hlg) = (vp9_hdr, vp9_hlg);
+        (VideoCodec::Vp9, Some(codecs))
     } else {
         (VideoCodec::Other(video.codec_id.clone()), None)
     };

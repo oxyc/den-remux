@@ -50,7 +50,8 @@ const STDERR_TAIL: usize = 2048;
 pub enum Video {
     Copy {
         /// The sample entry to write: `hvc1` for HEVC (Safari plays HEVC in fMP4 only under it, not `hev1`), `dvh1`
-        /// for Dolby Vision profile 5 kept as it is; `None` leaves the muxer's own: `avc1` for H.264, `av01` for AV1.
+        /// for Dolby Vision profile 5 kept as it is; `None` leaves the muxer's own: `avc1` for H.264, `av01` for AV1,
+        /// `vp09` for VP9.
         tag: Option<&'static str>,
         dovi: Dovi,
     },
@@ -119,13 +120,15 @@ pub fn preset_for(max_bitrate: Option<u64>) -> Preset {
 /// What happens to the audio track.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum AudioOut {
-    /// Copied as it is — E-AC-3 or AC-3, for a player that plays them in fMP4 HLS.
+    /// Copied as it is — E-AC-3, AC-3 or FLAC, for a player that plays them in fMP4 HLS.
     Copy,
     /// Re-encoded to AAC-LC stereo, which every player takes.
     Stereo,
     /// Re-encoded to AAC-LC 5.1, for a player that plays multichannel AAC, from a track of six channels or more.
     /// `-ac 6` hands the encoder 5.1 whatever the source's layout: swresample folds 7.1 down to it.
     Surround,
+    /// Re-encoded to AAC-LC 7.1, for a player that plays 8-channel AAC, from a track of eight channels or more.
+    Surround71,
 }
 
 impl AudioOut {
@@ -135,6 +138,7 @@ impl AudioOut {
             AudioOut::Copy => source,
             AudioOut::Stereo => 2,
             AudioOut::Surround => 6,
+            AudioOut::Surround71 => 8,
         }
     }
 }
@@ -226,6 +230,8 @@ pub fn args(spec: &Spec<'_>, ca_file: Option<&str>) -> Vec<String> {
         AudioOut::Stereo => a.extend(s(&["-c:a", "aac", "-ac", "2", "-b:a", "192k"])),
         // 64 kbit/s a channel, as the stereo track has.
         AudioOut::Surround => a.extend(s(&["-c:a", "aac", "-ac", "6", "-b:a", "384k"])),
+        // 64 kbit/s a channel, as 5.1 has.
+        AudioOut::Surround71 => a.extend(s(&["-c:a", "aac", "-ac", "8", "-b:a", "512k"])),
     }
     a.extend(s(&["-threads", "1", "-filter_threads", "1"]));
     a.extend(s(&["-max_muxing_queue_size", "1024", "-avoid_negative_ts", "disabled"]));
@@ -596,10 +602,25 @@ mod tests {
         let alignment = "-copyts -start_at_zero -noaccurate_seek -ss 13.135000";
         assert!(joined.contains(alignment), "the same alignment: {joined}");
         assert_eq!(
-            [AudioOut::Copy, AudioOut::Stereo, AudioOut::Surround].map(|o| o.channels(8)),
-            [8, 2, 6],
-            "7.1 copied keeps its eight, converted comes down to two or six"
+            [AudioOut::Copy, AudioOut::Stereo, AudioOut::Surround, AudioOut::Surround71]
+                .map(|o| o.channels(8)),
+            [8, 2, 6, 8],
+            "7.1 copied or kept 7.1 keeps its eight, converted otherwise comes down to two or six"
         );
+    }
+
+    #[test]
+    fn seven_one_for_a_player_that_plays_it_is_aac_7_1() {
+        let spec = Spec {
+            input: "/f.mkv",
+            seek: seek_for(13.0),
+            video: Video::Copy { tag: None, dovi: Dovi::Absent },
+            audio: 1,
+            audio_out: AudioOut::Surround71,
+            dir: Path::new("/d"),
+        };
+        let joined = args(&spec, None).join(" ");
+        assert!(joined.contains("-map 0:a:1 -c:v copy -c:a aac -ac 8 -b:a 512k -threads 1"), "{joined}");
     }
 
     #[test]

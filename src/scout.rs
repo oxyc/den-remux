@@ -98,14 +98,14 @@ pub fn parse(body: &[u8]) -> Result<Vec<Stream>, String> {
 }
 
 /// Could the browser take this release with only the audio re-encoded? Cached — an uncached one would
-/// start a debrid download and play nothing — and H.264 or HEVC, AV1 for a player that decodes it (`av1`),
-/// or a codec the title does not name (the probe decides those). AV1 for any other player, VP9, MPEG-4
-/// Part 2 and VC-1 need the video re-encoded, which this service does not do. Containers other than
-/// Matroska and MP4 are left out by name.
-fn remuxable(s: &Stream, av1: bool) -> bool {
+/// start a debrid download and play nothing — and H.264 or HEVC, AV1 or VP9 for a player that decodes it
+/// (`av1`, `vp9`), or a codec the title does not name (the probe decides those). AV1 or VP9 for any other
+/// player, MPEG-4 Part 2 and VC-1 need the video re-encoded, which this service does not do. Containers
+/// other than Matroska and MP4 are left out by name.
+fn remuxable(s: &Stream, av1: bool, vp9: bool) -> bool {
     let codec_ok = match s.attributes.codec.as_deref().map(str::to_ascii_lowercase) {
         None => true,
-        Some(c) => c == "h264" || c == "hevc" || (av1 && c == "av1"),
+        Some(c) => c == "h264" || c == "hevc" || (av1 && c == "av1") || (vp9 && c == "vp9"),
     };
     let name = s.filename().to_ascii_lowercase();
     let container_ok = ![".avi", ".ts", ".m2ts", ".iso", ".wmv", ".mpg", ".mpeg", ".vob", ".webm"]
@@ -116,9 +116,9 @@ fn remuxable(s: &Stream, av1: bool) -> bool {
 
 /// The releases worth trying, in the order to try them: the one the browser named first when it is
 /// playable here, then scout's order — ranked for this browser when the session passed on what it plays.
-/// `av1`: the player decodes AV1.
-pub fn candidates(streams: &[Stream], filename: Option<&str>, av1: bool) -> Vec<Stream> {
-    let mut out: Vec<Stream> = streams.iter().filter(|s| remuxable(s, av1)).cloned().collect();
+/// `av1`, `vp9`: the player decodes AV1, VP9.
+pub fn candidates(streams: &[Stream], filename: Option<&str>, av1: bool, vp9: bool) -> Vec<Stream> {
+    let mut out: Vec<Stream> = streams.iter().filter(|s| remuxable(s, av1, vp9)).cloned().collect();
     if let Some(want) = filename {
         if let Some(i) = out.iter().position(|s| s.filename() == want) {
             let chosen = out.remove(i);
@@ -314,7 +314,7 @@ mod tests {
     #[test]
     fn only_cached_remuxable_releases_are_candidates() {
         let names: Vec<String> =
-            candidates(&fixture(), None, false).iter().map(|s| s.filename().to_string()).collect();
+            candidates(&fixture(), None, false, false).iter().map(|s| s.filename().to_string()).collect();
         assert_eq!(
             names,
             [
@@ -322,28 +322,43 @@ mod tests {
                 "Film.2019.1080p.WEB-DL.DDP5.1.H.264.mkv",
                 "Film.2019.1080p.BluRay.mkv",
             ],
-            "scout's order, minus uncached, cache-unknown, AV1, XviD, AVI and 3D"
+            "scout's order, minus uncached, cache-unknown, AV1, VP9, XviD, AVI and 3D"
         );
     }
 
     #[test]
     fn a_named_release_goes_first_when_it_is_playable() {
-        let pick = candidates(&fixture(), Some("Film.2019.1080p.BluRay.mkv"), false);
+        let pick = candidates(&fixture(), Some("Film.2019.1080p.BluRay.mkv"), false, false);
         assert_eq!(pick[0].filename(), "Film.2019.1080p.BluRay.mkv");
         assert_eq!(pick.len(), 3, "the others stay as fallbacks");
         // Named but uncached: scout's first cached one instead.
-        let pick = candidates(&fixture(), Some("Film.2019.1080p.WEB.x264-UNCACHED.mkv"), false);
+        let pick = candidates(&fixture(), Some("Film.2019.1080p.WEB.x264-UNCACHED.mkv"), false, false);
         assert_eq!(pick[0].filename(), "Film.2019.2160p.UHD.BluRay.REMUX.HEVC.TrueHD.7.1.mkv");
         // Named 4K: it still goes first, ahead of the ranking.
-        let pick =
-            candidates(&fixture(), Some("Film.2019.2160p.UHD.BluRay.REMUX.HEVC.TrueHD.7.1.mkv"), false);
+        let pick = candidates(
+            &fixture(),
+            Some("Film.2019.2160p.UHD.BluRay.REMUX.HEVC.TrueHD.7.1.mkv"),
+            false,
+            false,
+        );
         assert_eq!(pick[0].filename(), "Film.2019.2160p.UHD.BluRay.REMUX.HEVC.TrueHD.7.1.mkv");
+    }
+
+    #[test]
+    fn vp9_is_a_candidate_only_for_a_player_that_decodes_it() {
+        let names = |vp9| -> Vec<String> {
+            candidates(&fixture(), None, false, vp9).iter().map(|s| s.filename().to_string()).collect()
+        };
+        let vp9 = "Film.2019.2160p.WEB-DL.VP9.Opus.mkv".to_string();
+        assert!(!names(false).contains(&vp9));
+        assert_eq!(names(true)[1], vp9, "in scout's order");
+        assert_eq!(names(true).len(), names(false).len() + 1, "and nothing else changes");
     }
 
     #[test]
     fn av1_is_a_candidate_only_for_a_player_that_decodes_it() {
         let names = |av1| -> Vec<String> {
-            candidates(&fixture(), None, av1).iter().map(|s| s.filename().to_string()).collect()
+            candidates(&fixture(), None, av1, false).iter().map(|s| s.filename().to_string()).collect()
         };
         assert!(!names(false).contains(&"Film.2019.2160p.WEB-DL.AV1.mkv".to_string()));
         assert_eq!(

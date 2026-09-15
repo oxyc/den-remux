@@ -273,6 +273,16 @@ fn parse_moov(moov: &[u8]) -> Result<MediaInfo, ProbeError> {
             hdr = av1_hdr;
             (VideoCodec::Av1, codecs)
         }
+        b"vp09" => {
+            // `vpcC` records the level, so no frame rate is needed to work one out.
+            let recorded = config(b"vpcC").and_then(super::vpcc_config).unwrap_or_default();
+            let (width, height) =
+                (u16_at(video.entry, 24).unwrap_or(0), u16_at(video.entry, 26).unwrap_or(0));
+            let (codecs, vp9_hdr, vp9_hlg) =
+                super::vp9_track(recorded, container, width as u32, height as u32, None);
+            (hdr, hlg) = (vp9_hdr, vp9_hlg);
+            (VideoCodec::Vp9, Some(codecs))
+        }
         other => (VideoCodec::Other(String::from_utf8_lossy(other).into_owned()), None),
     };
     if video.timescale == 0 {
