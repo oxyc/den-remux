@@ -249,20 +249,26 @@ fn parse_moov(moov: &[u8]) -> Result<MediaInfo, ProbeError> {
     // `colr` of type `nclx`: primaries, transfer, matrix as u16s, then the full-range flag in the top bit.
     let colr = config(b"colr").filter(|c| c.get(0..4) == Some(b"nclx"));
     let of = |at| colr.and_then(|c| u16_at(c, at)).unwrap_or(0) as u64;
+    let container = super::Colour {
+        primaries: of(4),
+        transfer: of(6),
+        matrix: of(8),
+        full_range: colr.and_then(|c| c.get(10)).map(|b| b & 0x80 != 0),
+    };
     let mut hdr = super::is_hdr(of(6), of(4), of(8));
+    let mut hlg = of(6) == 18;
     let (codec, codecs) = match &video.fourcc {
         b"avc1" | b"avc3" => (VideoCodec::H264, config(b"avcC").and_then(super::avc_codecs)),
         // dvh1/dvhe carry an hvcC base layer; `dolby_vision` below says whether it shows on its own.
-        b"hvc1" | b"hev1" | b"dvh1" | b"dvhe" => {
-            (VideoCodec::Hevc, config(b"hvcC").and_then(super::hevc_codecs))
-        }
+        b"hvc1" | b"hev1" | b"dvh1" | b"dvhe" => match config(b"hvcC") {
+            Some(hvcc) => {
+                let (codecs, hevc_hdr, hevc_hlg) = super::hevc_track(hvcc, container);
+                (hdr, hlg) = (hevc_hdr, hevc_hlg);
+                (VideoCodec::Hevc, codecs)
+            }
+            None => (VideoCodec::Hevc, None),
+        },
         b"av01" => {
-            let container = super::Colour {
-                primaries: of(4),
-                transfer: of(6),
-                matrix: of(8),
-                full_range: colr.and_then(|c| c.get(10)).map(|b| b & 0x80 != 0),
-            };
             let (codecs, av1_hdr) = config(b"av1C").map_or((None, hdr), |c| super::av1_track(c, container));
             hdr = av1_hdr;
             (VideoCodec::Av1, codecs)
@@ -305,7 +311,15 @@ fn parse_moov(moov: &[u8]) -> Result<MediaInfo, ProbeError> {
         width: u16_at(video.entry, 24).unwrap_or(0) as u32,
         height: u16_at(video.entry, 26).unwrap_or(0) as u32,
         hdr,
-        hlg: of(6) == 18,
+        hlg,
+        // The samples over all of stts's time: a first sample shorter than the rest, as an encoder's often is, doesn't
+        // skew it.
+        frame_rate: child(video.stbl, b"stts").and_then(timing_runs).and_then(|(runs, frames)| {
+            let ticks = runs.as_chunks::<8>().0.iter().try_fold(0u64, |ticks, run| {
+                ticks.checked_add((u32_at(run, 0)? as u64).checked_mul(u32_at(run, 4)? as u64)?)
+            })?;
+            (ticks > 0).then(|| frames as f64 * video.timescale as f64 / ticks as f64)
+        }),
         dolby_vision: [b"dvcC", b"dvvC", b"dvwC"].into_iter().find_map(config).and_then(super::dovi_config),
         audio,
         keyframes,

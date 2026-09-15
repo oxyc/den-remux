@@ -74,6 +74,7 @@ async fn an_hdr10_release_reads_as_hdr_and_is_tone_mapped() {
         info.codecs
     );
     assert!(info.hdr, "the PQ transfer");
+    assert_eq!(info.frame_rate.map(|f| (f * 1000.0).round()), Some(24_000.0), "Matroska's DefaultDuration");
     assert!(info.dolby_vision.is_none());
     assert!(crate::session::tonemaps(&info), "a conversion of it has to tone-map, or it plays nowhere");
 }
@@ -111,6 +112,11 @@ async fn av1_matroska_and_mp4_give_the_same_av01_codec_string() {
     assert_eq!(mp4.video, VideoCodec::Av1);
     assert_eq!(mp4.codecs, mkv.codecs, "the av01 sample entry's av1C and colr");
     assert!(mp4.hdr);
+    assert_eq!(
+        mp4.frame_rate.map(|f| format!("{f:.2}")).as_deref(),
+        Some("24.00"),
+        "the samples over stts's time"
+    );
 }
 
 #[tokio::test]
@@ -787,7 +793,8 @@ async fn av1_plays_only_for_a_player_that_reports_it() {
     assert_eq!(j["video"], copied);
     let master = call(&state, "GET", j["playlist"].as_str().unwrap(), None, "").await.text();
     assert!(
-        master.contains("CODECS=\"av01.0.") && master.contains(",VIDEO-RANGE=PQ,RESOLUTION=320x180"),
+        master.contains("CODECS=\"av01.0.")
+            && master.contains(",VIDEO-RANGE=PQ,RESOLUTION=320x180,FRAME-RATE=24.000\n"),
         "{master}"
     );
     state.end_all("test").await;

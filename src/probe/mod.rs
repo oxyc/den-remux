@@ -48,10 +48,14 @@ pub struct MediaInfo {
     pub codecs: Option<String>,
     pub width: u32,
     pub height: u32,
-    /// HDR by what the container says of the colours (`is_hdr`): a conversion to SDR H.264 tone-maps it.
+    /// HDR by what the container — or, where it is silent, the stream's own header — says of the colours
+    /// (`is_hdr`): a conversion to SDR H.264 tone-maps it.
     pub hdr: bool,
-    /// Whether the container names the transfer HLG (18). An HDR stream that doesn't is taken as PQ.
+    /// Whether the transfer is named HLG (18). An HDR stream that isn't is taken as PQ.
     pub hlg: bool,
+    /// Frames a second, from Matroska's DefaultDuration or an MP4's sample timing: the master's FRAME-RATE,
+    /// without which Safari passes an HDR variant over and plays nothing.
+    pub frame_rate: Option<f64>,
     /// The video's Dolby Vision configuration, when it carries one.
     pub dolby_vision: Option<DolbyVision>,
     pub audio: Vec<AudioTrack>,
@@ -81,9 +85,9 @@ impl fmt::Display for ProbeError {
 }
 
 /// Is this what a container says of the colours HDR (H.273 code points)? The transfer says so outright — PQ (16)
-/// or HLG (18) — but a muxer often writes none: ffmpeg leaves it to the video stream's own headers, which this
-/// doesn't read. Rec. 2020 primaries (9) or matrix (9) then stand for it: in a release they mean HDR, and SDR is
-/// Rec. 709.
+/// or HLG (18) — but a muxer often writes none, leaving it to the video stream's own headers, which `av1_track` and
+/// `hevc_track` read where the container is silent. Rec. 2020 primaries (9) or matrix (9) then stand for it: in a
+/// release they mean HDR, and SDR is Rec. 709.
 pub fn is_hdr(transfer: u64, primaries: u64, matrix: u64) -> bool {
     matches!(transfer, 16 | 18) || primaries == 9 || matrix == 9
 }
@@ -196,7 +200,12 @@ impl Bits<'_> {
         self.read(1).map(|v| v == 1)
     }
 
-    /// AV1's `uvlc()`.
+    fn skip(&mut self, n: usize) -> Option<()> {
+        self.pos += n;
+        (self.pos <= self.b.len() * 8).then_some(())
+    }
+
+    /// AV1's `uvlc()`, which is also H.265's `ue(v)` — and as long as its `se(v)`, for skipping one.
     fn uvlc(&mut self) -> Option<u64> {
         let mut zeros = 0;
         while !self.flag()? {
@@ -313,6 +322,219 @@ fn sequence_colour(payload: &[u8]) -> Option<Colour> {
     let srgb = !mono && (colour.primaries, colour.transfer, colour.matrix) == (1, 13, 0);
     colour.full_range = Some(srgb || r.flag()?);
     Some(colour)
+}
+
+/// An HEVC track's codec string, whether it is HDR and whether that HDR is HLG, from its `hvcC` record and what the
+/// container says of its colours. Where the container is silent, the VUI of the record's SPS speaks instead: a muxer
+/// that writes no Matroska Colour element or MP4 `colr` box still carries that, and a UHD Blu-ray remux often writes
+/// neither — its HDR10 goes out named SDR, which Safari refuses outright.
+pub fn hevc_track(hvcc: &[u8], container: Colour) -> (Option<String>, bool, bool) {
+    let colour = container.or(hevc_sps_colour(hvcc).unwrap_or_default());
+    (hevc_codecs(hvcc), is_hdr(colour.transfer, colour.primaries, colour.matrix), colour.transfer == 18)
+}
+
+/// The colours the first SPS among an `hvcC` record's parameter-set arrays (ISO/IEC 14496-15 8.3.3.1) describes,
+/// walked field by field to the VUI's colour description (H.265 7.3.2.2, E.2.1). `None` without an SPS, or with one
+/// that ends early.
+fn hevc_sps_colour(hvcc: &[u8]) -> Option<Colour> {
+    let mut at = 23;
+    for _ in 0..*hvcc.get(22)? {
+        let kind = hvcc.get(at)? & 0x3f;
+        let count = u16::from_be_bytes([*hvcc.get(at + 1)?, *hvcc.get(at + 2)?]);
+        at += 3;
+        for _ in 0..count {
+            let len = u16::from_be_bytes([*hvcc.get(at)?, *hvcc.get(at + 1)?]) as usize;
+            let nal = hvcc.get(at + 2..at + 2 + len)?;
+            if kind == 33 {
+                // Past the two-byte NAL unit header.
+                return sps_colour(&unescape(nal.get(2..)?));
+            }
+            at += 2 + len;
+        }
+    }
+    None
+}
+
+/// A NAL unit's payload without its emulation prevention bytes: the `03` of every `00 00 03`.
+fn unescape(nal: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(nal.len());
+    let mut zeros = 0;
+    for &b in nal {
+        if zeros >= 2 && b == 3 {
+            zeros = 0;
+            continue;
+        }
+        zeros = if b == 0 { zeros + 1 } else { 0 };
+        out.push(b);
+    }
+    out
+}
+
+fn sps_colour(rbsp: &[u8]) -> Option<Colour> {
+    let mut r = Bits { b: rbsp, pos: 0 };
+    r.read(4)?; // sps_video_parameter_set_id
+    let sub_layers = r.read(3)? as usize;
+    r.read(1)?; // sps_temporal_id_nesting_flag
+
+    // profile_tier_level: the general profile (88 bits) and level (8), then each sub-layer's where it has them.
+    r.skip(88 + 8)?;
+    let mut present = [(false, false); 7];
+    for p in present.iter_mut().take(sub_layers) {
+        *p = (r.flag()?, r.flag()?);
+    }
+    if sub_layers > 0 {
+        r.skip(2 * (8 - sub_layers))?;
+    }
+    for &(profile, level) in &present[..sub_layers] {
+        r.skip(if profile { 88 } else { 0 } + if level { 8 } else { 0 })?;
+    }
+    r.uvlc()?; // sps_seq_parameter_set_id
+    if r.uvlc()? == 3 {
+        r.read(1)?; // separate_colour_plane_flag
+    }
+    r.uvlc()?; // pic_width_in_luma_samples
+    r.uvlc()?; // pic_height_in_luma_samples
+    if r.flag()? {
+        for _ in 0..4 {
+            r.uvlc()?; // conformance window offsets
+        }
+    }
+    r.uvlc()?; // bit_depth_luma_minus8
+    r.uvlc()?; // bit_depth_chroma_minus8
+    let poc_lsb_bits = r.uvlc()? as u32 + 4;
+    let ordering_from = if r.flag()? { 0 } else { sub_layers };
+    for _ in ordering_from..=sub_layers {
+        for _ in 0..3 {
+            r.uvlc()?; // max_dec_pic_buffering, max_num_reorder_pics, max_latency_increase
+        }
+    }
+    for _ in 0..6 {
+        r.uvlc()?; // coding and transform block sizes, transform hierarchy depths
+    }
+    if r.flag()? && r.flag()? {
+        scaling_list_data(&mut r)?;
+    }
+    r.read(2)?; // amp_enabled_flag, sample_adaptive_offset_enabled_flag
+    if r.flag()? {
+        r.read(8)?; // PCM sample bit depths
+        r.uvlc()?;
+        r.uvlc()?; // PCM coding block sizes
+        r.read(1)?; // pcm_loop_filter_disabled_flag
+    }
+    let sets = r.uvlc()?;
+    if sets > 64 {
+        return None;
+    }
+    let mut rps = Vec::new();
+    for idx in 0..sets as usize {
+        let set = short_term_ref_pic_set(&mut r, &rps, idx)?;
+        rps.push(set);
+    }
+    if r.flag()? {
+        let long_term = r.uvlc()?;
+        if long_term > 32 {
+            return None;
+        }
+        for _ in 0..long_term {
+            r.read(poc_lsb_bits + 1)?; // lt_ref_pic_poc_lsb_sps, used_by_curr_pic_lt_sps_flag
+        }
+    }
+    r.read(2)?; // sps_temporal_mvp_enabled_flag, strong_intra_smoothing_enabled_flag
+    let mut colour = Colour::default();
+    if !r.flag()? {
+        return Some(colour); // no VUI
+    }
+    if r.flag()? && r.read(8)? == 255 {
+        r.read(32)?; // an extended sample aspect ratio's width and height
+    }
+    if r.flag()? {
+        r.read(1)?; // overscan_appropriate_flag
+    }
+    if r.flag()? {
+        r.read(3)?; // video_format
+        colour.full_range = Some(r.flag()?);
+        if r.flag()? {
+            colour.primaries = r.read(8)?;
+            colour.transfer = r.read(8)?;
+            colour.matrix = r.read(8)?;
+        }
+    }
+    Some(colour)
+}
+
+/// Past `scaling_list_data()` (H.265 7.3.4).
+fn scaling_list_data(r: &mut Bits<'_>) -> Option<()> {
+    for size in 0..4usize {
+        for _ in (0..6).step_by(if size == 3 { 3 } else { 1 }) {
+            if !r.flag()? {
+                r.uvlc()?; // scaling_list_pred_matrix_id_delta
+                continue;
+            }
+            if size > 1 {
+                r.uvlc()?; // scaling_list_dc_coef_minus8
+            }
+            for _ in 0..64.min(1usize << (4 + 2 * size)) {
+                r.uvlc()?; // scaling_list_delta_coef
+            }
+        }
+    }
+    Some(())
+}
+
+/// Reads `st_ref_pic_set(idx)` (H.265 7.3.7) into its pictures' POC deltas, negative and positive, in the order 7.4.8
+/// derives them: a later set predicted from this one carries a flag for each.
+fn short_term_ref_pic_set(
+    r: &mut Bits<'_>,
+    sets: &[(Vec<i64>, Vec<i64>)],
+    idx: usize,
+) -> Option<(Vec<i64>, Vec<i64>)> {
+    if idx > 0 && r.flag()? {
+        // Predicted from the set before it: an SPS's sets name no delta_idx.
+        let (s0, s1) = sets.get(idx - 1)?;
+        let negative_delta = r.flag()?;
+        let magnitude = r.uvlc()? as i64 + 1;
+        let delta = if negative_delta { -magnitude } else { magnitude };
+        // use_delta_flag, which used_by_curr_pic_flag implies; the last is the reference picture itself.
+        let mut used = Vec::with_capacity(s0.len() + s1.len() + 1);
+        for _ in 0..=s0.len() + s1.len() {
+            used.push(r.flag()? || r.flag()?);
+        }
+        let own = used[s0.len() + s1.len()];
+        let at0 = |i: usize| used[i];
+        let at1 = |i: usize| used[s0.len() + i];
+        let mut negative = Vec::new();
+        negative.extend(
+            s1.iter().enumerate().rev().filter(|&(i, d)| d + delta < 0 && at1(i)).map(|(_, d)| d + delta),
+        );
+        negative.extend(Some(delta).filter(|d| *d < 0 && own));
+        negative
+            .extend(s0.iter().enumerate().filter(|&(i, d)| d + delta < 0 && at0(i)).map(|(_, d)| d + delta));
+        let mut positive = Vec::new();
+        positive.extend(
+            s0.iter().enumerate().rev().filter(|&(i, d)| d + delta > 0 && at0(i)).map(|(_, d)| d + delta),
+        );
+        positive.extend(Some(delta).filter(|d| *d > 0 && own));
+        positive
+            .extend(s1.iter().enumerate().filter(|&(i, d)| d + delta > 0 && at1(i)).map(|(_, d)| d + delta));
+        return Some((negative, positive));
+    }
+    let (negatives, positives) = (r.uvlc()?, r.uvlc()?);
+    if negatives > 16 || positives > 16 {
+        return None;
+    }
+    let mut deltas = |n: u64, sign: i64| -> Option<Vec<i64>> {
+        let mut poc = 0;
+        (0..n)
+            .map(|_| {
+                poc += sign * (r.uvlc()? as i64 + 1);
+                r.read(1)?; // used_by_curr_pic_s0/s1_flag
+                Some(poc)
+            })
+            .collect()
+    };
+    let negative = deltas(negatives, -1)?;
+    let positive = deltas(positives, 1)?;
+    Some((negative, positive))
 }
 
 /// A Dolby Vision stream's profile, and what its base layer is without it — written `8.1`, `7.6`, as Dolby does.
@@ -593,6 +815,115 @@ mod tests {
             "a sequence header that ends early says nothing"
         );
         assert_eq!(av1_sequence_colour(&[0x0C]), None, "an extension byte that isn't there");
+    }
+
+    /// An `hvcC` record (Main 10, level 5.1) holding one SPS NAL unit, its payload escaped as an encoder would.
+    fn hvcc_with_sps(rbsp: &[u8]) -> Vec<u8> {
+        let mut nal = vec![0x42, 0x01];
+        let mut zeros = 0;
+        for &b in rbsp {
+            if zeros >= 2 && b <= 3 {
+                nal.push(3);
+                zeros = 0;
+            }
+            zeros = if b == 0 { zeros + 1 } else { 0 };
+            nal.push(b);
+        }
+        let mut record = vec![
+            1, 0x02, 0x20, 0, 0, 0, 0x90, 0, 0, 0, 0, 0, 153, 0xf0, 0, 0xfc, 0xfd, 0xfa, 0xfa, 0, 0, 0x0f, 1,
+        ];
+        record.extend([0x80 | 33, 0, 1]);
+        record.extend((nal.len() as u16).to_be_bytes());
+        record.extend(nal);
+        record
+    }
+
+    fn unhex(s: &str) -> Vec<u8> {
+        (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
+    }
+
+    #[test]
+    fn an_hevc_sps_speaks_for_a_silent_container() {
+        // The Hobbit's UHD Blu-ray x265 encode, whose Matroska header names no colours; the SPS is as its hvcC
+        // carries it, emulation prevention and all.
+        let hobbit = unhex(
+            "420101022000000300900000030000030099a001e0200649365959a4930bc05a848804db0800001f480002ee030526b2f000044aa20000895444",
+        );
+        let record = [
+            &hvcc_with_sps(&[])[..hvcc_with_sps(&[]).len() - 4],
+            &(hobbit.len() as u16).to_be_bytes(),
+            &hobbit,
+        ]
+        .concat();
+        assert_eq!(hevc_sps_colour(&record).map(|c| (c.primaries, c.transfer, c.matrix)), Some((9, 16, 9)));
+        assert_eq!(hevc_track(&record, Colour::default()), (Some("hvc1.2.4.L153.90".into()), true, false));
+        let sdr = Colour { primaries: 1, transfer: 1, matrix: 1, full_range: Some(false) };
+        assert!(!hevc_track(&record, sdr).1, "the container says otherwise, and wins");
+        let cut = [&record[..record.len() - hobbit.len() + 20]].concat();
+        assert_eq!(hevc_sps_colour(&cut), None, "an SPS cut short says nothing");
+        assert!(!hevc_track(&cut, Colour::default()).1);
+        // libx265's own SPS for an SDR encode, which names no colours.
+        let sdr_sps =
+            unhex("420101022000000300900000030000030096a001e0200649365959a4932bc05a020000030002000003003010");
+        let sdr_record =
+            [&record[..record.len() - hobbit.len() - 2], &(sdr_sps.len() as u16).to_be_bytes(), &sdr_sps]
+                .concat();
+        assert_eq!(
+            hevc_track(&sdr_record, Colour::default()),
+            (Some("hvc1.2.4.L153.90".into()), false, false)
+        );
+        assert_eq!(hevc_sps_colour(&[1, 2, 3]), None, "no arrays");
+    }
+
+    #[test]
+    fn an_hevc_sps_is_walked_past_every_optional_part() {
+        let ue = |v: u64| (v + 1, 2 * (64 - (v + 1).leading_zeros()) - 1);
+        #[rustfmt::skip]
+        let mut f: Vec<(u64, u32)> = vec![
+            (0, 4), (1, 3), (1, 1),                   // two sub-layers
+            (0x0220_0000_0090_0000, 64), (153, 32),   // general profile_tier_level
+            (1, 1), (1, 1), (0, 14),                  // sub-layer 0 has a profile and a level; reserved bits
+            (0x0220_0000_0090_0000, 64), (150, 32),
+            ue(0), ue(1), ue(3839), ue(2159),         // SPS 0, 4:2:0, size
+            (1, 1), ue(0), ue(0), ue(0), ue(12),      // conformance window
+            ue(2), ue(2), ue(4),                      // 10-bit, 8-bit POC LSBs
+            (0, 1), ue(4), ue(2), ue(0),              // ordering info for the top sub-layer only
+            ue(0), ue(3), ue(0), ue(3), ue(1), ue(1),
+            (1, 1), (1, 1),                           // scaling lists, sent
+        ];
+        for size in 0..4u32 {
+            for matrix in (0..6u64).step_by(if size == 3 { 3 } else { 1 }) {
+                if matrix > 0 {
+                    f.extend([(0, 1), ue(matrix)]);
+                    continue;
+                }
+                f.push((1, 1));
+                if size > 1 {
+                    f.push(ue(7));
+                }
+                f.extend((0..64.min(1 << (4 + 2 * size))).map(|_| ue(2)));
+            }
+        }
+        #[rustfmt::skip]
+        f.extend([
+            (0, 1), (1, 1),                           // amp, SAO
+            (1, 1), (9, 4), (9, 4), ue(0), ue(2), (1, 1), // PCM
+            ue(3),                                    // three short-term sets
+            ue(2), ue(1), ue(0), (1, 1), ue(1), (1, 1), ue(0), (1, 1), // 0: −1, −3 and +1
+            // 1: predicted from 0 by −1 — a flag each for −1, −3, +1 and the picture itself: −1, −2, −4, nothing after.
+            (1, 1), (1, 1), ue(0), (1, 1), (0, 1), (1, 1), (0, 1), (0, 1), (1, 1),
+            (1, 1), (0, 1), ue(1), (1, 1), (1, 1), (1, 1), (1, 1), // 2: predicted from 1's three by +2, so four flags
+            (1, 1), ue(2), (5, 8), (1, 1), (9, 8), (0, 1), // two long-term pictures
+            (1, 1), (1, 1),                           // temporal MVP, strong intra smoothing
+            (1, 1),                                   // VUI
+            (1, 1), (255, 8), (4, 16), (3, 16),       // extended sample aspect ratio
+            (1, 1), (0, 1),                           // overscan
+            (1, 1), (5, 3), (0, 1), (1, 1), (9, 8), (18, 8), (9, 8), // HLG
+            (0, 8),
+        ]);
+        let colour = hevc_sps_colour(&hvcc_with_sps(&pack(&f)));
+        assert_eq!(colour, Some(Colour { primaries: 9, transfer: 18, matrix: 9, full_range: Some(false) }));
+        assert_eq!(hevc_track(&hvcc_with_sps(&pack(&f)), Colour::default()).1..=true, true..=true);
     }
 
     #[test]

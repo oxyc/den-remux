@@ -22,6 +22,7 @@ const TRACK_NUMBER: u32 = 0xD7;
 const TRACK_TYPE: u32 = 0x83;
 const CODEC_ID: u32 = 0x86;
 const CODEC_PRIVATE: u32 = 0x63A2;
+const DEFAULT_DURATION: u32 = 0x23E383;
 const LANGUAGE: u32 = 0x22B59C;
 const LANGUAGE_BCP47: u32 = 0x22B59D;
 const NAME: u32 = 0x536E;
@@ -116,6 +117,8 @@ struct Track {
     kind: u64,
     codec_id: String,
     private: Vec<u8>,
+    /// Nanoseconds a frame; 0 where the muxer wrote none.
+    default_duration: u64,
     language: Option<String>,
     name: Option<String>,
     default: bool,
@@ -144,6 +147,7 @@ fn parse_tracks(b: &[u8]) -> Vec<Track> {
                     TRACK_TYPE => t.kind = uint(v),
                     CODEC_ID => t.codec_id = string(v),
                     CODEC_PRIVATE => t.private = v.to_vec(),
+                    DEFAULT_DURATION => t.default_duration = uint(v),
                     LANGUAGE => t.language = Some(string(v)),
                     LANGUAGE_BCP47 => bcp47 = Some(string(v)),
                     NAME => t.name = Some(string(v)).filter(|n| !n.is_empty()),
@@ -320,10 +324,14 @@ pub async fn probe(src: &Source<'_>, head: &[u8]) -> Result<MediaInfo, ProbeErro
         return Err(ProbeError::Unsupported("the Cues index no video keyframes".into()));
     }
     let mut hdr = super::is_hdr(video.transfer, video.primaries, video.matrix);
+    let mut hlg = video.transfer == 18;
     let (codec, codecs) = if video.codec_id.starts_with("V_MPEG4/ISO/AVC") {
         (VideoCodec::H264, super::avc_codecs(&video.private))
     } else if video.codec_id.starts_with("V_MPEGH/ISO/HEVC") {
-        (VideoCodec::Hevc, super::hevc_codecs(&video.private))
+        // V_MPEGH/ISO/HEVC's CodecPrivate is the `hvcC` record.
+        let (codecs, hevc_hdr, hevc_hlg) = super::hevc_track(&video.private, colour(video));
+        (hdr, hlg) = (hevc_hdr, hevc_hlg);
+        (VideoCodec::Hevc, codecs)
     } else if video.codec_id == "V_AV1" {
         // V_AV1's CodecPrivate is the `av1C` record itself.
         let (codecs, av1_hdr) = super::av1_track(&video.private, colour(video));
@@ -354,7 +362,8 @@ pub async fn probe(src: &Source<'_>, head: &[u8]) -> Result<MediaInfo, ProbeErro
         width: video.width,
         height: video.height,
         hdr,
-        hlg: video.transfer == 18,
+        hlg,
+        frame_rate: (video.default_duration > 0).then(|| 1e9 / video.default_duration as f64),
         dolby_vision: video.dovi,
         audio,
         keyframes,

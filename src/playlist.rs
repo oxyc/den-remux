@@ -82,6 +82,10 @@ pub struct DolbyVision {
 ///
 /// Copied and 5.1 audio is also named by an AUDIO rendition with no URI — its media is in the variant's own segments —
 /// so the player learns its CHANNELS, which CODECS does not carry. Stereo AAC, which every player assumes, is not.
+///
+/// FRAME-RATE is named wherever the file says it: Safari passes over a VIDEO-RANGE=PQ variant without one, with no
+/// error, and plays nothing.
+#[allow(clippy::too_many_arguments)]
 pub fn master(
     video_codecs: &str,
     dolby_vision: Option<&DolbyVision>,
@@ -89,9 +93,11 @@ pub fn master(
     bandwidth: u64,
     average: u64,
     resolution: Option<(u32, u32)>,
+    frame_rate: Option<f64>,
     subs: &[(String, String)],
 ) -> String {
     let res = resolution.filter(|(w, h)| *w > 0 && *h > 0).map(|(w, h)| format!(",RESOLUTION={w}x{h}"));
+    let rate = frame_rate.filter(|f| *f > 0.0 && *f < 1000.0).map(|f| format!(",FRAME-RATE={f:.3}"));
     let mut out = String::from("#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-INDEPENDENT-SEGMENTS\n");
     let (audio_codec, rendition) = match audio {
         Audio::Aac => ("mp4a.40.2", None),
@@ -121,9 +127,10 @@ pub fn master(
         format!("{supplemental},VIDEO-RANGE={}", dv.range)
     });
     out.push_str(&format!(
-        "#EXT-X-STREAM-INF:BANDWIDTH={bandwidth},AVERAGE-BANDWIDTH={average},CODECS=\"{video_codecs},{audio_codec}\"{dv}{}{}{}\n\
+        "#EXT-X-STREAM-INF:BANDWIDTH={bandwidth},AVERAGE-BANDWIDTH={average},CODECS=\"{video_codecs},{audio_codec}\"{dv}{}{}{}{}\n\
          media.m3u8\n",
         res.unwrap_or_default(),
+        rate.unwrap_or_default(),
         if rendition.is_none() { "" } else { ",AUDIO=\"audio\"" },
         if subs.is_empty() { "" } else { ",SUBTITLES=\"subs\"" }
     ));
@@ -218,24 +225,33 @@ mod tests {
         let (peak, avg) = bandwidth(Some(3_750_000), 30.0);
         assert_eq!(avg, 1_000_000);
         assert!(peak > avg);
-        let m = master("hvc1.1.6.L93.B0", None, &Audio::Aac, peak, avg, Some((320, 180)), &[]);
+        let m = master(
+            "hvc1.1.6.L93.B0",
+            None,
+            &Audio::Aac,
+            peak,
+            avg,
+            Some((320, 180)),
+            Some(24000.0 / 1001.0),
+            &[],
+        );
         assert!(m.contains("CODECS=\"hvc1.1.6.L93.B0,mp4a.40.2\""), "{m}");
-        assert!(m.contains("RESOLUTION=320x180"));
+        assert!(m.contains("RESOLUTION=320x180,FRAME-RATE=23.976\n"), "{m}");
         assert!(m.contains(&format!("BANDWIDTH={peak},AVERAGE-BANDWIDTH={avg}")));
         assert!(m.ends_with("media.m3u8\n"));
         assert!(!m.contains("SUBTITLES") && !m.contains("TYPE=AUDIO") && !m.contains("AUDIO=\""));
-        assert!(!master("avc1.64001e", None, &Audio::Aac, 1, 1, None, &[]).contains("RESOLUTION"));
+        assert!(!master("avc1.64001e", None, &Audio::Aac, 1, 1, None, None, &[]).contains("RESOLUTION"));
         assert!(!m.contains("VIDEO-RANGE"), "nothing kept, nothing named");
     }
 
     #[test]
     fn kept_dolby_vision_is_named_beside_or_as_its_codec() {
         let p81 = DolbyVision { supplemental: Some("dvh1.08.06/db1p".into()), range: "PQ" };
-        let m = master("hvc1.2.4.L153.B0", Some(&p81), &Audio::Aac, 1, 1, None, &[]);
+        let m = master("hvc1.2.4.L153.B0", Some(&p81), &Audio::Aac, 1, 1, None, None, &[]);
         let supplemental = ",SUPPLEMENTAL-CODECS=\"dvh1.08.06/db1p\",VIDEO-RANGE=PQ\n";
         assert!(m.contains(&format!("CODECS=\"hvc1.2.4.L153.B0,mp4a.40.2\"{supplemental}")), "{m}");
         let p5 = DolbyVision { supplemental: None, range: "PQ" };
-        let m = master("dvh1.05.06", Some(&p5), &Audio::Aac, 1, 1, None, &[]);
+        let m = master("dvh1.05.06", Some(&p5), &Audio::Aac, 1, 1, None, None, &[]);
         assert!(m.contains("CODECS=\"dvh1.05.06,mp4a.40.2\",VIDEO-RANGE=PQ\n"), "{m}");
         assert!(!m.contains("SUPPLEMENTAL"), "{m}");
     }
@@ -243,7 +259,7 @@ mod tests {
     #[test]
     fn copied_dolby_audio_is_named_with_its_channels() {
         let eac3 = Audio::Copy { codec: "ec-3", channels: 6, language: Some("eng") };
-        let m = master("hvc1.2.4.L150.B0", None, &eac3, 1, 1, None, &[]);
+        let m = master("hvc1.2.4.L150.B0", None, &eac3, 1, 1, None, None, &[]);
         assert!(
             m.contains(
                 "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"audio\",NAME=\"English\",LANGUAGE=\"eng\",DEFAULT=YES,AUTOSELECT=YES,CHANNELS=\"6\"\n"
@@ -253,13 +269,14 @@ mod tests {
         assert!(m.contains("CODECS=\"hvc1.2.4.L150.B0,ec-3\",AUDIO=\"audio\"\nmedia.m3u8"), "{m}");
         assert!(!m.contains("URI="), "the audio is in the variant's own segments: {m}");
         let ac3 = Audio::Copy { codec: "ac-3", channels: 2, language: None };
-        let m = master("avc1.640028", None, &ac3, 1, 1, None, &[]);
+        let m = master("avc1.640028", None, &ac3, 1, 1, None, None, &[]);
         assert!(m.contains("NAME=\"Audio\",DEFAULT=YES") && m.contains(",ac-3\""), "{m}");
     }
 
     #[test]
     fn aac_5_1_is_named_with_its_channels_and_stereo_is_not() {
-        let m = master("avc1.640028", None, &Audio::AacSurround { language: Some("swe") }, 1, 1, None, &[]);
+        let m =
+            master("avc1.640028", None, &Audio::AacSurround { language: Some("swe") }, 1, 1, None, None, &[]);
         assert!(
             m.contains(
                 "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"audio\",NAME=\"Swedish\",LANGUAGE=\"swe\",DEFAULT=YES,AUTOSELECT=YES,CHANNELS=\"6\"\n"
@@ -267,7 +284,7 @@ mod tests {
             "{m}"
         );
         assert!(m.contains("CODECS=\"avc1.640028,mp4a.40.2\",AUDIO=\"audio\"\nmedia.m3u8"), "{m}");
-        let stereo = master("avc1.640028", None, &Audio::Aac, 1, 1, None, &[]);
+        let stereo = master("avc1.640028", None, &Audio::Aac, 1, 1, None, None, &[]);
         assert_eq!(
             stereo,
             "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-INDEPENDENT-SEGMENTS\n\
@@ -279,7 +296,7 @@ mod tests {
     #[test]
     fn subtitles_are_renditions_of_one_group() {
         let subs = [("en".to_string(), "English".to_string()), ("fi".to_string(), "Finnish".to_string())];
-        let m = master("avc1.640028", None, &Audio::Aac, 1, 1, None, &subs);
+        let m = master("avc1.640028", None, &Audio::Aac, 1, 1, None, None, &subs);
         assert!(m.contains("TYPE=SUBTITLES,GROUP-ID=\"subs\",NAME=\"Finnish\",LANGUAGE=\"fi\""), "{m}");
         assert!(m.contains("URI=\"sub1.m3u8\""));
         assert!(m.contains("LANGUAGE=\"en\",DEFAULT=YES,AUTOSELECT=YES"), "the most wanted shows: {m}");

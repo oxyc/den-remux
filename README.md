@@ -345,7 +345,12 @@ the `h264_vaapi` encoder), fitted inside 1920 × 1080 at 8 Mbit/s (12 max) — o
 inside 1280 × 720 at 3 Mbit/s (4.5 max). The tone-mapper marks every frame it
 makes BT.709, which is what the output carries: H.264 tagged BT.2020 and PQ is HDR H.264, which Apple's decoders
 refuse. (Naming those colours on the command line as well breaks the filter graph, so it isn't done.) A UHD Blu-ray remux often leaves Matroska's Colour element
-out, so Dolby Vision counts as HDR too — its base layer is HDR10 or HLG, except profile 8.2's, already SDR. `-force_key_frames source` puts an output
+out, so where the container is silent the colours come from the VUI of the SPS in the `hvcC` record, and Dolby Vision
+counts as HDR too — its base layer is HDR10 or HLG, except profile 8.2's, already SDR. Taking such a release for SDR
+fails twice over on Apple's player: the copy's variant names no `VIDEO-RANGE=PQ` for PQ in its SPS, and the
+transcode skips the tone-mapper and carries the source's PQ tags, and either is refused at `init.mp4` as error 3,
+before a segment is asked for. A copied HDR variant also names `FRAME-RATE` (Matroska's DefaultDuration, an MP4's
+sample timing): Safari passes over a `VIDEO-RANGE=PQ` variant without one, with no error. `-force_key_frames source` puts an output
 keyframe on every source keyframe, so the GOPs, the playlist and the joining are exactly a copy's; the
 audio and subtitles are unchanged.
 
