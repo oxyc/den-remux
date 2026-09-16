@@ -595,7 +595,10 @@ where
         return bad_request("audio, subtitleLanguages and videoCodecs are at most 8 short tags each.");
     }
     let id = scout::title_id(&req.imdb, episode);
-    let playable = req.playable.map(|p| p.through(req.player.as_deref()));
+    // As the browser reported it, for every player. 10-bit VP9 used to be cleared for a native session because
+    // nobody had played it in Apple's own player; codec lab has now done so, on an iPhone and on a Mac, and it
+    // plays (oxyc/den#37).
+    let playable = req.playable;
     let want = session::Want {
         id: &id,
         filename: req.filename.as_deref(),

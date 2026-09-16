@@ -1000,17 +1000,6 @@ impl Playable {
         }
     }
 
-    /// The report as it holds for the page's HLS player (`player` in `POST /remux/session`): no 10-bit VP9 but through
-    /// hls.js. Safari's own player plays VP9 profile 0 in fMP4 HLS at 1080p30 and 1080p60 on iPhone and Mac (codec lab,
-    /// 2026-09-15), but profile 2 there is unmeasured — the clip that failed carried Opus, which fails on its own — so
-    /// a session that is native, or doesn't say, gets no profile 2, and neither does scout's ranking for it.
-    pub fn through(self, player: Option<&str>) -> Playable {
-        match player {
-            Some("hls.js") => self,
-            _ => Playable { vp9_profile2: false, ..self },
-        }
-    }
-
     fn takes_hevc(&self) -> bool {
         self.hevc_main > 0 || self.hevc_main10 > 0
     }
@@ -1798,14 +1787,11 @@ mod tests {
         assert!(!Playable { vp9_profile2: false, ..chrome }.takes(&p2), "profile 0 only");
         assert!(!chrome.takes(&info(VideoCodec::Vp9, "vp09.02.51.12", false)), "12-bit: never asked about");
         assert!(!chrome.takes(&info(VideoCodec::Vp9, "vp09.01.41.08.03.01.01.01.00", false)), "profile 1");
-        assert_eq!(chrome.through(Some("hls.js")).to_string(), chrome.to_string());
-        let native = chrome.through(Some("native"));
-        assert!(native.takes(&p0), "Safari's own player plays VP9 profile 0 in fMP4");
-        assert!(!native.takes(&p2), "profile 2 there is unmeasured");
-        assert!(!chrome.through(None).vp9_profile2, "nor for a session that doesn't say which player");
-        assert_eq!(native.h264, 0x33, "the rest of the report stands");
-        let sent = serde_json::to_value(native).unwrap();
-        assert!(sent["vp9"] == true && sent["vp9Profile2"] == false, "scout is sent it as it holds: {sent}");
+        // Every player now gets the report as the browser gave it. Profile 2 was cleared for a native session
+        // while 10-bit VP9 in Apple's own player was unmeasured; codec lab played it there on an iPhone (842
+        // frames of a thirty-second clip) and in every path on macOS Safari (oxyc/den#37).
+        let sent = serde_json::to_value(chrome).unwrap();
+        assert!(sent["vp9"] == true && sent["vp9Profile2"] == true, "scout is sent it as it holds: {sent}");
         assert!(chrome.to_string().ends_with("AV1 10-bit L0, VP9, VP9 profile 2"), "{chrome}");
 
         let a = |bit_depth| scout::Attributes { codec: Some("vp9".into()), bit_depth, ..Default::default() };
