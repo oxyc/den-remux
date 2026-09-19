@@ -356,7 +356,8 @@ dependabot cannot bump it, so bump both lines by hand.
   remote session is bounded by it — a 4K remux will not fit. A player that sends `maxBitrate` gets a release that
   fits, or a 1080p or 720p transcode, or failing both the smallest copy; its measure is taken once, before the
   session, and nothing adapts to a link that changes mid-film (one variant, no ABR ladder).
-- **One listener.** The public `/remux/s/` listener for Cast/AirPlay (#11 §C) is phase 3.
+- **One listener.** The public `/remux/s/` listener for Cast/AirPlay (#11 §C, #31) is Caddy in front of this service,
+  deployed by oxyc/den's `deploy/`; it forwards only strict signed-session paths.
 
 ### Hardware transcode
 
