@@ -77,8 +77,8 @@ pub struct DolbyVision {
 }
 
 /// The master playlist: one variant — the copied video plus its audio — and a WebVTT rendition per
-/// `(language, name)` in `subs`, most wanted first. The first is the default, so a player shows it without being
-/// asked; the rest are there to choose.
+/// `(language, name)` in `subs`, most wanted first. They are all opt-in: the browser or Cast receiver applies the
+/// viewer's choice, and an unset preference really means subtitles off.
 ///
 /// Copied and multichannel AAC audio is also named by an AUDIO rendition with no URI — its media is in the variant's own segments —
 /// so the player learns its CHANNELS, which CODECS does not carry. Stereo AAC, which every player assumes, is not.
@@ -115,10 +115,9 @@ pub fn master(
         ));
     }
     for (i, (lang, name)) in subs.iter().enumerate() {
-        let default = if i == 0 { "YES" } else { "NO" };
         out.push_str(&format!(
             "#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"subs\",NAME=\"{name}\",LANGUAGE=\"{lang}\",\
-             DEFAULT={default},AUTOSELECT=YES,FORCED=NO,URI=\"sub{i}.m3u8\"\n"
+             DEFAULT=NO,AUTOSELECT=YES,FORCED=NO,URI=\"sub{i}.m3u8\"\n"
         ));
     }
     let dv = dolby_vision.map_or_else(String::new, |dv| {
@@ -317,9 +316,9 @@ mod tests {
         let m = master("avc1.640028", None, &Audio::Aac, 1, 1, None, None, &subs);
         assert!(m.contains("TYPE=SUBTITLES,GROUP-ID=\"subs\",NAME=\"Finnish\",LANGUAGE=\"fi\""), "{m}");
         assert!(m.contains("URI=\"sub1.m3u8\""));
-        assert!(m.contains("LANGUAGE=\"en\",DEFAULT=YES,AUTOSELECT=YES"), "the most wanted shows: {m}");
+        assert!(m.contains("LANGUAGE=\"en\",DEFAULT=NO,AUTOSELECT=YES"), "{m}");
         assert!(m.contains("LANGUAGE=\"fi\",DEFAULT=NO,AUTOSELECT=YES"), "{m}");
-        assert_eq!(m.matches("DEFAULT=YES").count(), 1, "one default in a group");
+        assert_eq!(m.matches("DEFAULT=YES").count(), 0, "subtitles stay off until selected");
         assert!(m.contains(",SUBTITLES=\"subs\"\nmedia.m3u8"), "{m}");
         let s = subtitle_media(30.021, 1);
         assert!(
