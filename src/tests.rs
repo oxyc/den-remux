@@ -1004,18 +1004,12 @@ async fn concurrent_starts_count_against_the_install_and_browser_shares() {
     state.end_all("test").await;
 }
 
-/// A release scout's attributes rule out (here Dolby Vision profile 5, which has no picture without it) is never
-/// opened, and a title is tried past the first three releases that won't open. No ffmpeg needed.
+/// A title is tried past the first three releases that won't open. No ffmpeg needed.
 #[tokio::test]
-async fn ruled_out_releases_stay_unopened_and_the_search_goes_past_three() {
+async fn the_search_goes_past_three_releases_that_wont_open() {
     let origin = origin().await;
     let state = test_state(&origin, 2, Duration::from_secs(600));
     let with = |imdb: &str| format!(r#"{{"imdb":"{imdb}","scout":"{origin}/cfg"}}"#);
-    let r = call(&state, "POST", "/remux/session", None, &with("tt0000006")).await;
-    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
-    assert_eq!(r.json()["release"]["filename"], "h264.mkv");
-    assert_eq!(NEVER_OPENED.load(Relaxed), 0, "the profile 5 release was opened");
-    state.end_all("test").await;
     let r = call(&state, "POST", "/remux/session", None, &with("tt0000008")).await;
     assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
     assert_eq!(r.json()["release"]["filename"], "h264.mkv", "the fifth release");

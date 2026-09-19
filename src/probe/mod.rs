@@ -60,6 +60,9 @@ pub struct MediaInfo {
     pub frame_rate: Option<f64>,
     /// The video's Dolby Vision configuration, when it carries one.
     pub dolby_vision: Option<DolbyVision>,
+    /// The container claims Profile 5 while the HEVC VUI proves there is a normal BT.2020 PQ/HLG base layer.
+    /// Such a record is unsafe to keep: when the first RPU cannot correct it, playback still uses the base layer.
+    pub dolby_vision_record_mismatch: bool,
     pub audio: Vec<AudioTrack>,
     /// Keyframe presentation times in seconds, ascending — the timeline ffmpeg reports with
     /// `-copyts -start_at_zero`, which is the one the segments are cut on.
@@ -452,8 +455,14 @@ fn sequence_colour(payload: &[u8]) -> Option<Colour> {
 /// that writes no Matroska Colour element or MP4 `colr` box still carries that, and a UHD Blu-ray remux often writes
 /// neither — its HDR10 goes out named SDR, which Safari refuses outright.
 pub fn hevc_track(hvcc: &[u8], container: Colour) -> (Option<String>, bool, bool) {
-    let colour = container.or(hevc_sps_colour(hvcc).unwrap_or_default());
+    let colour = hevc_colour(hvcc, container);
     (hevc_codecs(hvcc), is_hdr(colour.transfer, colour.primaries, colour.matrix), colour.transfer == 18)
+}
+
+/// The container's HEVC colour description completed by its SPS VUI. Kept separate from the display flags because
+/// a malformed Dolby Vision Profile 5 record is contradictory only for BT.2020 YCbCr with PQ or HLG specifically.
+pub(crate) fn hevc_colour(hvcc: &[u8], container: Colour) -> Colour {
+    container.or(hevc_sps_colour(hvcc).unwrap_or_default())
 }
 
 /// The colours the first SPS among an `hvcC` record's parameter-set arrays (ISO/IEC 14496-15 8.3.3.1) describes,
