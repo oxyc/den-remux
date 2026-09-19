@@ -10,7 +10,7 @@
 //! only while its ffmpeg is actually running and otherwise sleeps until a request or its idle deadline.
 
 use std::path::PathBuf;
-use std::sync::atomic::Ordering::Relaxed;
+use std::sync::atomic::{AtomicU8, Ordering::Relaxed};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -153,6 +153,7 @@ pub struct Session {
     pub segments: Vec<Segment>,
     pub master: String,
     pub media: String,
+    reports: AtomicU8,
     /// Scout's play URL for the release and the scout it came from, for fetching a fresh debrid link
     /// when the one ffmpeg reads stops working mid-session. Both are secrets.
     play_url: String,
@@ -250,6 +251,12 @@ impl Session {
 
     pub fn touch(&self) {
         self.lock().last_seen = Instant::now();
+    }
+
+    /// A player's diagnostic is useful once and bounded to three attempts. The signed URL is a bearer
+    /// credential; it must not also be an unbounded log-writing endpoint.
+    pub fn take_report_slot(&self) -> bool {
+        self.reports.fetch_update(Relaxed, Relaxed, |count| (count < 3).then_some(count + 1)).is_ok()
     }
 
     /// `Cache-Control` for what the session's URL serves the same for its whole life: its playlists, a found
@@ -1630,6 +1637,7 @@ pub async fn create(
             &renditions,
         ),
         media: playlist::media(&segments, start_at),
+        reports: AtomicU8::new(0),
         sid: sid.clone(),
         sig,
         exp,

@@ -44,7 +44,10 @@ GET    /remux/s/<sid>/<sig>/seg<N>.m4s  200 when made (waits up to 20 s), else 5
 GET    /remux/s/<sid>/<sig>/sub<N>.m3u8 a subtitle rendition: one WebVTT segment spanning the film
 GET    /remux/s/<sid>/<sig>/sub<N>.vtt  text/vtt, kept for the session; an empty document, no-store, when nothing in
                                         that language was found or den-subtitles failed (asked again next time)
-POST   /remux/s/<sid>/<sig>/report      {code, message}: the player couldn't play it — logged against the session, 204
+GET    /remux/s/<sid>/<sig>/speed?bytes=<n>
+                                        the same bounded speed probe, authorized and kept alive by this session URL
+POST   /remux/s/<sid>/<sig>/report      {code, message}: the player couldn't play it — logged against the session, 204;
+                                        at most three attempts per session, including malformed reports
 DELETE /remux/s/<sid>/<sig>             204; the session's URLs answer 410 from then on
 GET    /health, /remux/health           200 {status} — ok, or degraded with a reason (Maintenance); the second is
                                         what a client probes under the /remux mount (den-spec routes-v1)
@@ -148,7 +151,8 @@ itself is never logged. Brave on iOS sends Safari's User-Agent, so it reads as S
   without scout or a probe; a link that stops working mid-session is fetched again and forgotten. A named `filename` (another
   audio track of the release playing) goes first and is kept, converted if need be.
 
-`/remux/s/…` responses carry `Access-Control-Allow-Origin: *`, allow `Range` and expose
+Only a valid `/remux/s/…` bearer URL gets public CORS. Those responses carry
+`Access-Control-Allow-Origin: *`, allow `Range` and expose
 `Content-Range`/`Content-Length` — a Cast receiver's page is on Google's origin. Playlists are
 `application/vnd.apple.mpegurl`; `init.mp4` and segments are `video/mp4`, always whole (`Accept-Ranges: none`; a
 `Range` is ignored). What a session's URL serves is fixed for its life and signed for it alone, so playlists, found
@@ -207,7 +211,8 @@ people watching, not titles clicked.
   runtime plus an hour (six hours at most), ends after `SESSION_IDLE_SECS` without a request, and
   `DELETE` ends it at once. Whoever holds the URL can watch that one title through the homelab until then —
   and nothing else: no scout, no ticket, no debrid link. A signature that does not match is a 404, so a
-  guess learns nothing about which sessions exist.
+  guess learns nothing about which sessions exist. Forged or unknown-session URLs return an empty 404 without CORS,
+  and each session accepts at most three player reports, bounding both log volume and disk writes.
 - **The logs never carry a secret.** The request log shortens the session id and drops the signature;
   anything unrouted is written as `/<unrouted>`; request bodies (where the scout URL arrives) are never
   logged. Every line that quotes an upstream or ffmpeg error goes through a scrubber that removes the
