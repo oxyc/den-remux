@@ -298,11 +298,16 @@ async fn first_rpu_profile(
     hvcc: &[u8],
 ) -> Result<Option<u8>, ProbeError> {
     let bytes = src.read(cluster_at, RPU_AUDIT_BYTES).await?;
-    let (id, _, hl) = header(&bytes).ok_or(ProbeError::Truncated("first Cluster"))?;
+    let (id, size, hl) = header(&bytes).ok_or(ProbeError::Truncated("first Cluster"))?;
     if id != CLUSTER {
         return Err(ProbeError::Unsupported("the first video Cue points outside a Cluster".into()));
     }
-    Ok(rpu_from_elements(&bytes[hl..], track, hvcc, false)
+    // The range may include bytes after this Cluster when its declared size is smaller than the cap. The audit is
+    // specifically of the first cued video Cluster, so do not interpret any trailing top-level or malformed bytes as
+    // its children. Unknown-size Clusters use the whole bounded prefix; known-size ones stop at their declared payload.
+    let available = &bytes[hl..];
+    let payload_len = size.unwrap_or(available.len() as u64).min(available.len() as u64) as usize;
+    Ok(rpu_from_elements(&available[..payload_len], track, hvcc, false)
         .and_then(|nal| dolby_vision::rpu::dovi_rpu::DoviRpu::parse_unspec62_nalu(nal).ok())
         .map(|rpu| rpu.dovi_profile))
 }
@@ -462,7 +467,10 @@ pub async fn probe(src: &Source<'_>, head: &[u8]) -> Result<MediaInfo, ProbeErro
     let mut dolby_vision = video.dovi;
     let dolby_vision_record_mismatch = hevc_colour.is_some_and(|c| contradictory_profile5(dolby_vision, c));
     if dolby_vision_record_mismatch {
-        let first_cluster = parsed_cues.iter().min_by_key(|c| c.time).map(|c| seg_start + c.cluster);
+        // A hostile CueClusterPosition must not wrap into an unrelated range. Failure to audit is safe here: the
+        // VUI contradiction still forces the Dolby Vision record off and uses the HDR base layer.
+        let first_cluster =
+            parsed_cues.iter().min_by_key(|c| c.time).and_then(|c| seg_start.checked_add(c.cluster));
         let profile = match first_cluster {
             Some(at) => match first_rpu_profile(src, at, video.number, &video.private).await {
                 Ok(profile) => profile,
@@ -596,6 +604,34 @@ mod tests {
         assert_eq!(block_frame(&block, 1), None, "lacing needs a full frame split and is not guessed");
         block[3] = 0x80;
         assert_eq!(block_frame(&block, 2), None, "another track");
+    }
+
+    #[tokio::test]
+    async fn an_rpu_audit_stays_inside_the_cued_cluster() {
+        use dolby_vision::rpu::{dovi_rpu::DoviRpu, generate::GenerateConfig};
+
+        let mut hvcc = vec![0; 22];
+        hvcc[21] = 3;
+        let nal = DoviRpu::profile81_config(&GenerateConfig::default())
+            .unwrap()
+            .write_hevc_unspec62_nalu()
+            .unwrap();
+        let mut frame = (nal.len() as u32).to_be_bytes().to_vec();
+        frame.extend_from_slice(&nal);
+        let mut block = vec![0x81, 0, 0, 0x80];
+        block.extend(frame);
+        assert!(block.len() < 0x3FFF);
+
+        // The cued Cluster declares an empty payload. A complete P8 SimpleBlock follows outside that payload in the
+        // same range read. Even malformed trailing bytes cannot become evidence about the cued Cluster.
+        let mut bytes = vec![0x1F, 0x43, 0xB6, 0x75, 0x80];
+        bytes.extend_from_slice(&[0xA3, 0x40 | (block.len() >> 8) as u8, block.len() as u8]);
+        bytes.extend_from_slice(&block);
+        assert_eq!(
+            first_rpu_profile(&Source::Mem(&bytes), 0, 1, &hvcc).await.unwrap(),
+            None,
+            "bytes outside the declared Cluster cannot supply its RPU verdict"
+        );
     }
 
     #[test]
