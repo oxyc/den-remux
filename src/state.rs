@@ -356,6 +356,7 @@ mod tests {
             hlg: false,
             frame_rate: None,
             dolby_vision: None,
+            dolby_vision_record_mismatch: false,
             audio: Vec::new(),
             keyframes: vec![0.0],
         };

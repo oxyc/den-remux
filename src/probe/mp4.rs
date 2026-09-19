@@ -331,6 +331,7 @@ fn parse_moov(moov: &[u8]) -> Result<MediaInfo, ProbeError> {
             (ticks > 0).then(|| frames as f64 * video.timescale as f64 / ticks as f64)
         }),
         dolby_vision: [b"dvcC", b"dvvC", b"dvwC"].into_iter().find_map(config).and_then(super::dovi_config),
+        dolby_vision_record_mismatch: false,
         audio,
         keyframes,
     })

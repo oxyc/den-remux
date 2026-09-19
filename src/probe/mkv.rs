@@ -49,7 +49,13 @@ const CUE_POINT: u32 = 0xBB;
 const CUE_TIME: u32 = 0xB3;
 const CUE_TRACK_POSITIONS: u32 = 0xB7;
 const CUE_TRACK: u32 = 0xF7;
+const CUE_CLUSTER_POSITION: u32 = 0xF1;
 const CLUSTER: u32 = 0x1F43B675;
+const SIMPLE_BLOCK: u32 = 0xA3;
+const BLOCK_GROUP: u32 = 0xA0;
+const BLOCK: u32 = 0xA1;
+/// A 4K keyframe is ordinarily much smaller. This bounds the one extra range read made only for a contradictory P5.
+const RPU_AUDIT_BYTES: u64 = 16 * 1024 * 1024;
 
 /// An element header: id, payload size (`None` = EBML's "unknown size"), and the header's length.
 pub(crate) fn header(b: &[u8]) -> Option<(u32, Option<u64>, usize)> {
@@ -200,18 +206,119 @@ fn colour(t: &Track) -> super::Colour {
     }
 }
 
-/// CueTimes (in timestamp-scale units) of the cue points that index `track`.
-fn parse_cues(b: &[u8], track: u64) -> Vec<u64> {
+#[derive(Clone, Copy)]
+struct Cue {
+    time: u64,
+    cluster: u64,
+}
+
+/// CueTimes and cluster positions (relative to the Segment payload) that index `track`.
+fn parse_cues(b: &[u8], track: u64) -> Vec<Cue> {
     children(b)
         .filter(|(id, _)| *id == CUE_POINT)
         .filter_map(|(_, point)| {
             let time = child(point, CUE_TIME).map(uint)?;
-            children(point)
-                .filter(|(id, _)| *id == CUE_TRACK_POSITIONS)
-                .any(|(_, pos)| child(pos, CUE_TRACK).map(uint) == Some(track))
-                .then_some(time)
+            children(point).filter(|(id, _)| *id == CUE_TRACK_POSITIONS).find_map(|(_, pos)| {
+                if child(pos, CUE_TRACK).map(uint) != Some(track) {
+                    return None;
+                }
+                Some(Cue { time, cluster: child(pos, CUE_CLUSTER_POSITION).map(uint)? })
+            })
         })
         .collect()
+}
+
+/// The first frame in an unlaced Matroska Block for `track`.
+fn block_frame(block: &[u8], track: u64) -> Option<&[u8]> {
+    let first = *block.first()?;
+    let n = first.leading_zeros() as usize + 1;
+    if n > 8 || block.len() < n + 3 {
+        return None;
+    }
+    let mask = (0xFFu16 >> n) as u8;
+    let number = block[..n]
+        .iter()
+        .enumerate()
+        .fold(0u64, |v, (i, b)| v << 8 | if i == 0 { (b & mask) as u64 } else { *b as u64 });
+    let flags = block[n + 2];
+    (number == track && flags & 0x06 == 0).then_some(&block[n + 3..])
+}
+
+/// The first UNSPEC62 NAL in a frame whose NAL units use the length size from `hvcC`.
+fn rpu_nal<'a>(frame: &'a [u8], hvcc: &[u8]) -> Option<&'a [u8]> {
+    let length_size = (*hvcc.get(21)? & 3) as usize + 1;
+    let mut at = 0;
+    while at + length_size <= frame.len() {
+        let len = frame[at..at + length_size].iter().fold(0usize, |n, b| n << 8 | *b as usize);
+        at += length_size;
+        let nal = frame.get(at..at.checked_add(len)?)?;
+        if nal.first().is_some_and(|b| (b >> 1) & 0x3f == 62) {
+            return Some(nal);
+        }
+        at += len;
+    }
+    None
+}
+
+/// Walk a possibly truncated Cluster/BlockGroup prefix. A block can declare more bytes than the bounded audit read;
+/// its available prefix is still enough when the RPU occurs before the cutoff.
+fn rpu_from_elements<'a>(b: &'a [u8], track: u64, hvcc: &[u8], nested: bool) -> Option<&'a [u8]> {
+    let mut at = 0;
+    while let Some((id, size, hl)) = b.get(at..).and_then(header) {
+        let size = usize::try_from(size?).ok()?;
+        let start = at.checked_add(hl)?;
+        let declared_end = start.checked_add(size)?;
+        let end = declared_end.min(b.len());
+        let body = b.get(start..end)?;
+        let frame = match id {
+            SIMPLE_BLOCK if !nested => block_frame(body, track),
+            BLOCK if nested => block_frame(body, track),
+            _ => None,
+        };
+        if let Some(nal) = frame.and_then(|f| rpu_nal(f, hvcc)) {
+            return Some(nal);
+        }
+        if id == BLOCK_GROUP && !nested {
+            if let Some(nal) = rpu_from_elements(body, track, hvcc, true) {
+                return Some(nal);
+            }
+        }
+        if declared_end > b.len() {
+            break;
+        }
+        at = declared_end;
+    }
+    None
+}
+
+async fn first_rpu_profile(
+    src: &Source<'_>,
+    cluster_at: u64,
+    track: u64,
+    hvcc: &[u8],
+) -> Result<Option<u8>, ProbeError> {
+    let bytes = src.read(cluster_at, RPU_AUDIT_BYTES).await?;
+    let (id, size, hl) = header(&bytes).ok_or(ProbeError::Truncated("first Cluster"))?;
+    if id != CLUSTER {
+        return Err(ProbeError::Unsupported("the first video Cue points outside a Cluster".into()));
+    }
+    // The range may include bytes after this Cluster when its declared size is smaller than the cap. The audit is
+    // specifically of the first cued video Cluster, so do not interpret any trailing top-level or malformed bytes as
+    // its children. Unknown-size Clusters use the whole bounded prefix; known-size ones stop at their declared payload.
+    let available = &bytes[hl..];
+    let payload_len = size.unwrap_or(available.len() as u64).min(available.len() as u64) as usize;
+    Ok(rpu_from_elements(&available[..payload_len], track, hvcc, false)
+        .and_then(|nal| dolby_vision::rpu::dovi_rpu::DoviRpu::parse_unspec62_nalu(nal).ok())
+        .map(|rpu| rpu.dovi_profile))
+}
+
+/// A genuine Profile 5 uses IPT-PQ-c2, which has no HEVC VUI code point. BT.2020 YCbCr plus PQ/HLG therefore proves
+/// the container record is wrong before any packet is read (the exact gate used by AetherEngine #532).
+fn contradictory_profile5(dv: Option<super::DolbyVision>, colour: super::Colour) -> bool {
+    dv.is_some_and(|d| d.profile == 5 && d.compat == 0)
+        && colour.primaries == 9
+        && colour.matrix == 9
+        && matches!(colour.transfer, 16 | 18)
 }
 
 fn parse_seek_head(b: &[u8]) -> Vec<(u32, u64)> {
@@ -320,8 +427,8 @@ pub async fn probe(src: &Source<'_>, head: &[u8]) -> Result<MediaInfo, ProbeErro
         .iter()
         .find(|t| t.kind == 1)
         .ok_or_else(|| ProbeError::Unsupported("no video track".into()))?;
-    let mut keyframes: Vec<f64> =
-        parse_cues(&cues, video.number).into_iter().map(|t| secs(t as f64)).collect();
+    let parsed_cues = parse_cues(&cues, video.number);
+    let mut keyframes: Vec<f64> = parsed_cues.iter().map(|c| secs(c.time as f64)).collect();
     keyframes.sort_by(f64::total_cmp);
     keyframes.dedup();
     if keyframes.is_empty() {
@@ -329,11 +436,13 @@ pub async fn probe(src: &Source<'_>, head: &[u8]) -> Result<MediaInfo, ProbeErro
     }
     let mut hdr = super::is_hdr(video.transfer, video.primaries, video.matrix);
     let mut hlg = video.transfer == 18;
+    let mut hevc_colour = None;
     let (codec, codecs) = if video.codec_id.starts_with("V_MPEG4/ISO/AVC") {
         (VideoCodec::H264, super::avc_codecs(&video.private))
     } else if video.codec_id.starts_with("V_MPEGH/ISO/HEVC") {
         // V_MPEGH/ISO/HEVC's CodecPrivate is the `hvcC` record.
         let (codecs, hevc_hdr, hevc_hlg) = super::hevc_track(&video.private, colour(video));
+        hevc_colour = Some(super::hevc_colour(&video.private, colour(video)));
         (hdr, hlg) = (hevc_hdr, hevc_hlg);
         (VideoCodec::Hevc, codecs)
     } else if video.codec_id == "V_AV1" {
@@ -355,6 +464,36 @@ pub async fn probe(src: &Source<'_>, head: &[u8]) -> Result<MediaInfo, ProbeErro
     } else {
         (VideoCodec::Other(video.codec_id.clone()), None)
     };
+    let mut dolby_vision = video.dovi;
+    let dolby_vision_record_mismatch = hevc_colour.is_some_and(|c| contradictory_profile5(dolby_vision, c));
+    if dolby_vision_record_mismatch {
+        // A hostile CueClusterPosition must not wrap into an unrelated range. Failure to audit is safe here: the
+        // VUI contradiction still forces the Dolby Vision record off and uses the HDR base layer.
+        let first_cluster =
+            parsed_cues.iter().min_by_key(|c| c.time).and_then(|c| seg_start.checked_add(c.cluster));
+        let profile = match first_cluster {
+            Some(at) => match first_rpu_profile(src, at, video.number, &video.private).await {
+                Ok(profile) => profile,
+                Err(e) => {
+                    eprintln!("probe: Dolby Vision Profile 5 record contradicts the HEVC VUI; RPU audit failed: {e}");
+                    None
+                }
+            },
+            None => None,
+        };
+        if let Some(profile @ (7 | 8)) = profile {
+            let old = dolby_vision.expect("the contradiction gate has a Dolby Vision record");
+            dolby_vision =
+                Some(super::DolbyVision { profile, compat: if hlg { 4 } else { 1 }, level: old.level });
+            eprintln!(
+                "probe: Dolby Vision Profile 5 record contradicted by its HEVC VUI and first RPU (profile {profile}); using the HDR base layer"
+            );
+        } else {
+            eprintln!(
+                "probe: Dolby Vision Profile 5 record contradicts the HEVC VUI; using the HDR base layer because the first RPU did not prove profile 7 or 8"
+            );
+        }
+    }
     let audio = tracks
         .iter()
         .filter(|t| t.kind == 2)
@@ -379,7 +518,8 @@ pub async fn probe(src: &Source<'_>, head: &[u8]) -> Result<MediaInfo, ProbeErro
         hdr,
         hlg,
         frame_rate: (video.default_duration > 0).then(|| 1e9 / video.default_duration as f64),
-        dolby_vision: video.dovi,
+        dolby_vision,
+        dolby_vision_record_mismatch,
         audio,
         keyframes,
     })
@@ -419,6 +559,79 @@ mod tests {
         let tracks = parse_tracks(&track(b"dvvC"));
         assert_eq!(tracks[0].dovi, Some(super::super::DolbyVision { profile: 8, compat: 1, level: 6 }));
         assert_eq!(parse_tracks(&track(b"mvcC"))[0].dovi, None, "another block addition");
+    }
+
+    #[test]
+    fn only_a_profile5_record_over_a_bt2020_pq_or_hlg_vui_is_contradictory() {
+        let p5 = Some(super::super::DolbyVision { profile: 5, compat: 0, level: 6 });
+        let pq = super::super::Colour { primaries: 9, transfer: 16, matrix: 9, full_range: Some(false) };
+        assert!(contradictory_profile5(p5, pq));
+        assert!(contradictory_profile5(p5, super::super::Colour { transfer: 18, ..pq }));
+        assert!(!contradictory_profile5(p5, super::super::Colour::default()), "a genuine P5 reads no packet");
+        assert!(!contradictory_profile5(
+            Some(super::super::DolbyVision { profile: 8, compat: 1, level: 6 }),
+            pq
+        ));
+        assert!(!contradictory_profile5(p5, super::super::Colour { matrix: 1, ..pq }));
+    }
+
+    #[test]
+    fn a_length_prefixed_first_rpu_is_parsed_by_libdovi() {
+        use dolby_vision::rpu::{dovi_rpu::DoviRpu, generate::GenerateConfig};
+
+        let mut hvcc = vec![0; 22];
+        hvcc[21] = 3; // four-byte NAL lengths
+        for (rpu, expected) in [
+            (DoviRpu::profile5_config(&GenerateConfig::default()).unwrap(), 5),
+            (DoviRpu::profile81_config(&GenerateConfig::default()).unwrap(), 8),
+        ] {
+            let nal = rpu.write_hevc_unspec62_nalu().unwrap();
+            let mut frame = vec![0, 0, 0, 2, 0x26, 0x01]; // an ordinary HEVC NAL before the RPU
+            frame.extend_from_slice(&(nal.len() as u32).to_be_bytes());
+            frame.extend_from_slice(&nal);
+            let found = rpu_nal(&frame, &hvcc).expect("UNSPEC62");
+            assert_eq!(DoviRpu::parse_unspec62_nalu(found).unwrap().dovi_profile, expected);
+        }
+        assert!(rpu_nal(&[0, 0, 0, 8, 0x7c], &hvcc).is_none(), "a NAL past the frame is rejected");
+    }
+
+    #[test]
+    fn an_unlaced_video_block_yields_its_frame() {
+        let mut block = vec![0x81, 0, 0, 0x80]; // track 1, timestamp 0, keyframe, no lacing
+        block.extend_from_slice(&[1, 2, 3]);
+        assert_eq!(block_frame(&block, 1), Some(&[1, 2, 3][..]));
+        block[3] |= 0x02;
+        assert_eq!(block_frame(&block, 1), None, "lacing needs a full frame split and is not guessed");
+        block[3] = 0x80;
+        assert_eq!(block_frame(&block, 2), None, "another track");
+    }
+
+    #[tokio::test]
+    async fn an_rpu_audit_stays_inside_the_cued_cluster() {
+        use dolby_vision::rpu::{dovi_rpu::DoviRpu, generate::GenerateConfig};
+
+        let mut hvcc = vec![0; 22];
+        hvcc[21] = 3;
+        let nal = DoviRpu::profile81_config(&GenerateConfig::default())
+            .unwrap()
+            .write_hevc_unspec62_nalu()
+            .unwrap();
+        let mut frame = (nal.len() as u32).to_be_bytes().to_vec();
+        frame.extend_from_slice(&nal);
+        let mut block = vec![0x81, 0, 0, 0x80];
+        block.extend(frame);
+        assert!(block.len() < 0x3FFF);
+
+        // The cued Cluster declares an empty payload. A complete P8 SimpleBlock follows outside that payload in the
+        // same range read. Even malformed trailing bytes cannot become evidence about the cued Cluster.
+        let mut bytes = vec![0x1F, 0x43, 0xB6, 0x75, 0x80];
+        bytes.extend_from_slice(&[0xA3, 0x40 | (block.len() >> 8) as u8, block.len() as u8]);
+        bytes.extend_from_slice(&block);
+        assert_eq!(
+            first_rpu_profile(&Source::Mem(&bytes), 0, 1, &hvcc).await.unwrap(),
+            None,
+            "bytes outside the declared Cluster cannot supply its RPU verdict"
+        );
     }
 
     #[test]

@@ -1025,6 +1025,15 @@ pub(crate) fn keeps_dolby_vision(dv: crate::probe::DolbyVision, playable: Option
     }
 }
 
+fn kept_dolby_vision(
+    info: &MediaInfo,
+    transcoded: bool,
+    playable: Option<&Playable>,
+) -> Option<crate::probe::DolbyVision> {
+    info.dolby_vision
+        .filter(|dv| !transcoded && !info.dolby_vision_record_mismatch && keeps_dolby_vision(*dv, playable))
+}
+
 /// How kept Dolby Vision is named in the master playlist: CODECS to use in place of the base layer's (profile 5,
 /// `dvh1.05.LL`), SUPPLEMENTAL-CODECS (profile 8, `dvh1.08.LL/` and the brand of what its base layer is — `db1p`
 /// HDR10, `db2g` SDR, `db4h` HLG) and VIDEO-RANGE. `None` for a profile HLS does not name.
@@ -1056,6 +1065,11 @@ fn copied_range(info: &MediaInfo, codecs: &str) -> Option<&'static str> {
 /// Whether a release would play with no picture: Dolby Vision profile 5, which has no base layer, so stripped or
 /// transcoded it comes out green and purple — unless the player shows profile 5 and takes the release as it is.
 fn no_picture(want: &Want<'_>, takes_hevc: bool, info: &MediaInfo) -> bool {
+    // A contradictory P5 record sits over a regular BT.2020 PQ/HLG base layer. The record itself must not make us
+    // refuse that safe fallback when its RPU was unreadable.
+    if info.dolby_vision_record_mismatch {
+        return false;
+    }
     info.dolby_vision.is_some_and(|dv| {
         if dv.has_fallback() {
             return false;
@@ -1134,10 +1148,11 @@ pub(crate) enum Fit {
 /// A release's `Fit` from scout's attributes, only where they say so. The probe still has the last word on
 /// whatever is tried; this decides the order, and which not to try.
 pub(crate) fn fit(a: &scout::Attributes, playable: Option<&Playable>, takes_hevc: bool) -> Fit {
-    // Dolby Vision profile 5 has no base layer: stripped or converted, its picture is green and purple — unless the
-    // player shows profile 5 itself. Only scout's probe reads the profile, so it is the file's.
+    // Most Profile 5 has no base layer, but AE #532 established a real class whose container falsely says P5 over a
+    // normal HDR base layer. Put these last rather than ruling them out: this probe reads the VUI and first RPU before
+    // either refusing genuine P5 or safely stripping a contradictory record.
     if a.dv_profile == 5 && !playable.is_some_and(|p| p.dolby_vision.p5) {
-        return Fit::Never;
+        return Fit::Convert;
     }
     let uhd =
         a.resolution.as_deref().is_some_and(|r| matches!(r.to_ascii_lowercase().as_str(), "2160p" | "4k"));
@@ -1565,8 +1580,7 @@ pub async fn create(
     };
     // Dolby Vision stays in a copy for a player that shows it; everywhere else, and in every transcode, the base
     // layer plays alone.
-    let kept_dv =
-        info.dolby_vision.filter(|dv| transcode.is_none() && keeps_dolby_vision(*dv, want.playable));
+    let kept_dv = kept_dolby_vision(&info, transcode.is_some(), want.playable);
     let dovi = match (info.dolby_vision, kept_dv) {
         (None, _) => job::Dovi::Absent,
         (Some(_), None) => job::Dovi::Strip,
@@ -1749,6 +1763,7 @@ mod tests {
             hlg: false,
             frame_rate: None,
             dolby_vision: None,
+            dolby_vision_record_mismatch: false,
             audio: Vec::new(),
             keyframes: vec![0.0],
         }
@@ -1923,6 +1938,39 @@ mod tests {
     }
 
     #[test]
+    fn a_contradictory_profile5_record_always_uses_the_hdr_base_layer() {
+        let mut release = info(VideoCodec::Hevc, "hvc1.2.4.L153.B0", true);
+        release.dolby_vision = Some(crate::probe::DolbyVision { profile: 5, compat: 0, level: 6 });
+        release.dolby_vision_record_mismatch = true;
+        let player = Playable {
+            hevc_main10: 153,
+            hdr: true,
+            dolby_vision: DolbyVisionPlay { p5: true, p8: true },
+            ..Playable::default()
+        };
+        assert_eq!(
+            kept_dolby_vision(&release, false, Some(&player)),
+            None,
+            "never signal the false P5 record"
+        );
+        let want = Want {
+            id: "tt1",
+            filename: None,
+            scout: None,
+            audio: &[],
+            audio_track: None,
+            subtitles: None,
+            subtitle_languages: &[],
+            video_codecs: &[],
+            playable: Some(&player),
+            start_at: 0.0,
+            max_bitrate: None,
+            client: "test".into(),
+        };
+        assert!(!no_picture(&want, true, &release), "the BT.2020 base layer has a picture");
+    }
+
+    #[test]
     fn only_dolby_tracks_are_copied() {
         assert_eq!(dolby_codec("A_EAC3"), Some("ec-3"));
         assert_eq!(dolby_codec("ec-3"), Some("ec-3"));
@@ -1950,7 +1998,11 @@ mod tests {
         let uhd_h264 = scout::Attributes { resolution: Some("2160p".into()), ..a("h264") };
         assert_eq!(fit(&uhd_h264, Some(&Playable { h264: 0x29, ..firefox }), false), Fit::Never);
         let p5 = scout::Attributes { dv_profile: 5, hdr: true, ..a("hevc") };
-        assert_eq!(fit(&p5, p, true), Fit::Never, "no picture without Dolby Vision");
+        assert_eq!(
+            fit(&p5, p, true),
+            Fit::Convert,
+            "opened last so a false P5 record can be corrected by the probe"
+        );
         let shows_p5 = Playable { dolby_vision: DolbyVisionPlay { p5: true, p8: false }, ..safari };
         assert_eq!(fit(&p5, Some(&shows_p5), true), Fit::Copy, "a player that shows profile 5 opens it");
         let uhd = scout::Attributes { resolution: Some("2160p".into()), ..a("hevc") };
