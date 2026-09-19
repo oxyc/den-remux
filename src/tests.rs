@@ -455,6 +455,7 @@ fn state_with(origin: &str, max_sessions: usize, idle: Duration, scout_key: Opti
         max_transcodes: 1,
         vaapi_device: PathBuf::from("/dev/dri/renderD128"),
         trusted_proxies: vec!["192.168.86.149".parse().unwrap()],
+        public_session_proxy: Some("10.89.0.10".parse().unwrap()),
         web_origins: vec!["https://d.example".into()],
         metrics_token: None,
         log_requests: false,
@@ -462,6 +463,20 @@ fn state_with(origin: &str, max_sessions: usize, idle: Duration, scout_key: Opti
     state.scratch_ok.store(crate::state::check_scratch(&dir), Relaxed);
     state.ffmpeg_ok.store(true, Relaxed);
     state
+}
+
+#[test]
+fn only_the_dedicated_edge_peer_can_mark_a_session_public() {
+    let state = test_state("http://127.0.0.1:9", 2, Duration::from_secs(600));
+    let request = |peer: &str| {
+        let (mut parts, _) =
+            Request::builder().header("x-den-public-session", "1").body(()).unwrap().into_parts();
+        parts.extensions.insert(crate::Peer(peer.parse().unwrap()));
+        parts
+    };
+    assert!(crate::public_session_request(&state, &request("10.89.0.10")));
+    assert!(!crate::public_session_request(&state, &request("192.168.86.149")));
+    assert!(!crate::public_session_request(&state, &request("10.89.0.11")));
 }
 
 struct Reply {
@@ -1612,6 +1627,7 @@ async fn an_episode_plays_through_the_librarys_install_url() {
 #[tokio::test]
 async fn session_routes_refuse_without_the_right_credentials() {
     let state = test_state("http://127.0.0.1:9", 2, Duration::from_secs(600));
+    assert!(crate::metrics_body(&state).contains("remux_public_sessions 0\n"));
     // No cookie, a forged one, a bad key.
     assert_eq!(
         call(&state, "POST", "/remux/session", None, r#"{"imdb":"tt1"}"#).await.status,

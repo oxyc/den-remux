@@ -54,6 +54,8 @@ pub struct Config {
     /// `TRUSTED_PROXIES` — proxies (comma-separated IPs) whose `X-Forwarded-For` names the visitor, for the
     /// per-visitor limit on logins and new sessions. `tailscale serve` connects from its host's address.
     pub trusted_proxies: Vec<std::net::IpAddr>,
+    /// `PUBLIC_SESSION_PROXY` — the one den-edge container address allowed to mark a session as public.
+    pub public_session_proxy: Option<std::net::IpAddr>,
     /// `WEB_ORIGINS` — pages on another origin that may log in and start sessions here (comma-separated): the Den
     /// web app on its public name, whose player plays from this service's tailnet address (oxyc/den#15). Session
     /// files are readable from anywhere already; these two routes answer CORS for these origins only.
@@ -213,6 +215,7 @@ impl Config {
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("/dev/dri/renderD128")),
             trusted_proxies: parse_proxies(&env_opt("TRUSTED_PROXIES").unwrap_or_default()),
+            public_session_proxy: env_opt("PUBLIC_SESSION_PROXY").and_then(|value| value.parse().ok()),
             web_origins: parse_origins(&env_opt("WEB_ORIGINS").unwrap_or_default()),
             metrics_token: env_opt("METRICS_TOKEN"),
             log_requests: log_requests_on(env::var("LOG_REQUESTS").ok().as_deref()),

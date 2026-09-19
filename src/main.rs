@@ -140,7 +140,16 @@ fn metrics_body(state: &AppState) -> String {
         concat!("{version=\"", env!("CARGO_PKG_VERSION"), "\"}"),
         1,
     );
-    metric("remux_sessions", "gauge", "Sessions playing now.", "", state.sessions().len() as u64);
+    let sessions = state.sessions();
+    metric("remux_sessions", "gauge", "Sessions playing now.", "", sessions.len() as u64);
+    metric(
+        "remux_public_sessions",
+        "gauge",
+        "Sessions created through den-edge's authenticated public origin.",
+        "",
+        sessions.values().filter(|session| session.public).count() as u64,
+    );
+    drop(sessions);
     metric("remux_sessions_max", "gauge", "MAX_SESSIONS.", "", state.cfg.max_sessions as u64);
     metric(
         "remux_ffmpeg_running",
@@ -370,6 +379,11 @@ pub(crate) fn visitor(state: &AppState, parts: &hyper::http::request::Parts) -> 
         .map(str::trim)
         .rfind(|s| !s.is_empty());
     Some(forwarded.and_then(|s| s.parse().ok()).unwrap_or(peer))
+}
+
+fn public_session_request(state: &AppState, parts: &hyper::http::request::Parts) -> bool {
+    parts.headers.get("x-den-public-session").is_some_and(|value| value.as_bytes() == b"1")
+        && parts.extensions.get::<Peer>().map(|peer| peer.0) == state.cfg.public_session_proxy
 }
 
 /// A small JSON request body; `None` if it is larger than any real request.
@@ -614,7 +628,8 @@ where
         max_bitrate: req.max_bitrate,
         client: client::label(parts.headers.get(hyper::header::USER_AGENT), req.player.as_deref()),
     };
-    let created = session::create(state, admission, &want).await;
+    let public = public_session_request(state, parts);
+    let created = session::create(state, admission, &want, public).await;
     // Apple's players give up on an init.mp4 that takes more than about five seconds; hls.js doesn't need this.
     if let (Ok(s), Some("native")) = (&created, req.player.as_deref()) {
         s.prepare(state).await;
@@ -793,7 +808,7 @@ async fn run(cfg: Config) -> std::io::Result<()> {
     let on = |b: bool| if b { "on" } else { "off" };
     eprintln!(
         "den-remux {} listening on :{} — metrics={} log_requests={} scout_origins={} scout_key={} scout_install={} \
-         browser_keys={} url_key={} trusted_proxies={} \
+         browser_keys={} url_key={} trusted_proxies={} public_session_proxy={} \
          max_sessions={} per_install={} idle={}s scratch={} scratch_max={} ffmpeg={} transcode={}",
         env!("CARGO_PKG_VERSION"),
         state.cfg.port,
@@ -805,6 +820,7 @@ async fn run(cfg: Config) -> std::io::Result<()> {
         state.cfg.browser_key_hashes.len(),
         if state.cfg.url_key_ephemeral { "ephemeral" } else { "set" },
         state.cfg.trusted_proxies.len(),
+        on(state.cfg.public_session_proxy.is_some()),
         state.cfg.max_sessions,
         state.cfg.max_sessions_per_install,
         state.cfg.session_idle.as_secs(),

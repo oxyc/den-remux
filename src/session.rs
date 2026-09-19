@@ -128,6 +128,9 @@ pub struct Session {
     /// Whom it counts against: a logged-in browser's id, or the install it was started with
     /// (`auth::install_id`).
     pub owner: String,
+    /// Created through den-edge's authenticated public origin. Used only to release the public firewall gate;
+    /// signed media authorization remains the session URL itself.
+    pub public: bool,
     /// When it was set up, so an install past its share ends its oldest.
     pub started: Instant,
     pub imdb: String,
@@ -1331,6 +1334,7 @@ pub async fn create(
     st: &Arc<AppState>,
     admission: Admission,
     want: &Want<'_>,
+    public: bool,
 ) -> Result<Arc<Session>, ApiError> {
     let imdb = want.id;
     let base = scout_base(st, want.scout)?;
@@ -1650,6 +1654,7 @@ pub async fn create(
         sig,
         exp,
         owner,
+        public,
         started: Instant::now(),
         imdb: imdb.to_string(),
         dir,
