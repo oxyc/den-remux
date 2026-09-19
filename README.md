@@ -45,7 +45,7 @@ GET    /remux/s/<sid>/<sig>/sub<N>.m3u8 a subtitle rendition: one WebVTT segment
 GET    /remux/s/<sid>/<sig>/sub<N>.vtt  text/vtt, kept for the session; an empty document, no-store, when nothing in
                                         that language was found or den-subtitles failed (asked again next time)
 GET    /remux/s/<sid>/<sig>/speed?bytes=<n>
-                                        the same bounded speed probe, authorized and kept alive by this session URL
+                                        the same bounded speed probe, authorized by this session URL; two attempts
 POST   /remux/s/<sid>/<sig>/report      {code, message}: the player couldn't play it — logged against the session, 204;
                                         at most three attempts per session, including malformed reports
 DELETE /remux/s/<sid>/<sig>             204; the session's URLs answer 410 from then on
@@ -79,8 +79,8 @@ itself is never logged. Brave on iOS sends Safari's User-Agent, so it reads as S
   own `channels` in `audioTracks`: fewer means the track plays downmixed to stereo.
 - **Subtitles.** `subtitles` is den-subtitles' install URL from the library, on `SUBTITLE_ORIGINS`;
   `subtitleLanguages` (up to 4, most wanted first) become WebVTT renditions in the master playlist — what AirPlay
-  and Cast receivers show, which a page's own `<track>` never reaches. The first is `DEFAULT=YES`, so it shows
-  without being picked; the rest are `DEFAULT=NO`, all `AUTOSELECT=YES`. Nothing is fetched until a player opens one:
+  and Cast receivers show, which a page's own `<track>` never reaches. Every one is `DEFAULT=NO,AUTOSELECT=YES`,
+  so an unset preference remains off and the player or receiver can select one. Nothing is fetched until a player opens one:
   then den-remux asks den-subtitles for the title with the release's OpenSubtitles hash, size and
   filename (the Apple TV's hints, so an exact-encode match ranks first) and serves the first subtitle in
   that language. A subtitle URL off `SUBTITLE_ORIGINS` is skipped.

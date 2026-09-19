@@ -696,6 +696,16 @@ async fn end_to_end(
     assert_eq!(signed_speed.status, StatusCode::OK);
     assert_eq!(signed_speed.body.len(), 1024);
     assert_eq!(signed_speed.headers["access-control-allow-origin"], "*");
+    assert_eq!(
+        call(&state, "GET", &format!("{base}speed?bytes=1024"), None, "").await.status,
+        StatusCode::OK,
+        "one interrupted measurement may retry"
+    );
+    assert_eq!(
+        call(&state, "GET", &format!("{base}speed?bytes=1024"), None, "").await.status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "a signed session has a bounded speed-probe budget"
+    );
 
     // Ending it: 204, then 410 for anything under its URL, and its scratch is gone.
     let sid = created["sid"].as_str().unwrap();
@@ -1364,7 +1374,7 @@ async fn subtitles_are_webvtt_renditions_from_den_subtitles() {
 
     let master = call(&state, "GET", &format!("{base}master.m3u8"), None, "").await.text();
     assert!(master.contains("LANGUAGE=\"fi\"") && master.contains("SUBTITLES=\"subs\""), "{master}");
-    assert!(master.contains("LANGUAGE=\"en\",DEFAULT=YES,AUTOSELECT=YES"), "the first preference: {master}");
+    assert!(master.contains("LANGUAGE=\"en\",DEFAULT=NO,AUTOSELECT=YES"), "the first preference: {master}");
     let pl = call(&state, "GET", &format!("{base}sub0.m3u8"), None, "").await;
     assert_eq!(pl.status, StatusCode::OK);
     assert!(pl.text().contains("sub0.vtt"), "{}", pl.text());

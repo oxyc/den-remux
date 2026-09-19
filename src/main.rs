@@ -710,10 +710,12 @@ where
         // no server log sees otherwise. Only the holder of the session's signed URL gets here.
         (&Method::POST, Some("report")) if s.take_report_slot() => report(s.short(), body).await,
         (&Method::POST, Some("report")) => rate_limited("This session already reported its player failures."),
-        (&Method::GET | &Method::HEAD, Some("speed")) => {
+        (&Method::HEAD, Some("speed")) => speed(parts),
+        (&Method::GET, Some("speed")) if s.take_speed_slot() => {
             s.touch();
             speed(parts)
         }
+        (&Method::GET, Some("speed")) => rate_limited("This session already measured its link."),
         (&Method::GET | &Method::HEAD, Some(f)) => {
             let resp = match f {
                 // VOD with an ENDLIST, fixed when the session was made: kept for its life. Idleness is judged by
