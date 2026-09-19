@@ -455,6 +455,7 @@ fn state_with(origin: &str, max_sessions: usize, idle: Duration, scout_key: Opti
         max_transcodes: 1,
         vaapi_device: PathBuf::from("/dev/dri/renderD128"),
         trusted_proxies: vec!["192.168.86.149".parse().unwrap()],
+        public_session_proxy: Some("10.89.0.10".parse().unwrap()),
         web_origins: vec!["https://d.example".into()],
         metrics_token: None,
         log_requests: false,
@@ -462,6 +463,20 @@ fn state_with(origin: &str, max_sessions: usize, idle: Duration, scout_key: Opti
     state.scratch_ok.store(crate::state::check_scratch(&dir), Relaxed);
     state.ffmpeg_ok.store(true, Relaxed);
     state
+}
+
+#[test]
+fn only_the_dedicated_edge_peer_can_mark_a_session_public() {
+    let state = test_state("http://127.0.0.1:9", 2, Duration::from_secs(600));
+    let request = |peer: &str| {
+        let (mut parts, _) =
+            Request::builder().header("x-den-public-session", "1").body(()).unwrap().into_parts();
+        parts.extensions.insert(crate::Peer(peer.parse().unwrap()));
+        parts
+    };
+    assert!(crate::public_session_request(&state, &request("10.89.0.10")));
+    assert!(!crate::public_session_request(&state, &request("192.168.86.149")));
+    assert!(!crate::public_session_request(&state, &request("10.89.0.11")));
 }
 
 struct Reply {
@@ -682,6 +697,30 @@ async fn end_to_end(
         call(&state, "POST", &format!("{base}report"), None, "{}").await.status,
         StatusCode::BAD_REQUEST
     );
+    assert_eq!(
+        call(&state, "POST", &format!("{base}report"), None, r#"{"code":3,"message":"again"}"#).await.status,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        call(&state, "POST", &format!("{base}report"), None, r#"{"code":3,"message":"fourth"}"#).await.status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "a signed URL cannot turn reports into an unbounded log writer"
+    );
+
+    let signed_speed = call(&state, "GET", &format!("{base}speed?bytes=1024"), None, "").await;
+    assert_eq!(signed_speed.status, StatusCode::OK);
+    assert_eq!(signed_speed.body.len(), 1024);
+    assert_eq!(signed_speed.headers["access-control-allow-origin"], "*");
+    assert_eq!(
+        call(&state, "GET", &format!("{base}speed?bytes=1024"), None, "").await.status,
+        StatusCode::OK,
+        "one interrupted measurement may retry"
+    );
+    assert_eq!(
+        call(&state, "GET", &format!("{base}speed?bytes=1024"), None, "").await.status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "a signed session has a bounded speed-probe budget"
+    );
 
     // Ending it: 204, then 410 for anything under its URL, and its scratch is gone.
     let sid = created["sid"].as_str().unwrap();
@@ -691,9 +730,9 @@ async fn end_to_end(
     assert_eq!(del.status, StatusCode::NO_CONTENT);
     assert_eq!(call(&state, "GET", &format!("{base}seg0.m4s"), None, "").await.status, StatusCode::GONE);
     assert_eq!(call(&state, "GET", &playlist, None, "").await.status, StatusCode::GONE);
-    // A player that ends its session as it reports why is still heard.
+    // Tombstones reveal only that a holder's session is gone; they never retain a reporting endpoint.
     let late = call(&state, "POST", &format!("{base}report"), None, r#"{"code":3,"message":"DECODE"}"#).await;
-    assert_eq!(late.status, StatusCode::NO_CONTENT, "a report after the end is logged, not refused");
+    assert_eq!(late.status, StatusCode::GONE, "a report after the end is refused");
     assert!(!dir.exists(), "scratch left behind");
     assert_eq!(state.scratch_bytes.load(Relaxed), 0);
     (master.text(), init.body, whole)
@@ -1350,7 +1389,7 @@ async fn subtitles_are_webvtt_renditions_from_den_subtitles() {
 
     let master = call(&state, "GET", &format!("{base}master.m3u8"), None, "").await.text();
     assert!(master.contains("LANGUAGE=\"fi\"") && master.contains("SUBTITLES=\"subs\""), "{master}");
-    assert!(master.contains("LANGUAGE=\"en\",DEFAULT=YES,AUTOSELECT=YES"), "the first preference: {master}");
+    assert!(master.contains("LANGUAGE=\"en\",DEFAULT=NO,AUTOSELECT=YES"), "the first preference: {master}");
     let pl = call(&state, "GET", &format!("{base}sub0.m3u8"), None, "").await;
     assert_eq!(pl.status, StatusCode::OK);
     assert!(pl.text().contains("sub0.vtt"), "{}", pl.text());
@@ -1448,12 +1487,12 @@ async fn hevc_for_a_player_without_it_takes_the_one_transcode() {
     assert_eq!(r.json()["video"], copied, "copied");
 
     state.end_session(j["sid"].as_str().unwrap(), "test").await;
-    // A player that ends its session as it reports why is still heard; anything else under its URL is gone.
+    // A tombstone does not keep its report endpoint alive.
     let ended = j["playlist"].as_str().unwrap();
     let late =
         call(&state, "POST", &ended.replace("master.m3u8", "report"), None, r#"{"code":3,"message":"x"}"#)
             .await;
-    assert_eq!(late.status, StatusCode::NO_CONTENT, "a report after the end is logged, not refused");
+    assert_eq!(late.status, StatusCode::GONE, "a report after the end is refused");
     assert_eq!(call(&state, "GET", ended, None, "").await.status, StatusCode::GONE);
     let r = call(&state, "POST", "/remux/session", Some(&laptop), h264_only).await;
     assert_eq!(r.status, StatusCode::CREATED, "the ended session gave its transcode back: {}", r.text());
@@ -1588,6 +1627,7 @@ async fn an_episode_plays_through_the_librarys_install_url() {
 #[tokio::test]
 async fn session_routes_refuse_without_the_right_credentials() {
     let state = test_state("http://127.0.0.1:9", 2, Duration::from_secs(600));
+    assert!(crate::metrics_body(&state).contains("remux_public_sessions 0\n"));
     // No cookie, a forged one, a bad key.
     assert_eq!(
         call(&state, "POST", "/remux/session", None, r#"{"imdb":"tt1"}"#).await.status,
@@ -1607,12 +1647,13 @@ async fn session_routes_refuse_without_the_right_credentials() {
         call(&state, "POST", "/remux/session", Some(&cookie), r#"{"imdb":"tt1:1:2"}"#).await.status,
         StatusCode::BAD_REQUEST
     );
-    // An unknown session is a 404, with CORS so a receiver can read it; login is not cross-origin.
+    // An unknown session is a plain 404. Only a verified signed path gets receiver CORS.
     let r =
         call(&state, "GET", "/remux/s/AAAAAAAAAAAAAAAAAAAAAA/AAAAAAAAAAAAAAAAAAAAAA/master.m3u8", None, "")
             .await;
     assert_eq!(r.status, StatusCode::NOT_FOUND);
-    assert_eq!(r.headers["access-control-allow-origin"], "*");
+    assert!(r.body.is_empty(), "unknown signed paths are bare 404s");
+    assert!(r.headers.get("access-control-allow-origin").is_none());
     assert!(bad.headers.get("access-control-allow-origin").is_none());
     assert_eq!(call(&state, "GET", "/remux/login", None, "").await.status, StatusCode::METHOD_NOT_ALLOWED);
     assert_eq!(call(&state, "GET", "/nope", None, "").await.json()["error"], "not_found");

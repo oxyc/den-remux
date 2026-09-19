@@ -4,7 +4,7 @@
 //!   POST /remux/session {imdb, season?, episode?, filename?, scout?, maxBitrate?} → a signed session: /remux/s/<sid>/<sig>/master.m3u8
 //!   POST /remux/releases {imdb, season?, episode?, scout?} → what a session could play: labels and names, no URLs
 //!   GET  /remux/speed?bytes=<n>             → n random bytes (8 MiB at most), for a remote player to time its link
-//!   GET  /remux/s/<sid>/<sig>/…             → HLS (fMP4): master, media, init.mp4, seg<N>.m4s
+//!   GET  /remux/s/<sid>/<sig>/…             → HLS (fMP4) and a session-bound speed probe
 //!   POST /remux/s/<sid>/<sig>/report {code, message} → the player couldn't play it, into the log
 //!   DELETE /remux/s/<sid>/<sig>             → end it (410 from then on)
 //!   GET  /health, /metrics
@@ -140,7 +140,16 @@ fn metrics_body(state: &AppState) -> String {
         concat!("{version=\"", env!("CARGO_PKG_VERSION"), "\"}"),
         1,
     );
-    metric("remux_sessions", "gauge", "Sessions playing now.", "", state.sessions().len() as u64);
+    let sessions = state.sessions();
+    metric("remux_sessions", "gauge", "Sessions playing now.", "", sessions.len() as u64);
+    metric(
+        "remux_public_sessions",
+        "gauge",
+        "Sessions created through den-edge's authenticated public origin.",
+        "",
+        sessions.values().filter(|session| session.public).count() as u64,
+    );
+    drop(sessions);
     metric("remux_sessions_max", "gauge", "MAX_SESSIONS.", "", state.cfg.max_sessions as u64);
     metric(
         "remux_ffmpeg_running",
@@ -197,6 +206,7 @@ fn add_cors(resp: &mut Response<Body>) {
     h.insert("access-control-allow-methods", HeaderValue::from_static("GET, HEAD, POST, DELETE, OPTIONS"));
     h.insert("access-control-allow-headers", HeaderValue::from_static("Range, X-Request-Id"));
     h.insert("access-control-expose-headers", HeaderValue::from_static("Content-Range, Content-Length"));
+    h.insert("timing-allow-origin", HeaderValue::from_static("*"));
     h.insert("access-control-max-age", HeaderValue::from_static("86400"));
 }
 
@@ -208,9 +218,9 @@ where
     let start = std::time::Instant::now();
     let (parts, body) = req.into_parts();
     let mut resp = route(&state, &parts, body).await;
-    // The session files are readable from anywhere. Login and session creation answer only the web app's other
-    // origins (`WEB_ORIGINS`): a wildcard there would invite every site to try.
-    if parts.uri.path().starts_with("/remux/s/") {
+    // The route sets this private marker only after the session signature verifies. Removing it before the answer
+    // leaves malformed and forged paths without CORS, so a public listener cannot be used as a cross-origin oracle.
+    if resp.headers_mut().remove("x-den-valid-session").is_some() {
         add_cors(&mut resp);
     } else if matches!(
         parts.uri.path(),
@@ -369,6 +379,11 @@ pub(crate) fn visitor(state: &AppState, parts: &hyper::http::request::Parts) -> 
         .map(str::trim)
         .rfind(|s| !s.is_empty());
     Some(forwarded.and_then(|s| s.parse().ok()).unwrap_or(peer))
+}
+
+fn public_session_request(state: &AppState, parts: &hyper::http::request::Parts) -> bool {
+    parts.headers.get("x-den-public-session").is_some_and(|value| value.as_bytes() == b"1")
+        && parts.extensions.get::<Peer>().map(|peer| peer.0) == state.cfg.public_session_proxy
 }
 
 /// A small JSON request body; `None` if it is larger than any real request.
@@ -613,7 +628,8 @@ where
         max_bitrate: req.max_bitrate,
         client: client::label(parts.headers.get(hyper::header::USER_AGENT), req.player.as_deref()),
     };
-    let created = session::create(state, admission, &want).await;
+    let public = public_session_request(state, parts);
+    let created = session::create(state, admission, &want, public).await;
     // Apple's players give up on an init.mp4 that takes more than about five seconds; hls.js doesn't need this.
     if let (Ok(s), Some("native")) = (&created, req.player.as_deref()) {
         s.prepare(state).await;
@@ -638,6 +654,7 @@ where
                 },
                 "sid": s.sid,
                 "playlist": format!("/remux/s/{}/{}/master.m3u8", s.sid, s.sig),
+                "speed": format!("/remux/s/{}/{}/speed", s.sid, s.sig),
                 "release": {"label": s.release.label, "filename": s.release.filename, "size": s.release.size},
                 "duration": s.info.duration,
                 "expiresAt": s.exp,
@@ -675,41 +692,45 @@ where
     let mut it = rest.splitn(3, '/');
     let (sid, sig, file) = (it.next().unwrap_or(""), it.next().unwrap_or(""), it.next());
     if !auth::is_id(sid) || !auth::is_id(sig) {
-        return httputil::not_found();
-    }
-    if parts.method == Method::OPTIONS {
-        return Response::builder().status(StatusCode::NO_CONTENT).body(httputil::full("")).unwrap();
+        return session_not_found();
     }
     let key = &state.cfg.url_key;
     let Some(s) = state.session(sid) else {
         // An ended session answers 410 — but only to someone holding its URL; to anyone else it is as
         // absent as a session that never existed.
         return match state.tombstone(sid) {
-            Some(exp) if auth::url_sig_ok(key, sid, exp, sig) => match (&parts.method, file) {
-                // A player that gives up often ends its session as it reports why, and the report can arrive
-                // second. It is still the only record of what the player saw.
-                (&Method::POST, Some("report")) => report(sid.get(..6).unwrap_or(sid), body).await,
-                _ => session::gone(),
-            },
-            _ => httputil::not_found(),
+            Some(exp) if auth::url_sig_ok(key, sid, exp, sig) => valid_session(session::gone()),
+            _ => session_not_found(),
         };
     };
     if !auth::url_sig_ok(key, sid, s.exp, sig) {
-        return httputil::not_found();
+        return session_not_found();
+    }
+    if parts.method == Method::OPTIONS {
+        return valid_session(
+            Response::builder().status(StatusCode::NO_CONTENT).body(httputil::full("")).unwrap(),
+        );
     }
     if unix_now() >= s.exp {
         state.end_session(sid, "expired").await;
-        return session::gone();
+        return valid_session(session::gone());
     }
     let head = parts.method == Method::HEAD;
-    match (&parts.method, file) {
+    let response = match (&parts.method, file) {
         (&Method::DELETE, None | Some("")) => {
             state.end_session(sid, "deleted").await;
             Response::builder().status(StatusCode::NO_CONTENT).body(httputil::full("")).unwrap()
         }
         // The player's verdict when it can't play what it was sent — a browser's MediaError, or hls.js's — which
         // no server log sees otherwise. Only the holder of the session's signed URL gets here.
-        (&Method::POST, Some("report")) => report(s.short(), body).await,
+        (&Method::POST, Some("report")) if s.take_report_slot() => report(s.short(), body).await,
+        (&Method::POST, Some("report")) => rate_limited("This session already reported its player failures."),
+        (&Method::HEAD, Some("speed")) => speed(parts),
+        (&Method::GET, Some("speed")) if s.take_speed_slot() => {
+            s.touch();
+            speed(parts)
+        }
+        (&Method::GET, Some("speed")) => rate_limited("This session already measured its link."),
         (&Method::GET | &Method::HEAD, Some(f)) => {
             let resp = match f {
                 // VOD with an ENDLIST, fixed when the session was made: kept for its life. Idleness is judged by
@@ -748,12 +769,24 @@ where
             };
             if head {
                 let (p, _) = resp.into_parts();
-                return Response::from_parts(p, httputil::full(""));
+                return valid_session(Response::from_parts(p, httputil::full("")));
             }
             resp
         }
         _ => method_not_allowed("GET, HEAD, POST, DELETE, OPTIONS"),
-    }
+    };
+    valid_session(response)
+}
+
+fn valid_session(mut response: Response<Body>) -> Response<Body> {
+    response.headers_mut().insert("x-den-valid-session", hyper::header::HeaderValue::from_static("1"));
+    response
+}
+
+/// A forged or unknown signed URL is intentionally identical to Caddy's public catch-all: no JSON clue,
+/// no CORS, and no method advertisement. Only a verified session path reaches `valid_session`.
+fn session_not_found() -> Response<Body> {
+    Response::builder().status(StatusCode::NOT_FOUND).body(httputil::full("")).unwrap()
 }
 
 async fn run(cfg: Config) -> std::io::Result<()> {
@@ -775,7 +808,7 @@ async fn run(cfg: Config) -> std::io::Result<()> {
     let on = |b: bool| if b { "on" } else { "off" };
     eprintln!(
         "den-remux {} listening on :{} — metrics={} log_requests={} scout_origins={} scout_key={} scout_install={} \
-         browser_keys={} url_key={} trusted_proxies={} \
+         browser_keys={} url_key={} trusted_proxies={} public_session_proxy={} \
          max_sessions={} per_install={} idle={}s scratch={} scratch_max={} ffmpeg={} transcode={}",
         env!("CARGO_PKG_VERSION"),
         state.cfg.port,
@@ -787,6 +820,7 @@ async fn run(cfg: Config) -> std::io::Result<()> {
         state.cfg.browser_key_hashes.len(),
         if state.cfg.url_key_ephemeral { "ephemeral" } else { "set" },
         state.cfg.trusted_proxies.len(),
+        on(state.cfg.public_session_proxy.is_some()),
         state.cfg.max_sessions,
         state.cfg.max_sessions_per_install,
         state.cfg.session_idle.as_secs(),
