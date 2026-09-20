@@ -1148,7 +1148,7 @@ async fn reopening_a_release_takes_its_link_and_probe_from_the_first_open() {
     state.end_all("test").await;
 }
 
-fn edge<'a>(owner: &'a str) -> [(&'a str, &'a str); 2] {
+fn edge(owner: &str) -> [(&str, &str); 2] {
     [("x-den-edge-secret", EDGE_SECRET), ("x-den-owner", owner)]
 }
 
