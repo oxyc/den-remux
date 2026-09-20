@@ -46,9 +46,13 @@ GET    /remux/s/<sid>/<sig>/media.m3u8  VOD, #EXT-X-MAP init.mp4, segments on re
                                         #EXT-X-START:TIME-OFFSET=<startAt>,PRECISE=YES for a resume
 GET    /remux/s/<sid>/<sig>/init.mp4
 GET    /remux/s/<sid>/<sig>/seg<N>.m4s  200 when made (waits up to 20 s), else 503 + Retry-After: 2 (no-store)
-GET    /remux/s/<sid>/<sig>/sub<N>.m3u8 a subtitle rendition: one WebVTT segment spanning the film
+GET    /remux/s/<sid>/<sig>/sub<N>.m3u8 a subtitle rendition: den-subtitles' one WebVTT segment spanning the film, or the
+                                        release's own track as a WebVTT segment per video segment
 GET    /remux/s/<sid>/<sig>/sub<N>.vtt  text/vtt, kept for the session; an empty document, no-store, when nothing in
                                         that language was found or den-subtitles failed (asked again next time)
+GET    /remux/s/<sid>/<sig>/sub<N>_<W>.vtt
+                                        the release's own track over video segment W; waits up to 20 s for the job to read
+                                        past it, else 503 + Retry-After: 2 (no-store)
 GET    /remux/s/<sid>/<sig>/speed?bytes=<n>
                                         the same bounded speed probe, authorized by this session URL; two attempts
 POST   /remux/s/<sid>/<sig>/report      {code, message}: the player couldn't play it — logged against the session, 204;
@@ -83,12 +87,20 @@ itself is never logged. Brave on iOS sends Safari's User-Agent, so it reads as S
   `CHANNELS="6"` — and stereo at 192 kbit/s otherwise, byte for byte as before. `audioChannels` in the answer is what the session carries, beside the track's
   own `channels` in `audioTracks`: fewer means the track plays downmixed to stereo.
 - **Subtitles.** `subtitles` is den-subtitles' install URL from the library, on `SUBTITLE_ORIGINS`;
-  `subtitleLanguages` (up to 4, most wanted first) become WebVTT renditions in the master playlist — what AirPlay
+  `subtitleLanguages` (up to 8, most wanted first) become WebVTT renditions in the master playlist — what AirPlay
   and Cast receivers show, which a page's own `<track>` never reaches. Every one is `DEFAULT=NO,AUTOSELECT=YES`,
   so an unset preference remains off and the player or receiver can select one. Nothing is fetched until a player opens one:
   then den-remux asks den-subtitles for the title with the release's OpenSubtitles hash, size and
   filename (the Apple TV's hints, so an exact-encode match ranks first) and serves the first subtitle in
   that language. A subtitle URL off `SUBTITLE_ORIGINS` is skipped.
+  **The release's own text tracks** — SRT, ASS/SSA, WebVTT, `mov_text` — are the fallback where den-subtitles lists
+  nothing in a language, and add the release's other languages (up to eight renditions in all, the languages asked for
+  first), with or without a den-subtitles install. Matroska interleaves them with the video, so a separate pass would
+  read the whole file; instead each ffmpeg run writes them as one more WebVTT output beside the video it copies, and the
+  session cuts what the runs have written into a segment per video segment (`sub<N>_<W>.vtt`), made once a run has read a
+  second past it. A seek starts another run, which writes from its own start; what earlier runs wrote stays. A cue
+  that began before a run's start point, and is still showing there, is not in it. ASS/SSA lose their styling. A forced
+  track (foreign-language parts only), a bitmap track (PGS, VOBSUB) and a track that names no language are not offered.
 - **Video codecs.** `videoCodecs` is what the player takes (`["h264"]` for Firefox or an old
   Chromecast); empty is H.264 and HEVC. Without HEVC, H.264 releases are tried first, and an HEVC-only
   title is transcoded to H.264 on the GPU (Hardware transcode, below) — or refused with
@@ -352,7 +364,8 @@ dependabot cannot bump it, so bump both lines by hand.
   E-AC-3/AC-3 or FLAC copied with no stereo alternate beside it (Apple's authoring spec asks for AC-3 beside E-AC-3 for
   devices without it). A 5.1 or 7.1 variant carries no stereo alternate either: the player downmixes it for stereo
   output.
-- **Text subtitles only**, from den-subtitles; the release's own tracks (PGS, ASS) are not carried.
+- **Text subtitles only**: den-subtitles', and the release's own SRT, ASS/SSA, WebVTT and `mov_text` tracks. Bitmap
+  tracks (PGS, VOBSUB) have no WebVTT form and are not carried.
 - **Dolby Vision profile 5** has no HDR10/SDR base layer: Safari shows it, Chrome cannot, and stripped or
   transcoded its colours come out green and purple. A session skips it — the probe reads the profile — unless
   `playable.dolbyVision.p5` says the player shows profile 5 and it takes the release as it is: then it is copied,

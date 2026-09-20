@@ -145,6 +145,21 @@ pub fn subtitle_media(duration: f64, n: usize) -> String {
     )
 }
 
+/// A subtitle rendition's playlist made of the release's own track: one WebVTT segment per video segment, so a player
+/// asks for the cues around where it is and the session need have read no further than the video has.
+pub fn subtitle_segments(segs: &[Segment], n: usize) -> String {
+    let target = segs.iter().map(|s| s.end - s.start).fold(0.0, f64::max).ceil().max(1.0) as u64;
+    let mut out = format!(
+        "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:{target}\n#EXT-X-MEDIA-SEQUENCE:0\n\
+         #EXT-X-PLAYLIST-TYPE:VOD\n"
+    );
+    for (i, s) in segs.iter().enumerate() {
+        out.push_str(&format!("#EXTINF:{:.6},\nsub{n}_{i}.vtt\n", s.end - s.start));
+    }
+    out.push_str("#EXT-X-ENDLIST\n");
+    out
+}
+
 /// BANDWIDTH and AVERAGE-BANDWIDTH from the file's size and duration. The average is honest; the peak
 /// is a guess (a quarter over, plus the AAC we add), because nothing short of reading the whole file
 /// says what the busiest segment carries. `None` size assumes a 1080p WEB-DL.
@@ -326,5 +341,22 @@ mod tests {
             "{s}"
         );
         assert!(s.ends_with("#EXT-X-ENDLIST\n"));
+    }
+
+    #[test]
+    fn an_own_subtitle_track_is_a_segment_for_each_video_segment() {
+        let segs = segments(&KF, 30.021, TARGET_SECS);
+        let s = subtitle_segments(&segs, 2);
+        assert!(s.contains("#EXT-X-PLAYLIST-TYPE:VOD\n") && s.ends_with("#EXT-X-ENDLIST\n"), "{s}");
+        assert_eq!(s.matches(".vtt").count(), segs.len(), "{s}");
+        assert!(s.contains("#EXTINF:8.000000,\nsub2_0.vtt\n#EXTINF:5.000000,\nsub2_1.vtt\n"), "{s}");
+        assert!(s.contains("sub2_4.vtt\n"), "{s}");
+        let total: f64 = s
+            .lines()
+            .filter_map(|l| l.strip_prefix("#EXTINF:"))
+            .map(|v| v.trim_end_matches(',').parse::<f64>().unwrap())
+            .sum();
+        assert!((total - 30.021).abs() < 1e-5, "the same timeline as the video: {total}");
+        assert!(s.contains("#EXT-X-TARGETDURATION:8\n"), "{s}");
     }
 }

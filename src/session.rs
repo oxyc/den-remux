@@ -67,15 +67,32 @@ pub fn seg_index(file: &str) -> Option<usize> {
     (!n.is_empty() && n.bytes().all(|c| c.is_ascii_digit()) && n.len() < 8).then(|| n.parse().ok())?
 }
 
-/// `sub<N>.m3u8` or `sub<N>.vtt`: the rendition and whether it is the document.
-pub fn sub_file(file: &str) -> Option<(usize, bool)> {
+/// A subtitle rendition's file.
+#[derive(Debug, PartialEq)]
+pub enum SubFile {
+    /// `sub<N>.m3u8`
+    Playlist(usize),
+    /// `sub<N>.vtt`: den-subtitles' one document spanning the film.
+    Document(usize),
+    /// `sub<N>_<W>.vtt`: the release's own track over video segment `W`.
+    Window(usize, usize),
+}
+
+pub fn sub_file(file: &str) -> Option<SubFile> {
     let rest = file.strip_prefix("sub")?;
-    let (n, vtt) = match rest.strip_suffix(".vtt") {
-        Some(n) => (n, true),
-        None => (rest.strip_suffix(".m3u8")?, false),
+    let digits = |s: &str, max: usize| {
+        (!s.is_empty() && s.len() <= max && s.bytes().all(|c| c.is_ascii_digit()))
+            .then(|| s.parse::<usize>().ok())?
     };
-    let n = (n.len() == 1).then(|| n.parse::<usize>().ok())??;
-    (n < crate::subs::MAX_LANGUAGES).then_some((n, vtt))
+    let rendition = |s: &str| digits(s, 1).filter(|n| *n < crate::subs::MAX_LANGUAGES);
+    if let Some(n) = rest.strip_suffix(".m3u8") {
+        return rendition(n).map(SubFile::Playlist);
+    }
+    let body = rest.strip_suffix(".vtt")?;
+    match body.split_once('_') {
+        Some((n, w)) => Some(SubFile::Window(rendition(n)?, digits(w, 7)?)),
+        None => rendition(body).map(SubFile::Document),
+    }
 }
 
 pub fn is_session_file(file: &str) -> bool {
@@ -153,8 +170,14 @@ pub struct Session {
     pub audio_out: job::AudioOut,
     /// The channels the session's audio carries: the track's own when copied, else 2, 6 or 8.
     pub audio_channels: u32,
-    /// Subtitle renditions, when the browser asked for any.
+    /// den-subtitles, when the browser named an install and languages.
     pub subs: Option<crate::subs::Subs>,
+    /// What a player can pick: the languages asked for, then the release's own others, in rendition order.
+    pub renditions: Vec<crate::subs::Rendition>,
+    /// The release's own tracks the runs write, as ffmpeg numbers its subtitle streams.
+    text_tracks: Vec<usize>,
+    /// What the runs have written of them.
+    own: Mutex<crate::subs::OwnCues>,
     /// What a copy does with the video's Dolby Vision: kept for a player that shows it, else stripped.
     pub dovi: job::Dovi,
     /// The HEVC is transcoded to H.264 on the GPU, for a player that cannot take it.
@@ -337,6 +360,18 @@ impl Session {
             }
         }
         gops.sort_by(|a, b| a.start.total_cmp(&b.start));
+        if !job.text.is_empty() {
+            // The run has read the film as far as its last finished GOP (less what the demuxer may still hand over
+            // for it), or to the end when it ran that far.
+            let upto = match job.exit {
+                Some(true) => self.info.duration,
+                _ => job.next_start - crate::subs::TRAIL,
+            };
+            let mut own = self.own.lock().unwrap_or_else(|e| e.into_inner());
+            for &t in &job.text {
+                own.take(job.id, t, &job::text_file(&job.dir, t), job.start, upto);
+            }
+        }
         if newly_exited {
             if job.exit == Some(true) {
                 finished.push(job.id);
@@ -464,6 +499,7 @@ impl Session {
             video: self.video(st),
             audio: self.audio,
             audio_out: self.audio_out,
+            text: &self.text_tracks,
             dir: &dir,
         };
         match Job::spawn(&st.cfg.ffmpeg, id, start, &spec) {
@@ -488,7 +524,10 @@ impl Session {
     /// segment is done, while scratch is over its cap — and resume it when the player catches up.
     fn gate(&self, i: &mut Inner, st: &AppState) {
         let last = self.segments.len() - 1;
-        let limit = self.segments[(i.want + AHEAD_SEGMENTS).min(last)].end;
+        // A segment further, with the release's own subtitles: a player asks for a subtitle segment as far ahead as
+        // it buffers video, and one is only made once the job has read a little past it.
+        let ahead_segments = AHEAD_SEGMENTS + usize::from(!self.text_tracks.is_empty());
+        let limit = self.segments[(i.want + ahead_segments).min(last)].end;
         let wanted_done = self.segments[i.want.min(last)].end;
         let over_cap = st.scratch_bytes.load(Relaxed) > st.cfg.scratch_max_bytes;
         if let Some(j) = i.job.as_mut().filter(|j| j.exit.is_none()) {
@@ -661,9 +700,67 @@ impl Session {
         self.lock().init.is_some()
     }
 
-    /// Rendition `n`'s playlist.
-    pub fn subtitle_playlist(&self, n: usize) -> String {
-        playlist::subtitle_media(self.info.duration, n)
+    /// Rendition `n`'s playlist: one document spanning the film when den-subtitles serves the language — it has first
+    /// say, its subtitle usually being timed to the release — else a segment per video segment from the release's own
+    /// track, where it has one. A language with neither is the document, which serves as empty.
+    pub async fn subtitle_playlist(&self, st: &AppState, n: usize) -> String {
+        let Some(r) = self.renditions.get(n) else { return String::new() };
+        let own = match (r.own, r.den) {
+            (None, _) => false,
+            (Some(_), false) => true,
+            (Some(_), true) => !self.den_offers(st, n).await,
+        };
+        match own {
+            true => playlist::subtitle_segments(&self.segments, n),
+            false => playlist::subtitle_media(self.info.duration, n),
+        }
+    }
+
+    /// Does den-subtitles list a subtitle in rendition `n`'s language? Not when it could not be asked.
+    async fn den_offers(&self, st: &AppState, n: usize) -> bool {
+        let (Some(sb), Some(r)) = (self.subs.as_ref(), self.renditions.get(n)) else { return false };
+        let mut cache = sb.cache.lock().await;
+        if cache.list.is_none() {
+            cache.list = self.list_subtitles(st, sb).await;
+        }
+        cache.list.iter().flatten().any(|e| crate::lang::canonical(&e.lang) == r.lang)
+    }
+
+    /// Rendition `n`'s own track over video segment `w`, once the job has read the film past it: the cues showing in
+    /// it, as WebVTT. It waits a while for a job that is about to, and answers 503 like a video segment when none
+    /// does. A subtitle never starts a job: the video's requests drive that, and a player that wants both asks for
+    /// both.
+    pub async fn serve_subtitle_window(&self, st: &AppState, n: usize, w: usize) -> Response<Body> {
+        let (Some(track), Some(seg)) = (self.renditions.get(n).and_then(|r| r.own), self.segments.get(w))
+        else {
+            return httputil::not_found();
+        };
+        // Segment 0 starts at 0 whatever the file's first keyframe says, and a job for it starts at that keyframe.
+        let from = seg.start.max(self.info.keyframes.first().copied().unwrap_or(0.0));
+        let deadline = Instant::now() + SEGMENT_WAIT;
+        loop {
+            {
+                let mut i = self.lock();
+                if i.ended {
+                    return gone();
+                }
+                i.last_seen = Instant::now();
+                self.refresh(&mut i, st);
+                self.gate(&mut i, st);
+            }
+            self.wake.notify_one();
+            {
+                let own = self.own.lock().unwrap_or_else(|e| e.into_inner());
+                if own.covers(track, from, seg.end) {
+                    let doc = own.window(track, seg.start, seg.end);
+                    return httputil::text("text/vtt; charset=utf-8", &self.cache_control(), doc);
+                }
+            }
+            if Instant::now() >= deadline {
+                return busy();
+            }
+            tokio::time::sleep(POLL).await;
+        }
     }
 
     /// Rendition `n`'s WebVTT: the first subtitle in its language that den-subtitles offers and serves, made once
@@ -671,7 +768,8 @@ impl Session {
     /// kept once it answers, and a failed list or subtitle is asked for again on the player's next request, so one
     /// blip doesn't leave the session without subtitles.
     pub async fn subtitle(&self, st: &AppState, n: usize) -> Option<String> {
-        let sb = self.subs.as_ref().filter(|s| n < s.langs.len())?;
+        let want = &self.renditions.get(n).filter(|r| r.den)?.lang;
+        let sb = self.subs.as_ref()?;
         let mut cache = sb.cache.lock().await;
         if let Some(Some(doc)) = cache.docs.get(n) {
             return Some(doc.clone());
@@ -679,7 +777,6 @@ impl Session {
         if cache.list.is_none() {
             cache.list = self.list_subtitles(st, sb).await;
         }
-        let want = &sb.langs[n];
         let offered: Vec<String> = cache
             .list
             .iter()
@@ -1797,16 +1894,15 @@ pub async fn create(
         }
         None => (codecs, None),
     };
+    let renditions = crate::subs::plan(&sub_langs, sub_base.is_some(), &info.subtitles);
+    let text_tracks: Vec<usize> = renditions.iter().filter_map(|r| r.own).collect();
     let subs = sub_base.map(|base| crate::subs::Subs {
         base,
-        langs: sub_langs,
         head_sum: resolved.head.get(..crate::subs::HASH_CHUNK as usize).map(crate::subs::chunk_sum),
         cache: Default::default(),
     });
-    let renditions: Vec<(String, String)> = subs
-        .as_ref()
-        .map(|s| s.langs.iter().map(|l| (l.clone(), crate::lang::name(l))).collect())
-        .unwrap_or_default();
+    let named: Vec<(String, String)> =
+        renditions.iter().map(|r| (r.lang.clone(), crate::lang::name(&r.lang))).collect();
     let opened_key = opened_key(&source.base, c);
     let session = Arc::new(Session {
         master: playlist::master(
@@ -1828,7 +1924,7 @@ pub async fn create(
             avg,
             Some(resolution),
             info.frame_rate,
-            &renditions,
+            &named,
         ),
         media: playlist::media(&segments, start_at),
         reports: AtomicU8::new(0),
@@ -1858,6 +1954,9 @@ pub async fn create(
         audio_channels: audio_out.channels(source_channels),
         dovi,
         subs,
+        renditions,
+        text_tracks,
+        own: Default::default(),
         transcoded: transcode.is_some(),
         preset,
         inner: Mutex::new(Inner {
@@ -1975,6 +2074,7 @@ mod tests {
             dolby_vision_record_mismatch: false,
             dolby_vision_recordless: false,
             audio: Vec::new(),
+            subtitles: Vec::new(),
             keyframes: vec![0.0],
         }
     }
@@ -2399,6 +2499,15 @@ mod tests {
         assert_eq!(seg_index("seg99999999.m4s"), None);
         assert!(is_session_file("init.mp4") && is_session_file("media.m3u8"));
         assert!(!is_session_file("../gops.m3u8"));
+        assert_eq!(sub_file("sub0.m3u8"), Some(SubFile::Playlist(0)));
+        assert_eq!(sub_file("sub7.vtt"), Some(SubFile::Document(7)));
+        assert_eq!(sub_file("sub3_12.vtt"), Some(SubFile::Window(3, 12)));
+        for not in
+            ["sub8.vtt", "sub.vtt", "sub0_.vtt", "sub_1.vtt", "sub0_+1.vtt", "sub0_12345678.vtt", "sub01.vtt"]
+        {
+            assert_eq!(sub_file(not), None, "{not}");
+        }
+        assert!(is_session_file("sub2_0.vtt") && !is_session_file("sub2_0.m3u8"));
     }
 
     #[test]

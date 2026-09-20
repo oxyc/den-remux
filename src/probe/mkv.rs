@@ -28,6 +28,7 @@ const LANGUAGE_BCP47: u32 = 0x22B59D;
 const NAME: u32 = 0x536E;
 const FLAG_DEFAULT: u32 = 0x88;
 const FLAG_COMMENTARY: u32 = 0x55AF;
+const FLAG_FORCED: u32 = 0x55AA;
 const VIDEO: u32 = 0xE0;
 const PIXEL_WIDTH: u32 = 0xB0;
 const PIXEL_HEIGHT: u32 = 0xBA;
@@ -130,6 +131,7 @@ struct Track {
     name: Option<String>,
     default: bool,
     commentary: bool,
+    forced: bool,
     width: u32,
     height: u32,
     transfer: u64,
@@ -162,6 +164,7 @@ fn parse_tracks(b: &[u8]) -> Vec<Track> {
                     NAME => t.name = Some(string(v)).filter(|n| !n.is_empty()),
                     FLAG_DEFAULT => t.default = uint(v) != 0,
                     FLAG_COMMENTARY => t.commentary = uint(v) != 0,
+                    FLAG_FORCED => t.forced = uint(v) != 0,
                     VIDEO => {
                         t.width = child(v, PIXEL_WIDTH).map(uint).unwrap_or(0) as u32;
                         t.height = child(v, PIXEL_HEIGHT).map(uint).unwrap_or(0) as u32;
@@ -534,6 +537,16 @@ pub async fn probe(src: &Source<'_>, head: &[u8]) -> Result<MediaInfo, ProbeErro
                 || t.name.as_deref().is_some_and(|n| n.to_ascii_lowercase().contains("commentary")),
         })
         .collect();
+    let subtitles = tracks
+        .iter()
+        .filter(|t| t.kind == SUBTITLE_TRACK)
+        .map(|t| super::SubtitleTrack {
+            codec: t.codec_id.clone(),
+            language: t.language.clone(),
+            text: is_text_subtitle(&t.codec_id),
+            forced: t.forced,
+        })
+        .collect();
     Ok(MediaInfo {
         container: "matroska",
         duration,
@@ -548,8 +561,19 @@ pub async fn probe(src: &Source<'_>, head: &[u8]) -> Result<MediaInfo, ProbeErro
         dolby_vision_record_mismatch,
         dolby_vision_recordless,
         audio,
+        subtitles,
         keyframes,
     })
+}
+
+/// Matroska's TrackType for a subtitle track.
+const SUBTITLE_TRACK: u64 = 17;
+
+/// Text a subtitle codec id carries as characters, which ffmpeg converts to WebVTT: SRT, ASS/SSA (both as `S_TEXT/…`
+/// and as the older `S_ASS`/`S_SSA`) and WebVTT. `S_HDMV/PGS`, `S_VOBSUB` and `S_DVBSUB` are bitmaps.
+fn is_text_subtitle(codec_id: &str) -> bool {
+    matches!(codec_id, "S_ASS" | "S_SSA")
+        || matches!(codec_id.strip_prefix("S_TEXT/"), Some("UTF8" | "ASCII" | "SSA" | "ASS" | "WEBVTT"))
 }
 
 #[cfg(test)]

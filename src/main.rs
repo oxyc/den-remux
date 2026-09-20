@@ -52,6 +52,7 @@ use tokio::net::TcpListener;
 
 use crate::config::Config;
 use crate::httputil::Body;
+use crate::session::SubFile;
 use crate::state::{unix_now, AppState};
 
 /// How often one failure condition may write a line.
@@ -703,9 +704,9 @@ where
                     "channels": a.channels,
                     "commentary": a.commentary,
                 })).collect::<Vec<_>>(),
-                "subtitles": s.subs.iter().flat_map(|x| &x.langs).map(|l| serde_json::json!({
-                    "language": l,
-                    "name": lang::name(l),
+                "subtitles": s.renditions.iter().map(|r| serde_json::json!({
+                    "language": r.lang,
+                    "name": lang::name(&r.lang),
                 })).collect::<Vec<_>>(),
             }),
             &[],
@@ -776,25 +777,32 @@ where
                     httputil::text("application/vnd.apple.mpegurl", &s.cache_control(), text)
                 }
                 "init.mp4" => s.serve_init(state, head).await,
-                _ => match session::sub_file(f)
-                    .filter(|(n, _)| s.subs.as_ref().is_some_and(|x| *n < x.langs.len()))
-                {
-                    Some((n, false)) => {
+                _ => match session::sub_file(f).filter(|file| {
+                    let n = match file {
+                        SubFile::Playlist(n) | SubFile::Document(n) | SubFile::Window(n, _) => *n,
+                    };
+                    n < s.renditions.len()
+                }) {
+                    Some(SubFile::Playlist(n)) => {
                         s.touch();
                         httputil::text(
                             "application/vnd.apple.mpegurl",
                             &s.cache_control(),
-                            s.subtitle_playlist(n),
+                            s.subtitle_playlist(state, n).await,
                         )
                     }
                     // A found subtitle is kept for the session; an empty document is not, so a player that asks
                     // again after den-subtitles failed gets another try.
-                    Some((n, true)) => {
+                    Some(SubFile::Document(n)) => {
                         s.touch();
                         match s.subtitle(state, n).await {
                             Some(doc) => httputil::text("text/vtt; charset=utf-8", &s.cache_control(), doc),
                             None => httputil::text("text/vtt; charset=utf-8", "no-store", subs::EMPTY.into()),
                         }
+                    }
+                    Some(SubFile::Window(n, w)) => {
+                        s.touch();
+                        s.serve_subtitle_window(state, n, w).await
                     }
                     None => match session::seg_index(f).filter(|n| *n < s.segments.len()) {
                         Some(n) => s.serve_segment(state, n, head).await,

@@ -313,6 +313,17 @@ fn parse_moov(moov: &[u8]) -> Result<MediaInfo, ProbeError> {
             commentary: false,
         })
         .collect();
+    // ffmpeg's subtitle streams: the text handlers, and closed captions, which it counts and this cannot convert.
+    let subtitles = traks
+        .iter()
+        .filter(|t| matches!(&t.handler, b"sbtl" | b"subt" | b"text" | b"clcp"))
+        .map(|t| super::SubtitleTrack {
+            codec: String::from_utf8_lossy(&t.fourcc).into_owned(),
+            language: t.language.clone().filter(|l| l != "und"),
+            text: &t.fourcc == b"tx3g",
+            forced: false,
+        })
+        .collect();
     Ok(MediaInfo {
         container: "mp4",
         duration: movie_dur / movie_ts,
@@ -334,6 +345,7 @@ fn parse_moov(moov: &[u8]) -> Result<MediaInfo, ProbeError> {
         dolby_vision_record_mismatch: false,
         dolby_vision_recordless: false,
         audio,
+        subtitles,
         keyframes,
     })
 }

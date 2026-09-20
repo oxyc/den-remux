@@ -15,6 +15,7 @@ unevenly, and the B-frames are what trigger ffmpeg's seek back-off (see `src/job
 | `av1.mkv` | AV1: SVT-AV1's 10-bit HDR10 (PQ, BT.2020), `V_AV1` with its `av1C` CodecPrivate, Colour element and sequence header; Opus audio | 0, 2.5, 6, 8.5, 12, 14, 18.5, 21, 24, 27.5 | 30.008 |
 | `av1.mp4` | `av1.mkv`'s video copied into MP4: the `av01` sample entry's `av1C` and `colr` | as `av1.mkv` | 29.999 |
 | `surround.mkv` | `h264.mkv`'s video copied, with a 5.1 AAC track (eng) and a 7.1 one (swe): converted to AAC 5.1 | as `h264.mkv` | 30.021 |
+| `subs.mkv` | `h264.mkv` with three text subtitle tracks: SRT English, ASS Finnish (an italic override) and a forced SRT Swedish. Cues sit inside a segment (1, 9, 26 s), across a cut at 13 s (12–14) and after it (14.5), so the segments 0–8, 8–13, 13–19.5, 19.5–24, 24–30 each hold a known set | as `h264.mkv` | 30.021 |
 | `scout-streams.json` | A den-scout stream list: uncached, AV1, VP9, XviD/AVI, 3D and cache-unknown releases to skip | — | — |
 
 ## Regenerating
@@ -71,6 +72,54 @@ ffmpeg -y -i h264.mkv \
   -f lavfi -i "aevalsrc=sin(440*2*PI*t)|sin(495*2*PI*t)|sin(550*2*PI*t)|0.3*sin(55*2*PI*t)|sin(660*2*PI*t)|sin(770*2*PI*t)|sin(880*2*PI*t)|sin(990*2*PI*t):c=7.1:s=48000:d=30" \
   -map 0:v -map 1:a -map 2:a -c:v copy -c:a aac -b:a:0 40k -b:a:1 40k \
   -metadata:s:a:0 language=eng -metadata:s:a:1 language=swe surround.mkv
+```
+
+Three subtitle files, muxed with `h264.mkv`'s streams copied (`-c copy`, so the keyframes are `h264.mkv`'s):
+
+```sh
+cat > eng.srt <<'EOF'
+1
+00:00:01,000 --> 00:00:03,000
+Hello there
+
+2
+00:00:09,000 --> 00:00:11,000
+Inside the second segment
+
+3
+00:00:12,000 --> 00:00:14,000
+Over the cut at thirteen
+
+4
+00:00:14,500 --> 00:00:16,000
+After the seek
+
+5
+00:00:26,000 --> 00:00:29,000
+The end
+EOF
+cat > swe.srt <<'EOF'
+1
+00:00:05,000 --> 00:00:06,000
+Bara främmande ord
+EOF
+cat > fin.ass <<'EOF'
+[Script Info]
+ScriptType: v4.00+
+PlayResX: 384
+PlayResY: 288
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,Arial,16,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,1,0,2,10,10,10,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:02.00,0:00:04.00,Default,,0,0,0,,{\i1}Moi{\i0} kaikille
+Dialogue: 0,0:00:20.00,0:00:22.00,Default,,0,0,0,,Hyvää yötä
+EOF
+ffmpeg -y -i h264.mkv -i eng.srt -i fin.ass -i swe.srt -map 0:v -map 0:a -map 1 -map 2 -map 3 -c copy \
+  -metadata:s:s:0 language=eng -metadata:s:s:1 language=fin -metadata:s:s:2 language=swe -disposition:s:2 forced subs.mkv
 ```
 
 AV1 has no frame reordering, so its keyframes are its key packets as well:
