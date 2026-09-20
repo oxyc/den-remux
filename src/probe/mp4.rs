@@ -332,6 +332,7 @@ fn parse_moov(moov: &[u8]) -> Result<MediaInfo, ProbeError> {
         }),
         dolby_vision: [b"dvcC", b"dvvC", b"dvwC"].into_iter().find_map(config).and_then(super::dovi_config),
         dolby_vision_record_mismatch: false,
+        dolby_vision_recordless: false,
         audio,
         keyframes,
     })

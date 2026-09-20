@@ -63,6 +63,10 @@ pub struct MediaInfo {
     /// The container claims Profile 5 while the HEVC VUI proves there is a normal BT.2020 PQ/HLG base layer.
     /// Such a record is unsafe to keep: when the first RPU cannot correct it, playback still uses the base layer.
     pub dolby_vision_record_mismatch: bool,
+    /// `dolby_vision` was not read from a configuration record but proven from the first frame's RPU: the container
+    /// carries no `dvcC`/`dvvC`, and the HEVC VUI names no colours. Keeping it would need a record ffmpeg cannot
+    /// write from nothing, and stripped or converted its picture is tinted, so such a release is not played.
+    pub dolby_vision_recordless: bool,
     pub audio: Vec<AudioTrack>,
     /// Keyframe presentation times in seconds, ascending — the timeline ffmpeg reports with
     /// `-copyts -start_at_zero`, which is the one the segments are cut on.
