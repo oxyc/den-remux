@@ -321,6 +321,13 @@ fn contradictory_profile5(dv: Option<super::DolbyVision>, colour: super::Colour)
         && matches!(colour.transfer, 16 | 18)
 }
 
+/// Whether an HEVC track with no Dolby Vision record is worth reading its first RPU for: 10-bit, and naming no
+/// transfer characteristic anywhere (unspecified is 2, or absent), as an IPT-PQ-c2 picture has none to name.
+fn recordless_profile5_candidate(codecs: &Option<String>, colour: super::Colour) -> bool {
+    let eight_bit = matches!(codecs.as_deref().and_then(super::profile_level), Some((1, _, _)));
+    matches!(colour.transfer, 0 | 2) && !eight_bit
+}
+
 fn parse_seek_head(b: &[u8]) -> Vec<(u32, u64)> {
     children(b)
         .filter(|(id, _)| *id == SEEK)
@@ -466,11 +473,30 @@ pub async fn probe(src: &Source<'_>, head: &[u8]) -> Result<MediaInfo, ProbeErro
     };
     let mut dolby_vision = video.dovi;
     let dolby_vision_record_mismatch = hevc_colour.is_some_and(|c| contradictory_profile5(dolby_vision, c));
+    // A hostile CueClusterPosition must not wrap into an unrelated range.
+    let first_cluster =
+        parsed_cues.iter().min_by_key(|c| c.time).and_then(|c| seg_start.checked_add(c.cluster));
+    let mut dolby_vision_recordless = false;
+    if dolby_vision.is_none() && hevc_colour.is_some_and(|c| recordless_profile5_candidate(&codecs, c)) {
+        // Profile 5 without a record, over a VUI that says nothing: only the RPU tells. A failed audit is no
+        // evidence either way, so the release is taken as the ordinary video it declares itself to be.
+        let profile = match first_cluster {
+            Some(at) => first_rpu_profile(src, at, video.number, &video.private).await.unwrap_or_else(|e| {
+                eprintln!("probe: RPU audit of a HEVC with no Dolby Vision record failed: {e}");
+                None
+            }),
+            None => None,
+        };
+        if profile == Some(5) {
+            // The level is only ever named for a profile 5 that is kept, which this never is.
+            dolby_vision = Some(super::DolbyVision { profile: 5, compat: 0, level: 6 });
+            dolby_vision_recordless = true;
+            eprintln!("probe: HEVC with no Dolby Vision record and no VUI colours carries profile 5 RPUs");
+        }
+    }
     if dolby_vision_record_mismatch {
-        // A hostile CueClusterPosition must not wrap into an unrelated range. Failure to audit is safe here: the
-        // VUI contradiction still forces the Dolby Vision record off and uses the HDR base layer.
-        let first_cluster =
-            parsed_cues.iter().min_by_key(|c| c.time).and_then(|c| seg_start.checked_add(c.cluster));
+        // Failure to audit is safe here: the VUI contradiction still forces the Dolby Vision record off and uses
+        // the HDR base layer.
         let profile = match first_cluster {
             Some(at) => match first_rpu_profile(src, at, video.number, &video.private).await {
                 Ok(profile) => profile,
@@ -520,6 +546,7 @@ pub async fn probe(src: &Source<'_>, head: &[u8]) -> Result<MediaInfo, ProbeErro
         frame_rate: (video.default_duration > 0).then(|| 1e9 / video.default_duration as f64),
         dolby_vision,
         dolby_vision_record_mismatch,
+        dolby_vision_recordless,
         audio,
         keyframes,
     })
@@ -632,6 +659,47 @@ mod tests {
             None,
             "bytes outside the declared Cluster cannot supply its RPU verdict"
         );
+    }
+
+    #[test]
+    fn only_untagged_ten_bit_hevc_is_read_for_a_recordless_profile5() {
+        let silent = super::super::Colour::default();
+        let main10 = Some("hvc1.2.4.L153.B0".to_string());
+        assert!(recordless_profile5_candidate(&main10, silent));
+        assert!(recordless_profile5_candidate(&None, super::super::Colour { transfer: 2, ..silent }));
+        assert!(!recordless_profile5_candidate(&Some("hvc1.1.6.L120.B0".into()), silent), "8-bit");
+        assert!(
+            !recordless_profile5_candidate(&main10, super::super::Colour { transfer: 16, ..silent }),
+            "PQ"
+        );
+        assert!(
+            !recordless_profile5_candidate(&main10, super::super::Colour { transfer: 1, ..silent }),
+            "BT.709"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_profile5_rpu_in_the_first_cluster_is_read_without_any_record() {
+        use dolby_vision::rpu::{dovi_rpu::DoviRpu, generate::GenerateConfig};
+
+        let mut hvcc = vec![0; 22];
+        hvcc[21] = 3;
+        for (rpu, expected) in [
+            (DoviRpu::profile5_config(&GenerateConfig::default()).unwrap(), Some(5)),
+            (DoviRpu::profile81_config(&GenerateConfig::default()).unwrap(), Some(8)),
+        ] {
+            let nal = rpu.write_hevc_unspec62_nalu().unwrap();
+            let mut block = vec![0x81, 0, 0, 0x80];
+            block.extend_from_slice(&(nal.len() as u32).to_be_bytes());
+            block.extend_from_slice(&nal);
+            assert!(block.len() < 0x3FFF);
+            let mut simple = vec![0xA3, 0x40 | (block.len() >> 8) as u8, block.len() as u8];
+            simple.extend_from_slice(&block);
+            let mut cluster =
+                vec![0x1F, 0x43, 0xB6, 0x75, 0x40 | (simple.len() >> 8) as u8, simple.len() as u8];
+            cluster.extend_from_slice(&simple);
+            assert_eq!(first_rpu_profile(&Source::Mem(&cluster), 0, 1, &hvcc).await.unwrap(), expected);
+        }
     }
 
     #[test]

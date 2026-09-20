@@ -71,6 +71,33 @@ impl OpenedCache {
     }
 }
 
+/// Releases whose probe is remembered for a verdict, oldest out first.
+const KNOWN_MAX: usize = 512;
+
+/// What opening a release showed of its video, kept without a link or a TTL — a release's file does not change — so
+/// `POST /remux/releases` can say a release once opened and ruled out for a player is `no` before anything is opened
+/// again. The facts, not a verdict: whether a profile 5 is refused, or an HEVC converted, depends on the player asking.
+/// Keyed by `session::known_key`: the title and the release.
+#[derive(Default)]
+pub struct KnownReleases {
+    entries: std::collections::VecDeque<(String, MediaInfo)>,
+}
+
+impl KnownReleases {
+    pub fn put(&mut self, key: String, info: &MediaInfo) {
+        self.entries.retain(|(k, _)| *k != key);
+        if self.entries.len() >= KNOWN_MAX {
+            self.entries.pop_front();
+        }
+        // Only what a verdict reads: the keyframe index and the audio are the bulk.
+        self.entries.push_back((key, MediaInfo { keyframes: Vec::new(), audio: Vec::new(), ..info.clone() }));
+    }
+
+    pub fn get(&self, key: &str) -> Option<MediaInfo> {
+        self.entries.iter().find(|(k, _)| k == key).map(|(_, i)| i.clone())
+    }
+}
+
 pub struct AppState {
     pub cfg: Config,
     pub http: reqwest::Client,
@@ -86,6 +113,8 @@ pub struct AppState {
     starts: Mutex<HashMap<IpAddr, (u64, u32)>>,
     /// Releases opened lately: their debrid links and probes.
     opened: Mutex<OpenedCache>,
+    /// What opened releases showed of their video, for `POST /remux/releases`.
+    known: Mutex<KnownReleases>,
     pub scratch_bytes: AtomicU64,
     pub sessions_started: AtomicU64,
     pub jobs_started: AtomicU64,
@@ -145,6 +174,7 @@ impl AppState {
             creating: Mutex::new(HashMap::new()),
             starts: Mutex::new(HashMap::new()),
             opened: Mutex::new(OpenedCache::default()),
+            known: Mutex::new(KnownReleases::default()),
             scratch_bytes: AtomicU64::new(0),
             sessions_started: AtomicU64::new(0),
             jobs_started: AtomicU64::new(0),
@@ -164,6 +194,10 @@ impl AppState {
         let max = self.cfg.max_transcodes;
         self.transcodes.fetch_update(Relaxed, Relaxed, |n| (n < max).then_some(n + 1)).ok()?;
         Some(TranscodeSlot(self.transcodes.clone()))
+    }
+
+    pub fn known(&self) -> MutexGuard<'_, KnownReleases> {
+        self.known.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     pub fn opened(&self) -> MutexGuard<'_, OpenedCache> {
@@ -357,6 +391,7 @@ mod tests {
             frame_rate: None,
             dolby_vision: None,
             dolby_vision_record_mismatch: false,
+            dolby_vision_recordless: false,
             audio: Vec::new(),
             keyframes: vec![0.0],
         };

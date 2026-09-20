@@ -753,6 +753,57 @@ async fn the_releases_list_names_and_labels_never_a_url() {
     assert_eq!(anonymous.status, StatusCode::UNAUTHORIZED, "no cookie and no install");
 }
 
+/// Each release says whether it plays for the player that reported what it decodes, and stays a plain `yes` for one
+/// that reported nothing.
+#[tokio::test]
+async fn the_releases_list_says_how_each_plays_for_the_player_that_asked() {
+    let origin = origin().await;
+    let state = test_state(&origin, 2, Duration::from_secs(60));
+    // tt0000006: a release scout says is Dolby Vision profile 5, and an H.264 one.
+    let ask = |extra: &'static str| {
+        let (state, body) =
+            (state.clone(), format!(r#"{{"imdb":"tt0000006","scout":"{origin}/cfg"{extra}}}"#));
+        async move {
+            let r = call(&state, "POST", "/remux/releases", None, &body).await;
+            let list = r.json()["releases"].as_array().unwrap().clone();
+            let by = |name: &str| list.iter().find(|r| r["filename"] == name).unwrap().clone();
+            (by("dv5.mkv"), by("h264.mkv"))
+        }
+    };
+    let (dv5, h264) = ask("").await;
+    assert_eq!((dv5["plays"].as_str(), h264["plays"].as_str()), (Some("yes"), Some("yes")), "no report");
+    assert!(dv5["why"].is_null() && h264["label"] == "H.264", "the existing fields stay: {h264}");
+    let chrome = r#","playable":{"h264":51,"hevcMain10":153,"hdr":true}"#;
+    let (dv5, h264) = ask(chrome).await;
+    assert_eq!(h264["plays"], "yes", "{h264}");
+    assert_ne!(dv5["plays"], "yes", "{dv5}");
+    assert!(dv5["why"].as_str().is_some_and(|w| w.contains("Dolby Vision profile 5")), "{dv5}");
+    let safari = r#","playable":{"h264":51,"hevcMain10":153,"hdr":true,"dolbyVision":{"p5":true}}"#;
+    assert_eq!(ask(safari).await.0["plays"], "yes");
+    // A release opened and ruled out is `no` for a browser that can't show it, `yes` for one that can.
+    let recordless = probe::MediaInfo {
+        container: "matroska",
+        duration: 1.0,
+        video: probe::VideoCodec::Hevc,
+        codecs: Some("hvc1.2.4.L153.B0".into()),
+        width: 3840,
+        height: 2160,
+        hdr: false,
+        hlg: false,
+        frame_rate: None,
+        dolby_vision: Some(probe::DolbyVision { profile: 5, compat: 0, level: 6 }),
+        dolby_vision_record_mismatch: false,
+        dolby_vision_recordless: true,
+        audio: Vec::new(),
+        keyframes: Vec::new(),
+    };
+    state.known().put("tt0000006/dv5.mkv".into(), &recordless);
+    let (dv5, _) = ask(chrome).await;
+    assert_eq!(dv5["plays"], "no", "{dv5}");
+    assert_eq!(dv5["why"], "Dolby Vision profile 5 (no record in the file) — this browser can't show it");
+    assert_eq!(ask(safari).await.0["plays"], "yes");
+}
+
 #[tokio::test]
 #[ignore]
 async fn h264_matroska_end_to_end() {

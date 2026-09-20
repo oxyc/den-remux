@@ -265,6 +265,111 @@ pub fn parse_gops(text: &str) -> Vec<(String, f64)> {
     out
 }
 
+/// The init segment of a Dolby Vision copy whose source names no Dolby Vision, with the sample entry a real
+/// profile 5 file has: `dvh1` over the `hvcC`, then a `dvcC` (rpu_present, no enhancement layer, base layer present,
+/// no base-layer compatibility). ffmpeg's mp4 muxer writes that box only from the source's side data, so it is added
+/// here — inside stsd, growing each box above it. Nothing points at bytes that move only in a fragmented init, whose
+/// sample tables are empty; any other layout is refused rather than left with wrong offsets.
+pub fn add_dovi_record(init: &[u8], profile: u8, level: u8) -> Result<Vec<u8>, String> {
+    let mut record = Vec::with_capacity(24);
+    record.extend_from_slice(&24u32.to_be_bytes());
+    record.extend_from_slice(b"dvcC");
+    // dv_version_major 1, minor 0; profile (7 bits) and level (6 bits); rpu, no el, bl; compatibility id 0.
+    record.extend_from_slice(&[1, 0, profile << 1 | level >> 5, (level & 0x1f) << 3 | 0b101, 0]);
+    record.resize(24, 0);
+    let path = [*b"moov", *b"trak", *b"mdia", *b"minf", *b"stbl", *b"stsd"];
+    walk_boxes(init, &path, &record)?.ok_or_else(|| "no HEVC sample entry in the init segment".to_string())
+}
+
+/// One box at the start of `b`: its four-character code, its body, and the whole box's length. 32-bit sizes only: a
+/// zero (to the end) or a 64-bit size is not something ffmpeg writes for an init.
+fn box_at(b: &[u8]) -> Result<([u8; 4], &[u8], usize), String> {
+    let size = u32::from_be_bytes(b.get(..4).ok_or("truncated box")?.try_into().unwrap()) as usize;
+    let kind: [u8; 4] = b.get(4..8).ok_or("truncated box")?.try_into().unwrap();
+    if size < 8 || size > b.len() {
+        return Err(format!("box {} of {size} bytes in {}", String::from_utf8_lossy(&kind), b.len()));
+    }
+    Ok((kind, &b[8..size], size))
+}
+
+fn boxed(kind: [u8; 4], body: &[u8]) -> Vec<u8> {
+    let mut out = ((body.len() + 8) as u32).to_be_bytes().to_vec();
+    out.extend_from_slice(&kind);
+    out.extend_from_slice(body);
+    out
+}
+
+/// `data`'s boxes with the ones along `path` rewritten: `None` when nothing in it reached an HEVC sample entry.
+fn walk_boxes(data: &[u8], path: &[[u8; 4]], record: &[u8]) -> Result<Option<Vec<u8>>, String> {
+    let (mut out, mut at, mut changed) = (Vec::with_capacity(data.len() + record.len()), 0, false);
+    while at < data.len() {
+        let (kind, body, size) = box_at(&data[at..])?;
+        let whole = &data[at..at + size];
+        if kind == path[0] {
+            let inner = if path.len() == 1 {
+                patch_stsd(body, record)?
+            } else {
+                if path[0] == *b"stbl" {
+                    no_chunk_offsets(body)?;
+                }
+                walk_boxes(body, &path[1..], record)?
+            };
+            if let Some(inner) = inner {
+                out.extend(boxed(kind, &inner));
+                (at, changed) = (at + size, true);
+                continue;
+            }
+        }
+        out.extend_from_slice(whole);
+        at += size;
+    }
+    Ok(changed.then_some(out))
+}
+
+/// A sample table with no chunk offsets to fix: what a fragmented init has.
+fn no_chunk_offsets(stbl: &[u8]) -> Result<(), String> {
+    let mut at = 0;
+    while at < stbl.len() {
+        let (kind, body, size) = box_at(&stbl[at..])?;
+        if matches!(&kind, b"stco" | b"co64") && body.get(4..8) != Some(&[0, 0, 0, 0]) {
+            return Err("the init segment has chunk offsets".into());
+        }
+        at += size;
+    }
+    Ok(())
+}
+
+/// The body of `stsd` with its HEVC entry renamed `dvh1` and given `record`; `None` for a sample description with
+/// no HEVC entry (the audio track's).
+fn patch_stsd(stsd: &[u8], record: &[u8]) -> Result<Option<Vec<u8>>, String> {
+    // Version and flags, entry count; then the entries, each a VisualSampleEntry's 78 bytes before its child boxes.
+    const ENTRY_HEADER: usize = 78;
+    let mut out = stsd.get(..8).ok_or("truncated stsd")?.to_vec();
+    let (mut at, mut changed) = (8, false);
+    while at < stsd.len() {
+        let (kind, body, size) = box_at(&stsd[at..])?;
+        if matches!(&kind, b"hvc1" | b"hev1" | b"dvh1" | b"dvhe") {
+            let mut has_record = false;
+            let mut child = ENTRY_HEADER;
+            while child < body.len() {
+                let (k, _, s) = box_at(body.get(child..).ok_or("truncated sample entry")?)?;
+                has_record |= matches!(&k, b"dvcC" | b"dvvC");
+                child += s;
+            }
+            let mut entry = body.to_vec();
+            if !has_record {
+                entry.extend_from_slice(record);
+            }
+            out.extend(boxed(*b"dvh1", &entry));
+            changed = true;
+        } else {
+            out.extend_from_slice(&stsd[at..at + size]);
+        }
+        at += size;
+    }
+    Ok(changed.then_some(out))
+}
+
 pub struct Job {
     pub id: u32,
     pub dir: PathBuf,
@@ -526,6 +631,143 @@ mod tests {
             ..sdr
         };
         assert!(args(&unknown, None).join(" ").contains("-vf scale_vaapi=w=-2:h=1080:format=nv12 "));
+    }
+
+    /// A fragmented init as ffmpeg writes it, cut down: ftyp, then moov with a video and an audio trak.
+    fn init_with(entry: &[u8; 4], stco_count: u32) -> Vec<u8> {
+        let mut visual = vec![0u8; 78];
+        visual[7] = 1; // data_reference_index
+        visual.extend(boxed(*b"hvcC", &[1, 2, 3, 4, 5]));
+        let video_entry = boxed(*entry, &visual);
+        let audio_entry = boxed(*b"mp4a", &[0u8; 28]);
+        let trak = |entry: Vec<u8>| {
+            let mut stsd = vec![0, 0, 0, 0, 0, 0, 0, 1];
+            stsd.extend(entry);
+            let mut stbl = boxed(*b"stsd", &stsd);
+            let mut stco = vec![0, 0, 0, 0];
+            stco.extend(stco_count.to_be_bytes());
+            stbl.extend(boxed(*b"stco", &stco));
+            let minf = boxed(*b"minf", &boxed(*b"stbl", &stbl));
+            boxed(*b"trak", &boxed(*b"mdia", &minf))
+        };
+        let mut moov = trak(video_entry);
+        moov.extend(trak(audio_entry));
+        moov.extend(boxed(*b"mvex", &[0u8; 8]));
+        let mut file = boxed(*b"ftyp", b"iso5\0\0\0\0iso5");
+        file.extend(boxed(*b"moov", &moov));
+        file
+    }
+
+    /// Every box in `b` walked to the end, recursing into `into`: the sizes all add up or this panics.
+    fn walk_clean(b: &[u8], into: &[&[u8; 4]], seen: &mut Vec<String>) {
+        let mut at = 0;
+        while at < b.len() {
+            let (kind, body, size) = box_at(&b[at..]).unwrap();
+            seen.push(String::from_utf8_lossy(&kind).into_owned());
+            if into.iter().any(|k| **k == kind) {
+                walk_clean(body, into, seen);
+            } else if &kind == b"stsd" {
+                walk_clean(&body[8..], &[], seen);
+            } else if &kind == b"dvh1" {
+                walk_clean(&body[78..], &[], seen);
+            }
+            at += size;
+        }
+        assert_eq!(at, b.len());
+    }
+
+    #[test]
+    fn a_recordless_profile5_init_gets_dvh1_and_a_dvcc_with_every_size_above_it_fixed() {
+        for entry in [b"hvc1", b"dvh1"] {
+            let init = init_with(entry, 0);
+            let patched = add_dovi_record(&init, 5, 6).unwrap();
+            assert_eq!(patched.len(), init.len() + 24);
+            let mut seen = Vec::new();
+            walk_clean(&patched, &[b"moov", b"trak", b"mdia", b"minf", b"stbl"], &mut seen);
+            assert_eq!(seen.iter().filter(|k| *k == "dvh1").count(), 1);
+            assert!(!seen.contains(&"hvc1".to_string()));
+            let dvcc = patched.windows(4).position(|w| w == b"dvcC").unwrap() - 4;
+            assert_eq!(
+                &patched[dvcc..dvcc + 24],
+                &[
+                    0,
+                    0,
+                    0,
+                    24,
+                    b'd',
+                    b'v',
+                    b'c',
+                    b'C',
+                    1,
+                    0,
+                    5 << 1,
+                    6 << 3 | 0b101,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0
+                ]
+            );
+            assert_eq!(
+                crate::probe::dovi_config(&patched[dvcc + 8..dvcc + 24]),
+                Some(crate::probe::DolbyVision { profile: 5, compat: 0, level: 6 })
+            );
+            assert!(seen.contains(&"hvcC".to_string()) && seen.contains(&"mp4a".to_string()));
+            assert_eq!(
+                add_dovi_record(&patched, 5, 6).unwrap(),
+                patched,
+                "a record already there stays as it is"
+            );
+        }
+    }
+
+    /// ffmpeg's own init for a kept profile 5 copy of a source with no Dolby Vision record: patched, it is still one
+    /// walkable file, with `dvh1`, the `hvcC` ffmpeg wrote and the `dvcC` added (`DOVI_INIT_OUT` keeps the file, to
+    /// hand to ffprobe or a player).
+    #[test]
+    #[ignore = "needs ffmpeg"]
+    fn ffmpegs_init_takes_the_dovi_record() {
+        let dir = std::env::temp_dir().join(format!("den-remux-dovi-{}", std::process::id()));
+        let input = concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/hevc.mkv");
+        let spec = Spec {
+            input,
+            seek: None,
+            video: Video::Copy { tag: Some("dvh1"), dovi: Dovi::Keep },
+            audio: 0,
+            audio_out: AudioOut::Stereo,
+            dir: &dir,
+        };
+        std::fs::create_dir_all(&dir).unwrap();
+        let status = std::process::Command::new("ffmpeg").args(args(&spec, None)).status().unwrap();
+        assert!(status.success());
+        let init = std::fs::read(dir.join("init.mp4")).unwrap();
+        let patched = add_dovi_record(&init, 5, 6).unwrap();
+        let mut seen = Vec::new();
+        walk_clean(&patched, &[b"moov", b"trak", b"mdia", b"minf", b"stbl"], &mut seen);
+        for want in ["dvh1", "hvcC", "dvcC"] {
+            assert!(seen.contains(&want.to_string()), "{want} in {seen:?}");
+        }
+        if let Ok(out) = std::env::var("DOVI_INIT_OUT") {
+            std::fs::write(out, &patched).unwrap();
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_init_this_cannot_patch_safely_is_refused() {
+        assert!(add_dovi_record(&init_with(b"hvc1", 3), 5, 6).unwrap_err().contains("chunk offsets"));
+        assert!(add_dovi_record(&boxed(*b"ftyp", b"iso5"), 5, 6).is_err(), "no moov");
+        let mut cut = init_with(b"hvc1", 0);
+        cut.truncate(cut.len() - 5);
+        assert!(add_dovi_record(&cut, 5, 6).is_err());
     }
 
     #[test]

@@ -2,7 +2,11 @@
 //!
 //!   POST /remux/login   {key}               → cookie for what needs this service to vouch
 //!   POST /remux/session {imdb, season?, episode?, filename?, scout?, maxBitrate?} → a signed session: /remux/s/<sid>/<sig>/master.m3u8
-//!   POST /remux/releases {imdb, season?, episode?, scout?} → what a session could play: labels and names, no URLs
+//!   POST /remux/releases {imdb, season?, episode?, scout?, videoCodecs?, playable?} → what a session could play:
+//!                        [{label, filename, size, plays: "yes"|"convert"|"no", why?}], no URLs. `plays` is decided by
+//!                        `playable` as a session is (and by what opening a release has shown of it); without either
+//!                        every release is "yes". A session's `release.requested {filename, why}` says why the release
+//!                        it was asked for was passed over.
 //!   GET  /remux/speed?bytes=<n>             → n random bytes (8 MiB at most), for a remote player to time its link
 //!   GET  /remux/s/<sid>/<sig>/…             → HLS (fMP4) and a session-bound speed probe
 //!   POST /remux/s/<sid>/<sig>/report {code, message} → the player couldn't play it, into the log
@@ -490,17 +494,26 @@ where
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
     #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
     struct Title {
         imdb: String,
         season: Option<u32>,
         episode: Option<u32>,
         scout: Option<String>,
+        /// As in `POST /remux/session`: what the player decodes, so each release can say whether it plays.
+        #[serde(default)]
+        video_codecs: Vec<String>,
+        playable: Option<session::Playable>,
     }
     let Some(req) = read_body(body).await.and_then(|b| serde_json::from_slice::<Title>(&b).ok()) else {
         return bad_request(
-            "Expected {\"imdb\": \"tt…\", \"season\"?: n, \"episode\"?: n, \"scout\"?: \"…\"}.",
+            "Expected {\"imdb\": \"tt…\", \"season\"?: n, \"episode\"?: n, \"scout\"?: \"…\", \
+             \"videoCodecs\"?: [\"h264\", \"hevc\"], \"playable\"?: {…as in /remux/session}}.",
         );
     };
+    if req.video_codecs.len() > 8 || req.video_codecs.iter().any(|c| c.len() > 35) {
+        return bad_request("videoCodecs is at most 8 short tags.");
+    }
     let admission = match (browser_of(state, parts), &req.scout) {
         (Some(b), _) => session::Admission::Browser(b),
         (None, Some(_)) => session::Admission::Install,
@@ -521,14 +534,27 @@ where
         _ => return bad_request("An episode needs both season and episode."),
     };
     let id = scout::title_id(&req.imdb, episode);
-    match session::releases(state, admission, req.scout.as_deref(), &id).await {
+    let listed = session::releases(
+        state,
+        admission,
+        req.scout.as_deref(),
+        &id,
+        req.playable.as_ref(),
+        &req.video_codecs,
+    )
+    .await;
+    match listed {
         Ok(list) => httputil::json(
             StatusCode::OK,
             &serde_json::json!({
-                "releases": list.iter().map(|s| serde_json::json!({
-                    "label": s.attributes.label,
-                    "filename": s.filename(),
-                    "size": s.attributes.size_bytes,
+                // `plays`: "yes" as it is, "convert" only converted on the server, "no" not at all; `why` says
+                // so where it isn't a plain yes.
+                "releases": list.iter().map(|v| serde_json::json!({
+                    "label": v.stream.attributes.label,
+                    "filename": v.stream.filename(),
+                    "size": v.stream.attributes.size_bytes,
+                    "plays": v.plays.as_str(),
+                    "why": v.why,
                 })).collect::<Vec<_>>(),
             }),
             &[],
@@ -655,7 +681,16 @@ where
                 "sid": s.sid,
                 "playlist": format!("/remux/s/{}/{}/master.m3u8", s.sid, s.sig),
                 "speed": format!("/remux/s/{}/{}/speed", s.sid, s.sig),
-                "release": {"label": s.release.label, "filename": s.release.filename, "size": s.release.size},
+                // `requested`: the release the player named, when another was played, and why it was passed over.
+                "release": {
+                    "label": s.release.label,
+                    "filename": s.release.filename,
+                    "size": s.release.size,
+                    "requested": s.release.requested.as_ref().map(|r| serde_json::json!({
+                        "filename": r.filename,
+                        "why": r.why,
+                    })),
+                },
                 "duration": s.info.duration,
                 "expiresAt": s.exp,
                 "audioTrack": s.audio,

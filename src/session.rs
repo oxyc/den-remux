@@ -9,7 +9,7 @@
 //! There are no timers while nothing is playing: each session has one supervising task, which ticks
 //! only while its ffmpeg is actually running and otherwise sleeps until a request or its idle deadline.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU8, Ordering::Relaxed};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -88,6 +88,14 @@ pub struct Release {
     pub label: String,
     pub filename: String,
     pub size: Option<u64>,
+    /// The release the player named when this one was played instead, and why it was passed over — where that is
+    /// known.
+    pub requested: Option<Requested>,
+}
+
+pub struct Requested {
+    pub filename: String,
+    pub why: String,
 }
 
 #[derive(Clone, Debug)]
@@ -281,6 +289,28 @@ impl Session {
         self.lock().want
     }
 
+    /// Put a job's init segment where the session serves it. A kept Dolby Vision profile 5 with no record in its
+    /// container has no side data for ffmpeg's muxer to write a `dvcC` from, so it is added here; a layout this
+    /// can't patch is not served, and the session fails as any whose init never appears.
+    fn write_init(&self, from: &Path, to: &Path) -> bool {
+        let recordless = self.dovi == job::Dovi::Keep && self.info.dolby_vision_recordless;
+        let Some(dv) = self.info.dolby_vision.filter(|_| recordless) else {
+            return std::fs::copy(from, to).is_ok();
+        };
+        let patched = std::fs::read(from)
+            .map_err(|e| e.to_string())
+            .and_then(|init| job::add_dovi_record(&init, dv.profile, dv.level));
+        match patched.and_then(|init| std::fs::write(to, init).map_err(|e| e.to_string())) {
+            Ok(()) => true,
+            Err(e) => {
+                crate::log_limited("init_dovi_record", || {
+                    format!("session {}: init.mp4 could not take a Dolby Vision record: {e}", self.short())
+                });
+                false
+            }
+        }
+    }
+
     /// Take what the job has finished since the last look: its exit, and the GOPs in its playlist.
     fn refresh(&self, i: &mut Inner, st: &AppState) {
         let Inner { job, gops, finished, init, bytes, failures, input, .. } = i;
@@ -301,7 +331,7 @@ impl Session {
             if init.is_none() {
                 // Every run writes a byte-identical init (see job.rs), so the first one serves all.
                 let dst = self.dir.join("init.mp4");
-                if std::fs::copy(job.dir.join("init.mp4"), &dst).is_ok() {
+                if self.write_init(&job.dir.join("init.mp4"), &dst) {
                     *init = Some(dst);
                 }
             }
@@ -832,11 +862,17 @@ pub(crate) fn opened_key(base: &str, s: &scout::Stream) -> String {
     format!("{}/{}/{}", crate::auth::install_id(base), s.attributes.size_bytes.unwrap_or(0), s.filename())
 }
 
+/// What `AppState::known` remembers a release's probe under: the title and the release's name, whoever listed it.
+pub(crate) fn known_key(title: &str, s: &scout::Stream) -> String {
+    format!("{title}/{}", s.filename())
+}
+
 /// Try one candidate: follow its play URL, read the head, and probe it — or take all of that from a recent
-/// open of the same release by the same install.
+/// open of the same release by the same install. What the probe found is remembered for `releases`' verdicts.
 async fn open(
     st: &AppState,
     src: &scout::ScoutSource,
+    title: &str,
     s: &scout::Stream,
 ) -> Result<(scout::Resolved, MediaInfo), String> {
     let key = opened_key(&src.base, s);
@@ -849,6 +885,7 @@ async fn open(
     let info = crate::probe::probe(&Source::Http { client: &st.http, url: &r.url }, &r.head)
         .await
         .map_err(|e| e.to_string())?;
+    st.known().put(known_key(title, s), &info);
     if let VideoCodec::Other(c) = &info.video {
         return Err(format!("video is {c}, which needs a re-encode"));
     }
@@ -1081,7 +1118,10 @@ fn copied_range(info: &MediaInfo, codecs: &str) -> Option<&'static str> {
 
 /// Whether a release would play with no picture: Dolby Vision profile 5, which has no base layer, so stripped or
 /// transcoded it comes out green and purple — unless the player shows profile 5 and takes the release as it is.
-fn no_picture(want: &Want<'_>, takes_hevc: bool, info: &MediaInfo) -> bool {
+///
+/// A profile 5 whose container has no Dolby Vision record (`dolby_vision_recordless`) is kept the same way: the
+/// init segment is given the record it lacks (`job::add_dovi_record`).
+fn no_picture(playable: Option<&Playable>, takes_hevc: bool, info: &MediaInfo) -> bool {
     // A contradictory P5 record sits over a regular BT.2020 PQ/HLG base layer. The record itself must not make us
     // refuse that safe fallback when its RPU was unreadable.
     if info.dolby_vision_record_mismatch {
@@ -1091,7 +1131,7 @@ fn no_picture(want: &Want<'_>, takes_hevc: bool, info: &MediaInfo) -> bool {
         if dv.has_fallback() {
             return false;
         }
-        !(keeps_dolby_vision(dv, want.playable) && plays(want, takes_hevc, info))
+        !(keeps_dolby_vision(dv, playable) && plays(playable, takes_hevc, info))
     })
 }
 
@@ -1140,8 +1180,8 @@ pub(crate) fn tonemaps(info: &crate::probe::MediaInfo) -> bool {
 
 /// Whether the player takes the release's video as it is: by `playable`, else by `videoCodecs`, which can only say
 /// that it takes no HEVC — and never that it takes AV1 or VP9, which only `playable` reports.
-fn plays(want: &Want<'_>, takes_hevc: bool, info: &crate::probe::MediaInfo) -> bool {
-    match want.playable {
+fn plays(playable: Option<&Playable>, takes_hevc: bool, info: &crate::probe::MediaInfo) -> bool {
+    match playable {
         Some(p) => p.takes(info),
         None => match info.video {
             VideoCodec::Hevc => takes_hevc,
@@ -1311,22 +1351,129 @@ async fn scout_list(
     })
 }
 
+/// Whether the player takes HEVC as it is: by `playable`, else by `videoCodecs` (empty is both).
+fn player_takes_hevc(playable: Option<&Playable>, video_codecs: &[String]) -> bool {
+    let named = video_codecs.is_empty()
+        || video_codecs
+            .iter()
+            .any(|c| matches!(c.to_ascii_lowercase().as_str(), "hevc" | "h265" | "hvc1" | "hev1"));
+    playable.map_or(named, Playable::takes_hevc)
+}
+
+/// Whether a release plays for the player that asked, as `POST /remux/releases` says it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Plays {
+    /// As it is (or nothing says otherwise).
+    Yes,
+    /// Only converted on the server's GPU.
+    Convert,
+    /// Not at all: a session skips it.
+    No,
+}
+
+impl Plays {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Plays::Yes => "yes",
+            Plays::Convert => "convert",
+            Plays::No => "no",
+        }
+    }
+}
+
+/// A listed release and how it plays for the player that asked.
+pub struct Verdict {
+    pub stream: scout::Stream,
+    pub plays: Plays,
+    /// A short reason a person can read, where it is not a plain yes.
+    pub why: Option<String>,
+}
+
+/// What opening a release showed of it, as a verdict for this player: the probe's own answer, by the very tests a
+/// session applies to what it opens.
+fn probed_verdict(
+    info: &MediaInfo,
+    playable: Option<&Playable>,
+    takes_hevc: bool,
+) -> (Plays, Option<String>) {
+    if no_picture(playable, takes_hevc, info) {
+        let profile = info.dolby_vision.map_or(5, |dv| dv.profile);
+        let record = if info.dolby_vision_recordless { " (no record in the file)" } else { "" };
+        return (
+            Plays::No,
+            Some(format!("Dolby Vision profile {profile}{record} — this browser can't show it")),
+        );
+    }
+    if plays(playable, takes_hevc, info) {
+        return (Plays::Yes, None);
+    }
+    let codec = info.codecs.as_deref().unwrap_or("its video");
+    match info.video {
+        VideoCodec::Hevc => {
+            (Plays::Convert, Some(format!("{codec} is converted on the server for this browser")))
+        }
+        _ => (Plays::No, Some(format!("{codec} is beyond this browser"))),
+    }
+}
+
+/// A release's verdict before it is opened, from scout's attributes.
+fn scouted_verdict(
+    a: &scout::Attributes,
+    playable: Option<&Playable>,
+    takes_hevc: bool,
+) -> (Plays, Option<String>) {
+    match fit(a, playable, takes_hevc) {
+        Fit::Copy => (Plays::Yes, None),
+        Fit::Convert if a.dv_profile == 5 => (
+            Plays::Convert,
+            Some("Dolby Vision profile 5 — this browser can't show it, so it plays only if its picture has a base layer".into()),
+        ),
+        Fit::Convert => (Plays::Convert, Some("converted on the server for this browser".into())),
+        Fit::Never => (Plays::No, Some(format!("{} — this browser can't decode it", a.codec.as_deref().unwrap_or("its video")))),
+    }
+}
+
 /// `POST /remux/releases`: the releases a session could play, in the order it would try them, so a player can name
-/// one (`filename`). The caller gets their labels, names and sizes — never a URL.
+/// one (`filename`), each with how it plays for a player that says what it decodes (`playable`, `videoCodecs`):
+/// by scout's attributes, or — once a session has opened the release — by what the probe found. The caller gets
+/// their labels, names and sizes — never a URL. Without a report every release is `yes`.
 pub async fn releases(
     st: &Arc<AppState>,
     admission: Admission,
     scout: Option<&str>,
     id: &str,
-) -> Result<Vec<scout::Stream>, ApiError> {
+    playable: Option<&Playable>,
+    video_codecs: &[String],
+) -> Result<Vec<Verdict>, ApiError> {
     let by_install = matches!(admission, Admission::Install);
     let key = match admission {
         Admission::Browser(_) => st.cfg.scout_key.clone(),
         Admission::Install => None,
     };
     let source = scout::ScoutSource { base: scout_base(st, scout)?, key };
-    // No capability report comes with this request, so no AV1 or VP9: nothing says the player decodes them.
-    Ok(scout::candidates(&scout_list(st, &source, id, by_install, None).await?, None, false, false))
+    // Without a capability report no AV1 or VP9: nothing says the player decodes them.
+    let list = scout_list(st, &source, id, by_install, playable).await?;
+    let candidates = scout::candidates(
+        &list,
+        None,
+        playable.is_some_and(Playable::takes_av1),
+        playable.is_some_and(Playable::takes_vp9),
+    );
+    let reported = playable.is_some() || !video_codecs.is_empty();
+    let takes_hevc = player_takes_hevc(playable, video_codecs);
+    Ok(candidates
+        .into_iter()
+        .map(|stream| {
+            let (plays, why) = if !reported {
+                (Plays::Yes, None)
+            } else if let Some(info) = st.known().get(&known_key(id, &stream)) {
+                probed_verdict(&info, playable, takes_hevc)
+            } else {
+                scouted_verdict(&stream.attributes, playable, takes_hevc)
+            };
+            Verdict { stream, plays, why }
+        })
+        .collect())
 }
 
 /// `POST /remux/session`: pick and probe a release, choose its audio track, and set up its session.
@@ -1389,12 +1536,9 @@ pub async fn create(
             "No cached release in a codec this service can remux.",
         ));
     }
-    let takes_hevc = want.video_codecs.is_empty()
-        || want
-            .video_codecs
-            .iter()
-            .any(|c| matches!(c.to_ascii_lowercase().as_str(), "hevc" | "h265" | "hvc1" | "hev1"));
-    let takes_hevc = want.playable.map_or(takes_hevc, Playable::takes_hevc);
+    let takes_hevc = player_takes_hevc(want.playable, want.video_codecs);
+    // Why the release the player named was passed over, where it was: `release.requested` in the answer.
+    let mut requested_why: Option<String> = None;
     // What scout says of each release decides, before any is opened, which are tried first — those that play as
     // they are, then those that play only converted, scout's ranking holding within each — and which aren't
     // opened at all. The named release stays first unless it can't play. Scout has already ranked a list for a
@@ -1402,10 +1546,15 @@ pub async fn create(
     let mut ranked: Vec<(Fit, &scout::Stream)> = Vec::new();
     for c in &candidates {
         match fit(&c.attributes, want.playable, takes_hevc) {
-            Fit::Never => eprintln!(
-                "session: {imdb} skipped \"{}\" unopened: scout's attributes say it can't play here",
-                c.attributes.label
-            ),
+            Fit::Never => {
+                eprintln!(
+                    "session: {imdb} skipped \"{}\" unopened: scout's attributes say it can't play here",
+                    c.attributes.label
+                );
+                if want.filename == Some(c.filename()) {
+                    requested_why = scouted_verdict(&c.attributes, want.playable, takes_hevc).1;
+                }
+            }
             f => ranked.push((f, c)),
         }
     }
@@ -1432,7 +1581,7 @@ pub async fn create(
                 let Some((_, c)) = queue.next() else { break };
                 tried += 1;
                 opening.push_back(async move {
-                    let opened = tokio::time::timeout(OPEN_TIMEOUT, open(st, source, c)).await;
+                    let opened = tokio::time::timeout(OPEN_TIMEOUT, open(st, source, imdb, c)).await;
                     (c, opened.unwrap_or_else(|_| Err(format!("not open after {}s", OPEN_TIMEOUT.as_secs()))))
                 });
             }
@@ -1441,21 +1590,36 @@ pub async fn create(
             match opened {
                 // Dolby Vision profile 5 has no base layer to fall back to: stripped or transcoded, its picture is
                 // green and purple. Only a player that shows profile 5 plays it, and only as it is.
-                Ok((_, info)) if no_picture(want, takes_hevc, &info) => eprintln!(
-                    "session: {imdb} skipped \"{}\": {} has no picture without Dolby Vision",
-                    c.attributes.label,
-                    info.dolby_vision.map(|dv| dv.to_string()).unwrap_or_default()
-                ),
+                Ok((_, info)) if no_picture(want.playable, takes_hevc, &info) => {
+                    let record = if info.dolby_vision_recordless {
+                        " (no Dolby Vision record in the container)"
+                    } else {
+                        ""
+                    };
+                    eprintln!(
+                        "session: {imdb} skipped \"{}\": {}{record} has no picture without Dolby Vision",
+                        c.attributes.label,
+                        info.dolby_vision.map(|dv| dv.to_string()).unwrap_or_default()
+                    );
+                    if want.filename == Some(c.filename()) {
+                        requested_why = probed_verdict(&info, want.playable, takes_hevc).1;
+                    }
+                }
                 // HEVC the player can't take as it is plays only converted on the GPU: kept as the last resort
                 // while the rest are looked through for one that plays untouched — unless the player named this
                 // release (another audio track of it), which it keeps.
-                Ok((r, info)) if info.video == VideoCodec::Hevc && !plays(want, takes_hevc, &info) => {
+                Ok((r, info))
+                    if info.video == VideoCodec::Hevc && !plays(want.playable, takes_hevc, &info) =>
+                {
                     eprintln!(
                         "session: {imdb} \"{}\" ({}) plays here only converted",
                         c.attributes.label,
                         info.codecs.as_deref().unwrap_or("HEVC")
                     );
                     let named = want.filename == Some(c.filename());
+                    if named {
+                        requested_why = probed_verdict(&info, want.playable, takes_hevc).1;
+                    }
                     if fallback.is_none() {
                         fallback = Some((c, (r, info)));
                     }
@@ -1464,11 +1628,16 @@ pub async fn create(
                     }
                 }
                 // H.264, AV1 or VP9 beyond the player: nothing here makes H.264 smaller, or converts AV1 or VP9 at all.
-                Ok((_, info)) if !plays(want, takes_hevc, &info) => eprintln!(
-                    "session: {imdb} skipped \"{}\": {} is beyond this player",
-                    c.attributes.label,
-                    info.codecs.as_deref().unwrap_or("its video")
-                ),
+                Ok((_, info)) if !plays(want.playable, takes_hevc, &info) => {
+                    eprintln!(
+                        "session: {imdb} skipped \"{}\": {} is beyond this player",
+                        c.attributes.label,
+                        info.codecs.as_deref().unwrap_or("its video")
+                    );
+                    if want.filename == Some(c.filename()) {
+                        requested_why = probed_verdict(&info, want.playable, takes_hevc).1;
+                    }
+                }
                 // A copy needing more than the player's link carries is kept aside while one that fits is looked for —
                 // unless the player named it, which is then decided on below as the only one.
                 Ok((r, info))
@@ -1489,11 +1658,16 @@ pub async fn create(
                     chosen = Some((c, found, None));
                     break;
                 }
-                Err(why) => eprintln!(
-                    "session: {imdb} skipped \"{}\": {}",
-                    c.attributes.label,
-                    crate::redact::scrub(&why, &secrets)
-                ),
+                Err(why) => {
+                    eprintln!(
+                        "session: {imdb} skipped \"{}\": {}",
+                        c.attributes.label,
+                        crate::redact::scrub(&why, &secrets)
+                    );
+                    if want.filename == Some(c.filename()) {
+                        requested_why = Some("it could not be opened".into());
+                    }
+                }
             }
         }
         (chosen, fallback, too_big)
@@ -1587,6 +1761,15 @@ pub async fn create(
         .to_string()
     });
     let size = resolved.size.or(c.attributes.size_bytes);
+    // A player that named a release and got another is told why, where this knows: what it saw of the named one
+    // just now, or of an earlier opening.
+    let requested = want.filename.filter(|f| *f != c.filename()).and_then(|f| {
+        let why = requested_why.or_else(|| {
+            let info = st.known().get(&format!("{imdb}/{f}"))?;
+            probed_verdict(&info, want.playable, takes_hevc).1
+        })?;
+        Some(Requested { filename: f.to_string(), why })
+    });
     let (peak, avg) = playlist::bandwidth(size, info.duration);
     let (codecs, resolution, (peak, avg)) = match transcode {
         Some(_) => (
@@ -1658,7 +1841,12 @@ pub async fn create(
         started: Instant::now(),
         imdb: imdb.to_string(),
         dir,
-        release: Release { label: c.attributes.label.clone(), filename: c.filename().to_string(), size },
+        release: Release {
+            label: c.attributes.label.clone(),
+            filename: c.filename().to_string(),
+            size,
+            requested,
+        },
         segments,
         play_url: c.url.clone(),
         source,
@@ -1785,6 +1973,7 @@ mod tests {
             frame_rate: None,
             dolby_vision: None,
             dolby_vision_record_mismatch: false,
+            dolby_vision_recordless: false,
             audio: Vec::new(),
             keyframes: vec![0.0],
         }
@@ -1988,7 +2177,41 @@ mod tests {
             max_bitrate: None,
             client: "test".into(),
         };
-        assert!(!no_picture(&want, true, &release), "the BT.2020 base layer has a picture");
+        assert!(!no_picture(want.playable, true, &release), "the BT.2020 base layer has a picture");
+    }
+
+    #[test]
+    fn a_recordless_profile5_plays_only_as_it_is_for_a_player_that_shows_profile5() {
+        let mut release = info(VideoCodec::Hevc, "hvc1.2.4.L153.B0", false);
+        release.dolby_vision = Some(crate::probe::DolbyVision { profile: 5, compat: 0, level: 6 });
+        release.dolby_vision_recordless = true;
+        let safari = &Playable {
+            hevc_main10: 153,
+            hdr: true,
+            dolby_vision: DolbyVisionPlay { p5: true, p8: true },
+            ..Playable::default()
+        };
+        let chrome = &Playable { hevc_main10: 153, hdr: true, ..Playable::default() };
+        let no_hevc =
+            &Playable { dolby_vision: DolbyVisionPlay { p5: true, p8: true }, ..Playable::default() };
+        // Safari keeps it: its master names `dvh1.05.06` and VIDEO-RANGE=PQ, and the copy keeps its RPUs.
+        assert!(!no_picture(Some(safari), true, &release));
+        let kept = kept_dolby_vision(&release, false, Some(safari)).expect("kept as it is");
+        assert_eq!(dolby_vision_signal(kept), Some((Some("dvh1.05.06".into()), None, "PQ")));
+        // Anywhere else it is refused, never stripped and never converted: profile 5 has no picture without its RPU.
+        assert!(no_picture(Some(chrome), true, &release));
+        assert!(
+            no_picture(Some(no_hevc), false, &release),
+            "a player without HEVC is not offered a conversion"
+        );
+        assert_eq!(probed_verdict(&release, Some(safari), true), (Plays::Yes, None));
+        let (plays, why) = probed_verdict(&release, Some(chrome), true);
+        assert_eq!(plays, Plays::No);
+        assert_eq!(
+            why.unwrap(),
+            "Dolby Vision profile 5 (no record in the file) — this browser can't show it"
+        );
+        assert_eq!(kept_dolby_vision(&release, true, Some(safari)), None, "a transcode drops Dolby Vision");
     }
 
     #[test]
