@@ -1390,6 +1390,9 @@ pub enum Admission {
     /// den-remux's key is not sent, so scout alone decides: a full install lists and plays, and an
     /// availability-only, revoked or foreign one does not.
     Install,
+    /// A guest's grant, vouched for by den-edge (`EDGE_SECRET`): the install is as for `Install`, but the sessions
+    /// belong to the grant (`grant:<gid>`), are capped by `GUEST_MAX_SESSIONS`, and are never transcoded.
+    Guest(String),
 }
 
 /// The scout install a request names, or this service's own. Validated as sent, then fetched at its LAN address
@@ -1542,10 +1545,10 @@ pub async fn releases(
     playable: Option<&Playable>,
     video_codecs: &[String],
 ) -> Result<Vec<Verdict>, ApiError> {
-    let by_install = matches!(admission, Admission::Install);
+    let by_install = !matches!(admission, Admission::Browser(_));
     let key = match admission {
         Admission::Browser(_) => st.cfg.scout_key.clone(),
-        Admission::Install => None,
+        Admission::Install | Admission::Guest(_) => None,
     };
     let source = scout::ScoutSource { base: scout_base(st, scout)?, key };
     // Without a capability report no AV1 or VP9: nothing says the player decodes them.
@@ -1582,10 +1585,12 @@ pub async fn create(
 ) -> Result<Arc<Session>, ApiError> {
     let imdb = want.id;
     let base = scout_base(st, want.scout)?;
-    let by_install = matches!(admission, Admission::Install);
+    let by_install = !matches!(admission, Admission::Browser(_));
+    let guest = matches!(admission, Admission::Guest(_));
     let (owner, key, share) = match admission {
         Admission::Browser(b) => (b, st.cfg.scout_key.clone(), 1),
         Admission::Install => (crate::auth::install_id(&base), None, st.cfg.max_sessions_per_install),
+        Admission::Guest(o) => (o, None, st.cfg.guest_max_sessions),
     };
     let source = scout::ScoutSource { base, key };
     // Checked before any work: a bad install is the browser's mistake, not a reason to probe a release.
@@ -1785,7 +1790,8 @@ pub async fn create(
             Some(too_big.remove(i))
         });
         if let Some((c, found)) = convert {
-            match st.reserve_transcode() {
+            // A guest never takes the GPU, which is the host's.
+            match if guest { None } else { st.reserve_transcode() } {
                 Some(slot) => chosen = Some((c, found, Some(slot))),
                 // The GPU is busy: it still plays as it is, below.
                 None if from_too_big => too_big.push((c, found)),

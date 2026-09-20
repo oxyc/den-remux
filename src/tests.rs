@@ -224,6 +224,7 @@ static FLAKY_SUBTITLES: AtomicU32 = AtomicU32::new(0);
 /// asks for.
 const SCOPED: &str = "c2NvcGVk";
 const SCOUT_KEY: &str = "test-scout-key";
+const EDGE_SECRET: &str = "test-edge-secret";
 
 fn origin_full(status: u16, body: impl Into<Bytes>) -> Response<OriginBody> {
     Response::builder().status(status).body(Full::new(body.into()).boxed()).unwrap()
@@ -463,8 +464,20 @@ fn test_state(origin: &str, max_sessions: usize, idle: Duration) -> Arc<AppState
 }
 
 fn state_with(origin: &str, max_sessions: usize, idle: Duration, scout_key: Option<&str>) -> Arc<AppState> {
+    state_from(test_config(origin, max_sessions, idle, scout_key))
+}
+
+fn state_from(cfg: Config) -> Arc<AppState> {
+    let dir = cfg.scratch_dir.clone();
+    let state = AppState::new(cfg);
+    state.scratch_ok.store(crate::state::check_scratch(&dir), Relaxed);
+    state.ffmpeg_ok.store(true, Relaxed);
+    state
+}
+
+fn test_config(origin: &str, max_sessions: usize, idle: Duration, scout_key: Option<&str>) -> Config {
     let dir = temp_dir();
-    let state = AppState::new(Config {
+    Config {
         port: 0,
         scout_origins: vec![origin.to_string()],
         scout_key: scout_key.map(String::from),
@@ -477,7 +490,7 @@ fn state_with(origin: &str, max_sessions: usize, idle: Duration, scout_key: Opti
         max_sessions,
         max_sessions_per_install: 2,
         session_idle: idle,
-        scratch_dir: dir.clone(),
+        scratch_dir: dir,
         scratch_max_bytes: 1 << 30,
         ffmpeg: tool("FFMPEG_PATH", "ffmpeg"),
         max_transcodes: 1,
@@ -487,10 +500,9 @@ fn state_with(origin: &str, max_sessions: usize, idle: Duration, scout_key: Opti
         web_origins: vec!["https://d.example".into()],
         metrics_token: None,
         log_requests: false,
-    });
-    state.scratch_ok.store(crate::state::check_scratch(&dir), Relaxed);
-    state.ffmpeg_ok.store(true, Relaxed);
-    state
+        edge_secret: Some(EDGE_SECRET.into()),
+        guest_max_sessions: 2,
+    }
 }
 
 #[test]
@@ -523,9 +535,23 @@ impl Reply {
 }
 
 async fn call(state: &Arc<AppState>, method: &str, path: &str, cookie: Option<&str>, body: &str) -> Reply {
+    call_with(state, method, path, cookie, &[], body).await
+}
+
+async fn call_with(
+    state: &Arc<AppState>,
+    method: &str,
+    path: &str,
+    cookie: Option<&str>,
+    headers: &[(&str, &str)],
+    body: &str,
+) -> Reply {
     let mut b = Request::builder().method(method).uri(path);
     if let Some(c) = cookie {
         b = b.header("cookie", c);
+    }
+    for (name, value) in headers {
+        b = b.header(*name, *value);
     }
     let resp =
         crate::handle_request(state.clone(), b.body(Full::new(Bytes::from(body.to_string()))).unwrap()).await;
@@ -1149,6 +1175,213 @@ async fn reopening_a_release_takes_its_link_and_probe_from_the_first_open() {
     }
     assert_eq!(COUNTED_PLAYS.load(Relaxed), 1, "the second session followed scout's play URL again");
     state.end_all("test").await;
+}
+
+fn edge(owner: &str) -> [(&str, &str); 2] {
+    [("x-den-edge-secret", EDGE_SECRET), ("x-den-owner", owner)]
+}
+
+/// `POST /remux/session` for the scout install at `{origin}/cfg`, with `headers`.
+async fn start_with(
+    state: &Arc<AppState>,
+    origin: &str,
+    cookie: Option<&str>,
+    headers: &[(&str, &str)],
+) -> Reply {
+    let body = format!(r#"{{"imdb":"tt0000001","scout":"{origin}/cfg"}}"#);
+    call_with(state, "POST", "/remux/session", cookie, headers, &body).await
+}
+
+/// How many published sessions each owner has, by owner.
+fn owned(state: &Arc<AppState>) -> std::collections::BTreeMap<String, usize> {
+    let mut by = std::collections::BTreeMap::new();
+    for s in state.sessions().values() {
+        *by.entry(s.owner.clone()).or_default() += 1;
+    }
+    by
+}
+
+/// A guest's owner is honoured only with the shared secret and a `grant:<8 hex>` name; anything else plays as
+/// the install the request names, as if the headers were not there.
+#[tokio::test]
+async fn a_guest_owner_is_honoured_only_with_the_edge_secret() {
+    let origin = origin().await;
+    let state = test_state(&origin, 4, Duration::from_secs(600));
+    let r = start_with(&state, &origin, None, &edge("grant:0a1b2c3d")).await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    assert_eq!(owned(&state), [("grant:0a1b2c3d".to_string(), 1)].into());
+    state.end_all("test").await;
+
+    let ignored = [
+        vec![("x-den-owner", "grant:0a1b2c3d")],
+        vec![("x-den-edge-secret", "wrong"), ("x-den-owner", "grant:0a1b2c3d")],
+        vec![("x-den-edge-secret", EDGE_SECRET)],
+        vec![("x-den-edge-secret", EDGE_SECRET), ("x-den-owner", "grant:0A1B2C3D")],
+        vec![("x-den-edge-secret", EDGE_SECRET), ("x-den-owner", "grant:0a1b2c3")],
+        vec![("x-den-edge-secret", EDGE_SECRET), ("x-den-owner", "install:0a1b2c3d0a1b2c3d")],
+    ];
+    for headers in ignored {
+        let r = start_with(&state, &origin, None, &headers).await;
+        assert_eq!(r.status, StatusCode::CREATED, "{headers:?}: {}", r.text());
+        let owners = owned(&state);
+        assert!(
+            owners.keys().all(|o| o.starts_with("install:") && o != "install:0a1b2c3d0a1b2c3d"),
+            "{headers:?}: {owners:?}"
+        );
+        state.end_all("test").await;
+    }
+
+    let off =
+        state_from(Config { edge_secret: None, ..test_config(&origin, 4, Duration::from_secs(600), None) });
+    let r = start_with(&off, &origin, None, &edge("grant:0a1b2c3d")).await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    assert!(owned(&off).keys().all(|o| o.starts_with("install:")), "{:?}", owned(&off));
+    off.end_all("test").await;
+
+    let body = format!(r#"{{"imdb":"tt0000001","scout":"{origin}/cfg"}}"#);
+    let r = call_with(&state, "POST", "/remux/releases", None, &edge("grant:0a1b2c3d"), &body).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+}
+
+/// A grant plays `GUEST_MAX_SESSIONS` at once and its oldest gives way; that never touches a host's sessions,
+/// and a host starting more never touches a grant's.
+#[tokio::test]
+async fn a_guest_has_its_own_cap_and_never_evicts_a_host() {
+    let origin = origin().await;
+    let state = test_state(&origin, 10, Duration::from_secs(600));
+    let phone = login(&state, "phone-key").await;
+    let host = start_with(&state, &origin, Some(&phone), &[]).await;
+    assert_eq!(host.status, StatusCode::CREATED, "{}", host.text());
+    let host_sid = host.json()["sid"].as_str().unwrap().to_string();
+
+    let mut guest_sids = Vec::new();
+    for _ in 0..3 {
+        let r = start_with(&state, &origin, None, &edge("grant:0a1b2c3d")).await;
+        assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+        guest_sids.push(r.json()["sid"].as_str().unwrap().to_string());
+    }
+    assert!(state.session(&guest_sids[0]).is_none(), "the grant's oldest gave way");
+    assert!(state.session(&guest_sids[1]).is_some() && state.session(&guest_sids[2]).is_some());
+    assert!(state.session(&host_sid).is_some(), "a guest evicted a host");
+
+    // The host's own limits move without the grant: its browser replaces its own session, its installs fill theirs.
+    for _ in 0..3 {
+        let r = start_with(&state, &origin, Some(&phone), &[]).await;
+        assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    }
+    for _ in 0..3 {
+        let r = start_with(&state, &origin, None, &[]).await;
+        assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    }
+    assert!(guest_sids[1..].iter().all(|s| state.session(s).is_some()), "a host evicted a guest");
+    let owners = owned(&state);
+    assert_eq!(owners["grant:0a1b2c3d"], 2);
+    assert_eq!(owners.iter().filter(|(o, _)| o.starts_with("install:")).map(|(_, n)| n).sum::<usize>(), 2);
+
+    // Another grant has a cap of its own.
+    for _ in 0..2 {
+        let r = start_with(&state, &origin, None, &edge("grant:deadbeef")).await;
+        assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    }
+    assert_eq!(owned(&state)["grant:0a1b2c3d"], 2);
+    assert_eq!(owned(&state)["grant:deadbeef"], 2);
+    state.end_all("test").await;
+}
+
+/// A grant never takes the GPU: a release that needs converting is refused as it is when no transcode is free,
+/// and the transcode stays there for a host.
+#[tokio::test]
+async fn a_guest_is_never_transcoded() {
+    let origin = origin().await;
+    let state = test_state(&origin, 4, Duration::from_secs(600));
+    state.transcode_ok.store(true, Relaxed);
+    let body = format!(r#"{{"imdb":"tt0000002","scout":"{origin}/cfg","videoCodecs":["h264"]}}"#);
+    let r = call_with(&state, "POST", "/remux/session", None, &edge("grant:0a1b2c3d"), &body).await;
+    assert_eq!(r.status, StatusCode::SERVICE_UNAVAILABLE, "{}", r.text());
+    assert_eq!(r.json()["error"], "transcode_unavailable");
+    assert_eq!(state.transcodes.load(Relaxed), 0);
+
+    let r = call(&state, "POST", "/remux/session", None, &body).await;
+    assert_eq!(r.status, StatusCode::CREATED, "the host has the transcode: {}", r.text());
+    assert_eq!(r.json()["video"]["transcoded"], true);
+    state.end_all("test").await;
+}
+
+/// `/remux/admin/kill` ends one grant's sessions as a DELETE does and no one else's.
+#[tokio::test]
+async fn kill_ends_the_sessions_of_one_grant_only() {
+    let origin = origin().await;
+    let state = test_state(&origin, 6, Duration::from_secs(600));
+    let phone = login(&state, "phone-key").await;
+    let mut sids = Vec::new();
+    for (cookie, owner) in [
+        (None, "grant:0a1b2c3d"),
+        (None, "grant:0a1b2c3d"),
+        (None, "grant:deadbeef"),
+        (Some(phone.as_str()), ""),
+    ] {
+        let headers = if owner.is_empty() { Vec::new() } else { edge(owner).to_vec() };
+        let r = start_with(&state, &origin, cookie, &headers).await;
+        assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+        sids.push((
+            r.json()["sid"].as_str().unwrap().to_string(),
+            r.json()["playlist"].as_str().unwrap().to_string(),
+        ));
+    }
+    let scratch = |sid: &str| state.cfg.scratch_dir.join(format!("s-{sid}"));
+    assert!(sids.iter().all(|(sid, _)| scratch(sid).exists()));
+
+    let kill = |owner: &str| {
+        let body = format!(r#"{{"owner":"{owner}"}}"#);
+        let state = state.clone();
+        async move {
+            call_with(&state, "POST", "/remux/admin/kill", None, &[("x-den-edge-secret", EDGE_SECRET)], &body)
+                .await
+        }
+    };
+    let r = kill("grant:0a1b2c3d").await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.json(), serde_json::json!({"ended": 2}));
+    for (sid, playlist) in &sids[..2] {
+        assert!(state.session(sid).is_none() && !scratch(sid).exists(), "scratch left behind");
+        assert_eq!(call(&state, "GET", playlist, None, "").await.status, StatusCode::GONE);
+    }
+    for (sid, _) in &sids[2..] {
+        assert!(state.session(sid).is_some() && scratch(sid).exists(), "another owner's session was ended");
+    }
+    assert_eq!(kill("grant:0a1b2c3d").await.json(), serde_json::json!({"ended": 0}));
+    // Only a grant's owner can be named: never a host's browser or install.
+    assert_eq!(kill("install:0a1b2c3d0a1b2c3d").await.status, StatusCode::BAD_REQUEST);
+    assert_eq!(state.sessions().len(), 2);
+    state.end_all("test").await;
+}
+
+/// Without the secret — wrong, missing, or the feature off — the admin route answers exactly as a route that
+/// does not exist, CORS and allow headers included.
+#[tokio::test]
+async fn kill_without_the_secret_looks_like_an_unknown_route() {
+    let origin = origin().await;
+    let state = test_state(&origin, 2, Duration::from_secs(600));
+    let off =
+        state_from(Config { edge_secret: None, ..test_config(&origin, 2, Duration::from_secs(600), None) });
+    let body = r#"{"owner":"grant:0a1b2c3d"}"#;
+    let unknown = call(&state, "POST", "/remux/admin/nothing", None, body).await;
+    assert_eq!(unknown.status, StatusCode::NOT_FOUND);
+    for (label, st, method, headers) in [
+        ("wrong", &state, "POST", vec![("x-den-edge-secret", "wrong")]),
+        ("empty", &state, "POST", vec![("x-den-edge-secret", "")]),
+        ("missing", &state, "POST", vec![]),
+        ("get with the secret", &state, "GET", vec![("x-den-edge-secret", EDGE_SECRET)]),
+        ("feature off", &off, "POST", vec![("x-den-edge-secret", EDGE_SECRET)]),
+        ("feature off, empty", &off, "POST", vec![("x-den-edge-secret", "")]),
+        ("with an origin", &state, "POST", vec![("origin", "https://d.example")]),
+    ] {
+        let r = call_with(st, method, "/remux/admin/kill", None, &headers, body).await;
+        assert_eq!(r.status, unknown.status, "{label}");
+        assert_eq!(r.headers, unknown.headers, "{label}");
+        assert_eq!(r.body, unknown.body, "{label}");
+    }
+    assert!(!unknown.headers.keys().any(|k| k.as_str().starts_with("access-control") || k == "allow"));
 }
 
 #[tokio::test]
