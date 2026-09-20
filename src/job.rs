@@ -150,7 +150,16 @@ pub struct Spec<'a> {
     /// Which audio track, counting audio tracks only.
     pub audio: usize,
     pub audio_out: AudioOut,
+    /// The release's own text subtitle tracks to write as WebVTT beside the video, counting subtitle tracks of every
+    /// kind: each is a second output of the same run (see [`text_file`]).
+    pub text: &'a [usize],
     pub dir: &'a Path,
+}
+
+/// Where a run writes subtitle track `n` as WebVTT. ffmpeg's webvtt muxer appends a cue as each packet is read, so the
+/// file grows while the run does, and `-copyts` keeps its cue times on the source's timeline, whatever the run's start.
+pub fn text_file(dir: &Path, n: usize) -> PathBuf {
+    dir.join(format!("t{n}.vtt"))
 }
 
 /// The ffmpeg command line. Pure, so the flags the alignment depends on are pinned by a test.
@@ -242,6 +251,14 @@ pub fn args(spec: &Spec<'_>, ca_file: Option<&str>) -> Vec<String> {
     a.push("-hls_segment_filename".into());
     a.push(spec.dir.join("g%d.m4s").to_string_lossy().into_owned());
     a.push(spec.dir.join("gops.m3u8").to_string_lossy().into_owned());
+    // One more output per subtitle track, in the same run: the demuxer reads every subtitle block already, interleaved
+    // with the video it copies, so the text costs no read of its own. Written packet by packet (`-flush_packets`),
+    // not at the end, so a cue is readable as soon as its block is.
+    for n in spec.text {
+        a.extend(s(&["-map", &format!("0:s:{n}"), "-c:s", "webvtt", "-flush_packets", "1"]));
+        a.extend(s(&["-avoid_negative_ts", "disabled", "-f", "webvtt"]));
+        a.push(text_file(spec.dir, *n).to_string_lossy().into_owned());
+    }
     a
 }
 
@@ -379,6 +396,8 @@ pub struct Job {
     pub next_start: f64,
     /// GOPs already taken from ffmpeg's playlist.
     pub read: usize,
+    /// The subtitle tracks this run writes (`Spec::text`).
+    pub text: Vec<usize>,
     pub stopped: bool,
     /// `Some(true)` once ffmpeg has exited cleanly (it reached the end), `Some(false)` on a failure.
     pub exit: Option<bool>,
@@ -427,6 +446,7 @@ impl Job {
             start,
             next_start: start,
             read: 0,
+            text: spec.text.to_vec(),
             stopped: false,
             exit: None,
             pid,
@@ -553,6 +573,7 @@ mod tests {
             video: Video::Copy { tag: Some("hvc1"), dovi: Dovi::Absent },
             audio: 1,
             audio_out: AudioOut::Stereo,
+            text: &[],
             dir,
         };
         let a = args(&spec, Some(CA_BUNDLE));
@@ -593,6 +614,7 @@ mod tests {
             },
             audio: 0,
             audio_out: AudioOut::Stereo,
+            text: &[],
             dir: Path::new("/d"),
         };
         let a = args(&spec, None);
@@ -743,6 +765,7 @@ mod tests {
             video: Video::Copy { tag: Some("dvh1"), dovi: Dovi::Keep },
             audio: 0,
             audio_out: AudioOut::Stereo,
+            text: &[],
             dir: &dir,
         };
         std::fs::create_dir_all(&dir).unwrap();
@@ -788,10 +811,37 @@ mod tests {
             video: Video::Copy { tag: None, dovi: Dovi::Absent },
             audio: 0,
             audio_out: AudioOut::Stereo,
+            text: &[],
             dir: Path::new("/d"),
         };
         let a = args(&spec, None);
         assert!(!a.iter().any(|x| x == "-ss" || x == "-reconnect" || x == "-tls_verify" || x == "-tag:v"));
+    }
+
+    #[test]
+    fn the_releases_own_subtitles_are_more_outputs_of_the_same_run() {
+        let dir = Path::new("/scratch/s-x/j1");
+        let spec = Spec {
+            input: "/f.mkv",
+            seek: seek_for(13.0),
+            video: Video::Copy { tag: None, dovi: Dovi::Absent },
+            audio: 0,
+            audio_out: AudioOut::Stereo,
+            text: &[3, 1],
+            dir,
+        };
+        let a = args(&spec, None);
+        let joined = a.join(" ");
+        // Counting subtitle tracks of every kind, each written as WebVTT as its packets are read, after the HLS output
+        // that is the run's own.
+        let hls = "-hls_segment_filename /scratch/s-x/j1/g%d.m4s /scratch/s-x/j1/gops.m3u8";
+        let first = "-map 0:s:3 -c:s webvtt -flush_packets 1 -avoid_negative_ts disabled -f webvtt /scratch/s-x/j1/t3.vtt";
+        let second = "-map 0:s:1 -c:s webvtt -flush_packets 1 -avoid_negative_ts disabled -f webvtt /scratch/s-x/j1/t1.vtt";
+        assert!(joined.ends_with(&format!("{hls} {first} {second}")), "{joined}");
+        assert_eq!(text_file(dir, 3), Path::new("/scratch/s-x/j1/t3.vtt"));
+        assert_eq!(a.iter().filter(|x| *x == "-copyts").count(), 1, "one timeline for every output");
+        let none = Spec { text: &[], ..spec };
+        assert!(!args(&none, None).join(" ").contains("webvtt"));
     }
 
     #[test]
@@ -802,6 +852,7 @@ mod tests {
             video: Video::Copy { tag: Some("dvh1"), dovi: Dovi::Keep },
             audio: 0,
             audio_out: AudioOut::Stereo,
+            text: &[],
             dir: Path::new("/d"),
         };
         let joined = args(&spec, None).join(" ");
@@ -817,6 +868,7 @@ mod tests {
             video: Video::Copy { tag: Some("hvc1"), dovi: Dovi::Absent },
             audio: 2,
             audio_out: AudioOut::Copy,
+            text: &[],
             dir: Path::new("/d"),
         };
         let joined = args(&spec, None).join(" ");
@@ -834,6 +886,7 @@ mod tests {
             video: Video::Copy { tag: Some("hvc1"), dovi: Dovi::Absent },
             audio: 1,
             audio_out: AudioOut::Surround,
+            text: &[],
             dir: Path::new("/d"),
         };
         let joined = args(&spec, None).join(" ");
@@ -859,6 +912,7 @@ mod tests {
             video: Video::Copy { tag: None, dovi: Dovi::Absent },
             audio: 1,
             audio_out: AudioOut::Surround71,
+            text: &[],
             dir: Path::new("/d"),
         };
         let joined = args(&spec, None).join(" ");

@@ -40,6 +40,19 @@ pub struct AudioTrack {
     pub commentary: bool,
 }
 
+/// A subtitle track of the release. Every one is listed, bitmap or not, because ffmpeg numbers its subtitle streams
+/// (`-map 0:s:N`) across all of them.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SubtitleTrack {
+    /// The container's own name for it: a Matroska `S_…` codec id, or an MP4 sample-entry fourcc.
+    pub codec: String,
+    pub language: Option<String>,
+    /// SRT, ASS/SSA, WebVTT or `mov_text`: what ffmpeg converts to WebVTT. PGS, VOBSUB and the like are bitmaps.
+    pub text: bool,
+    /// Flagged forced (foreign-language parts only), so no full track of its language.
+    pub forced: bool,
+}
+
 #[derive(Clone, Debug)]
 pub struct MediaInfo {
     pub container: &'static str,
@@ -68,6 +81,8 @@ pub struct MediaInfo {
     /// write from nothing, and stripped or converted its picture is tinted, so such a release is not played.
     pub dolby_vision_recordless: bool,
     pub audio: Vec<AudioTrack>,
+    /// The subtitle tracks, in the container's order.
+    pub subtitles: Vec<SubtitleTrack>,
     /// Keyframe presentation times in seconds, ascending — the timeline ffmpeg reports with
     /// `-copyts -start_at_zero`, which is the one the segments are cut on.
     pub keyframes: Vec<f64>,

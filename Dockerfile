@@ -38,7 +38,9 @@ WORKDIR /tmp/ffmpeg-${FFMPEG_VERSION}
 #              Opus, AAC, MP3/MP2, Vorbis, LPCM. And h264/hevc: a copy needs them for stream probing
 #              (to learn the B-frame reorder delay — without them ffmpeg guesses every copied packet's
 #              DTS), and a transcode decodes through them with the VAAPI hwaccels below.
-#   encoders   aac (ffmpeg's native, stereo 192k); h264_vaapi for a transcode
+#              and the text subtitles a release carries — SRT, ASS/SSA, WebVTT, mov_text — which are written as WebVTT
+#              beside the video in the same run (bitmap subtitles have no decoder here: nothing maps them)
+#   encoders   aac (ffmpeg's native, stereo 192k); h264_vaapi for a transcode; webvtt for the subtitles
 #   parsers    for the codecs the demuxers hand over unparsed. av1: Matroska asks for AV1's headers parsed, and
 #              the parser reads the pixel format and colours from the sequence header. A copy of AV1 needs no
 #              decoder: its packets are never reordered, so there is no delay to learn by probing
@@ -56,10 +58,10 @@ RUN ./configure \
       --enable-version3 --enable-openssl --enable-zlib --enable-vaapi \
       --enable-protocol=file,http,https,tcp,tls \
       --enable-demuxer=matroska,mov \
-      --enable-muxer=hls,mp4 \
-      --enable-decoder=h264,hevc,aac,ac3,eac3,dca,truehd,mlp,flac,opus,mp3,mp2,vorbis,pcm_s16le,pcm_s24le,pcm_s32le,pcm_f32le,pcm_s16be,pcm_s24be \
+      --enable-muxer=hls,mp4,webvtt \
+      --enable-decoder=h264,hevc,aac,ac3,eac3,dca,truehd,mlp,flac,opus,mp3,mp2,vorbis,pcm_s16le,pcm_s24le,pcm_s32le,pcm_f32le,pcm_s16be,pcm_s24be,subrip,ass,ssa,webvtt,movtext \
       --enable-hwaccel=h264_vaapi,hevc_vaapi \
-      --enable-encoder=aac,h264_vaapi \
+      --enable-encoder=aac,h264_vaapi,webvtt \
       --enable-parser=av1,h264,hevc,aac,ac3,dca,mlp,flac,opus,mpegaudio,vorbis \
       --enable-filter=aresample,aformat,anull,atrim,abuffer,abuffersink,null,trim,buffer,buffersink,format,scale_vaapi,tonemap_vaapi \
       --enable-bsf=dovi_rpu,filter_units \

@@ -87,6 +87,26 @@ async fn surround_matroska_reads_each_tracks_channels() {
     assert_eq!(tracks, [("A_AAC", 6), ("A_AAC", 8)]);
 }
 
+/// `subs.mkv` carries SRT English, ASS Finnish and a forced SRT Swedish; `h264.mkv` has none.
+#[tokio::test]
+async fn matroska_subtitle_tracks_are_listed_with_their_kind_and_flags() {
+    let info = probe_with_head(&fixture("subs.mkv"), crate::scout::HEAD_BYTES as usize).await;
+    let tracks: Vec<_> =
+        info.subtitles.iter().map(|t| (t.codec.as_str(), t.language.as_deref(), t.text, t.forced)).collect();
+    assert_eq!(
+        tracks,
+        [
+            ("S_TEXT/UTF8", Some("eng"), true, false),
+            ("S_TEXT/ASS", Some("fin"), true, false),
+            ("S_TEXT/UTF8", Some("swe"), true, true),
+        ]
+    );
+    assert!(probe_with_head(&fixture("h264.mkv"), crate::scout::HEAD_BYTES as usize)
+        .await
+        .subtitles
+        .is_empty());
+}
+
 #[tokio::test]
 async fn hevc_matroska_gives_an_hvc1_codec_string() {
     let info = probe_with_head(&fixture("hevc.mkv"), crate::scout::HEAD_BYTES as usize).await;
@@ -235,6 +255,13 @@ async fn origin_handle(
         ]});
         return origin_full(200, body.to_string());
     }
+    // The same install for the release that carries its own subtitles: it has English and nothing else.
+    if path.starts_with("/subs/subtitles/movie/tt0000015/") {
+        let body = serde_json::json!({"subtitles": [
+            {"id": "1", "url": format!("http://{addr}/subs/subtitle/1.srt?lang=eng"), "lang": "eng"}
+        ]});
+        return origin_full(200, body.to_string());
+    }
     if path == "/subs/subtitle/1.vtt" {
         return origin_full(200, "WEBVTT\n\n00:00:01.000 --> 00:00:02.500\nHello\n");
     }
@@ -346,6 +373,7 @@ async fn origin_handle(
             "tt0000009" => "slow/h264.mkv",
             "tt0000011" => "av1.mkv",
             "tt0000013" => "surround.mkv",
+            "tt0000015" => "subs.mkv",
             "tt0000004:1:2" if path.contains("/stream/series/") => "h264.mkv",
             _ => return origin_full(200, r#"{"streams":[]}"#),
         };
@@ -795,6 +823,7 @@ async fn the_releases_list_says_how_each_plays_for_the_player_that_asked() {
         dolby_vision_record_mismatch: false,
         dolby_vision_recordless: true,
         audio: Vec::new(),
+        subtitles: Vec::new(),
         keyframes: Vec::new(),
     };
     state.known().put("tt0000006/dv5.mkv".into(), &recordless);
@@ -1500,6 +1529,147 @@ async fn a_subtitle_that_failed_once_is_tried_again() {
     assert_kept_for_session(&found, j["expiresAt"].as_u64().unwrap(), "sub0.vtt");
     assert!(call(&state, "GET", &vtt, None, "").await.text().contains("Hello"));
     assert_eq!((FLAKY_LISTS.load(Relaxed), FLAKY_SUBTITLES.load(Relaxed)), (2, 2), "kept once found");
+    state.end_all("test").await;
+}
+
+/// A release that carries its own text subtitles offers them: a language den-subtitles has nothing in is the release's
+/// track, cut per video segment; one den-subtitles has stays its one document; and the release's other languages are
+/// offered with no den-subtitles or language named at all. Forced tracks are never a rendition.
+#[tokio::test]
+async fn a_release_offers_its_own_subtitles_where_den_subtitles_has_none() {
+    let origin = origin().await;
+    let state = test_state(&origin, 2, Duration::from_secs(600));
+    let cookie = login(&state, "phone-key").await;
+    let body =
+        format!(r#"{{"imdb":"tt0000015","subtitles":"{origin}/subs","subtitleLanguages":["en","fi"]}}"#);
+    let r = call(&state, "POST", "/remux/session", Some(&cookie), &body).await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let j = r.json();
+    assert_eq!(j["release"]["filename"], "subs.mkv");
+    assert_eq!(
+        j["subtitles"],
+        serde_json::json!([{"language": "en", "name": "English"}, {"language": "fi", "name": "Finnish"}]),
+        "the forced Swedish track is no rendition"
+    );
+    let base = j["playlist"].as_str().unwrap().trim_end_matches("master.m3u8").to_string();
+    let master = call(&state, "GET", &format!("{base}master.m3u8"), None, "").await.text();
+    assert!(master.contains("URI=\"sub0.m3u8\"") && master.contains("URI=\"sub1.m3u8\""), "{master}");
+    assert!(!master.contains("URI=\"sub2.m3u8\""), "{master}");
+    let en = call(&state, "GET", &format!("{base}sub0.m3u8"), None, "").await.text();
+    assert!(en.contains("\nsub0.vtt\n") && !en.contains("sub0_0.vtt"), "den-subtitles has English: {en}");
+    let fi = call(&state, "GET", &format!("{base}sub1.m3u8"), None, "").await;
+    assert_kept_for_session(&fi, j["expiresAt"].as_u64().unwrap(), "sub1.m3u8");
+    let media = call(&state, "GET", &format!("{base}media.m3u8"), None, "").await.text();
+    let fi = fi.text();
+    for i in 0..extinfs(&media).len() {
+        assert!(fi.contains(&format!("\nsub1_{i}.vtt\n")), "a segment for video segment {i}: {fi}");
+    }
+    assert!(!fi.contains("sub1.vtt"), "{fi}");
+    state.end_all("test").await;
+
+    // Nothing asked for, nothing to ask of: the release's own languages, in its order.
+    let r = call(&state, "POST", "/remux/session", Some(&cookie), r#"{"imdb":"tt0000015"}"#).await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    assert_eq!(
+        r.json()["subtitles"],
+        serde_json::json!([{"language": "en", "name": "English"}, {"language": "fi", "name": "Finnish"}])
+    );
+    let base = r.json()["playlist"].as_str().unwrap().trim_end_matches("master.m3u8").to_string();
+    let en = call(&state, "GET", &format!("{base}sub0.m3u8"), None, "").await.text();
+    assert!(en.contains("\nsub0_0.vtt\n"), "{en}");
+    // No den-subtitles behind it: the whole-film document is empty, as any language's with nothing to offer.
+    assert_eq!(call(&state, "GET", &format!("{base}sub0.vtt"), None, "").await.text(), crate::subs::EMPTY);
+    // A segment past the playlist's, and a rendition past the last, are not there.
+    let past = extinfs(&call(&state, "GET", &format!("{base}media.m3u8"), None, "").await.text()).len();
+    assert_eq!(
+        call(&state, "GET", &format!("{base}sub0_{past}.vtt"), None, "").await.status,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        call(&state, "GET", &format!("{base}sub2_0.vtt"), None, "").await.status,
+        StatusCode::NOT_FOUND
+    );
+    state.end_all("test").await;
+
+    // A release with no text tracks, and a player that names none: no renditions, as before.
+    let r = call(&state, "POST", "/remux/session", Some(&cookie), r#"{"imdb":"tt0000001"}"#).await;
+    assert_eq!(r.json()["subtitles"], serde_json::json!([]));
+    state.end_all("test").await;
+}
+
+/// The release's own subtitles come out of the same ffmpeg runs that copy its video, whatever order the player asks
+/// in: the first segment asked for starts a run mid-file, one behind it another from zero, and every subtitle segment
+/// then holds the cues showing in its video segment, over a cut included. Real ffmpeg, so `#[ignore]`d.
+#[tokio::test]
+#[ignore]
+async fn a_releases_own_subtitles_arrive_with_its_video() {
+    let origin = origin().await;
+    let state = test_state(&origin, 2, Duration::from_secs(600));
+    let cookie = login(&state, "phone-key").await;
+    let r = call(
+        &state,
+        "POST",
+        "/remux/session",
+        Some(&cookie),
+        r#"{"imdb":"tt0000015","subtitleLanguages":["fi"]}"#,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let j = r.json();
+    assert_eq!(
+        j["subtitles"],
+        serde_json::json!([{"language": "fi", "name": "Finnish"}, {"language": "en", "name": "English"}])
+    );
+    let base = j["playlist"].as_str().unwrap().trim_end_matches("master.m3u8").to_string();
+    let media = call(&state, "GET", &format!("{base}media.m3u8"), None, "").await.text();
+    let n = extinfs(&media).len();
+    assert!(n >= 5, "{media}");
+    let get = |file: String| {
+        let (state, base) = (state.clone(), base.clone());
+        async move { call(&state, "GET", &format!("{base}{file}"), None, "").await }
+    };
+    // Finnish is rendition 0, English 1. A window is the cues showing in it, on the film's timeline.
+    let window = |r: Reply| {
+        assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+        assert_eq!(r.headers["content-type"], "text/vtt; charset=utf-8");
+        assert!(
+            r.text().starts_with("WEBVTT\nX-TIMESTAMP-MAP=MPEGTS:0,LOCAL:00:00:00.000\n"),
+            "{}",
+            r.text()
+        );
+        r.text()
+    };
+
+    // A seek: the run starts at segment 3's keyframe (19.5 s), and its Finnish cue at 20 s arrives.
+    assert_eq!(get("init.mp4".into()).await.status, StatusCode::OK);
+    assert_eq!(get("seg3.m4s".into()).await.status, StatusCode::OK);
+    let w3 = window(get("sub0_3.vtt".into()).await);
+    assert!(w3.contains("Hyvää yötä") && !w3.contains("Moi"), "{w3}");
+    // Behind it: another run, from zero, brings the start of the film.
+    assert_eq!(get("seg0.m4s".into()).await.status, StatusCode::OK);
+    let (fi0, en0) = (window(get("sub0_0.vtt".into()).await), window(get("sub1_0.vtt".into()).await));
+    assert!(fi0.contains("Moi") && fi0.contains("kaikille"), "an ASS event, as WebVTT text: {fi0}");
+    assert!(en0.contains("Hello there") && !en0.contains("Inside"), "{en0}");
+    assert!(state.jobs_started.load(Relaxed) >= 2, "the seek restarted the run");
+
+    // The rest of the film, in order, on the last run: every segment's subtitles come with its video.
+    let mut all = Vec::new();
+    for i in 0..n {
+        assert_eq!(get(format!("seg{i}.m4s")).await.status, StatusCode::OK, "seg{i}");
+        all.push(window(get(format!("sub1_{i}.vtt")).await));
+        window(get(format!("sub0_{i}.vtt")).await);
+    }
+    // Segments run 0–8, 8–13, 13–19.5, 19.5–24, 24–30.
+    assert!(
+        all[1].contains("Inside the second segment") && all[1].contains("Over the cut at thirteen"),
+        "{}",
+        all[1]
+    );
+    assert!(all[2].contains("Over the cut at thirteen") && all[2].contains("After the seek"), "{}", all[2]);
+    assert!(all[4].contains("The end") && !all[4].contains("After the seek"), "{}", all[4]);
+    assert!(!all.concat().contains("främmande"), "a forced track is not offered");
+    let kept = get("sub1_2.vtt".into()).await;
+    assert_kept_for_session(&kept, j["expiresAt"].as_u64().unwrap(), "sub1_2.vtt");
     state.end_all("test").await;
 }
 

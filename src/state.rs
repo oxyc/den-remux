@@ -89,8 +89,11 @@ impl KnownReleases {
         if self.entries.len() >= KNOWN_MAX {
             self.entries.pop_front();
         }
-        // Only what a verdict reads: the keyframe index and the audio are the bulk.
-        self.entries.push_back((key, MediaInfo { keyframes: Vec::new(), audio: Vec::new(), ..info.clone() }));
+        // Only what a verdict reads: the keyframe index, the audio and the subtitles are the bulk.
+        self.entries.push_back((
+            key,
+            MediaInfo { keyframes: Vec::new(), audio: Vec::new(), subtitles: Vec::new(), ..info.clone() },
+        ));
     }
 
     pub fn get(&self, key: &str) -> Option<MediaInfo> {
@@ -393,6 +396,7 @@ mod tests {
             dolby_vision_record_mismatch: false,
             dolby_vision_recordless: false,
             audio: Vec::new(),
+            subtitles: Vec::new(),
             keyframes: vec![0.0],
         };
         (Resolved { url: url.into(), head: vec![7; 200_000], size: Some(1) }, info)
