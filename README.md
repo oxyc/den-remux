@@ -57,6 +57,8 @@ DELETE /remux/s/<sid>/<sig>             204; the session's URLs answer 410 from 
 GET    /health, /remux/health           200 {status} — ok, or degraded with a reason (Maintenance); the second is
                                         what a client probes under the /remux mount (den-spec routes-v1)
 GET    /metrics                         Prometheus text (bearer METRICS_TOKEN; 404 without it)
+POST   /remux/admin/kill                {owner: "grant:<gid>"} → {ended: n}; only with x-den-edge-secret (EDGE_SECRET),
+                                        else the same 404 as any unknown route
 anything else                           404 {"error":"not_found"}
 ```
 
@@ -321,6 +323,8 @@ Every variable is unprefixed; `.env.example` lists them with their defaults.
 | `TRUSTED_PROXIES` | — | Proxy IPs (comma-separated) whose `X-Forwarded-For` names the visitor, for the limit on logins and new sessions: `tailscale serve`'s host. |
 | `WEB_ORIGINS` | — | Pages on another origin that may log in and start sessions (comma-separated): the Den web app on its public name. Session files are readable from anywhere already. |
 | `METRICS_TOKEN` | — | Turns on `/metrics` behind `Authorization: Bearer <token>`; otherwise it is a 404. |
+| `EDGE_SECRET` | — | **Secret**, shared with den-edge (`REMUX_EDGE_SECRET`). With it, a request to `/remux/session` or `/remux/releases` carrying `x-den-edge-secret` and `x-den-owner: grant:<8 hex>` plays as that guest grant: its own cap (`GUEST_MAX_SESSIONS`), never a transcode, never counted against a host. It also turns on `POST /remux/admin/kill {"owner":"grant:<gid>"}` → `{"ended": n}`, which ends that grant's sessions. Unset, the headers are ignored and the admin route is a 404. |
+| `GUEST_MAX_SESSIONS` | `2` | Sessions one guest grant plays at once (1–8); past it, its oldest ends. |
 | `LOG_REQUESTS` | off | `1` writes `<METHOD> <path> <status> <ms>ms[ rid=<X-Request-Id>]` per response. |
 | `PORT` | `8095` | |
 

@@ -107,6 +107,21 @@ pub fn install_id(base: &str) -> String {
     format!("install:{}", hex(&sha256(base.as_bytes())[..8]))
 }
 
+/// Is `presented` the configured `EDGE_SECRET`? Constant-time; false when the feature is off.
+pub fn edge_secret_ok(configured: Option<&str>, presented: Option<&[u8]>) -> bool {
+    match (configured, presented) {
+        (Some(secret), Some(p)) => secret.as_bytes().ct_eq(p).into(),
+        _ => false,
+    }
+}
+
+/// Is `owner` a guest grant's owner, `grant:` and the grant's 8 lowercase hex characters?
+pub fn is_grant_owner(owner: &str) -> bool {
+    owner.strip_prefix("grant:").is_some_and(|gid| {
+        gid.len() == 8 && gid.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+    })
+}
+
 /// The browser `key` belongs to, if any. Every configured hash is compared, with no early exit, so
 /// the time taken does not say which one matched.
 pub fn browser_for_key(hashes: &[[u8; 32]], key: &str) -> Option<String> {

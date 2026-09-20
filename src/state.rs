@@ -289,6 +289,19 @@ impl AppState {
         }
     }
 
+    /// End every session `owner` has published, as a client's DELETE does; how many there were.
+    pub async fn end_owner(&self, owner: &str, why: &str) -> usize {
+        let sids: Vec<String> =
+            self.sessions().values().filter(|s| s.owner == owner).map(|s| s.sid.clone()).collect();
+        let mut ended = 0;
+        for sid in sids {
+            let Some(s) = self.sessions().remove(&sid) else { continue };
+            self.end_removed(s, why).await;
+            ended += 1;
+        }
+        ended
+    }
+
     pub async fn end_all(&self, why: &str) {
         let sids: Vec<String> = self.sessions().keys().cloned().collect();
         for sid in sids {

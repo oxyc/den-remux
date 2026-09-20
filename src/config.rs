@@ -3,7 +3,8 @@
 //! Env: PORT, SCOUT_ORIGINS, REMUX_SCOUT_KEY, SCOUT_INSTALL_URL, SUBTITLE_ORIGINS, ORIGIN_ALIASES, BROWSER_KEY_HASHES,
 //!      REMUX_URL_KEY,
 //!      MAX_SESSIONS, MAX_SESSIONS_PER_INSTALL, SESSION_IDLE_SECS, SCRATCH_DIR, SCRATCH_MAX_BYTES, FFMPEG_PATH,
-//!      MAX_TRANSCODES, VAAPI_DEVICE, TRUSTED_PROXIES, WEB_ORIGINS, METRICS_TOKEN, LOG_REQUESTS.
+//!      MAX_TRANSCODES, VAAPI_DEVICE, TRUSTED_PROXIES, WEB_ORIGINS, METRICS_TOKEN, LOG_REQUESTS,
+//!      EDGE_SECRET, GUEST_MAX_SESSIONS.
 
 use std::env;
 use std::path::PathBuf;
@@ -64,6 +65,11 @@ pub struct Config {
     pub metrics_token: Option<String>,
     /// `LOG_REQUESTS` — one stderr line per response when set (anything but empty or `0`).
     pub log_requests: bool,
+    /// `EDGE_SECRET` — the secret den-edge presents as `x-den-edge-secret` to name a guest grant's sessions
+    /// (`x-den-owner`) and to end them (`/remux/admin/kill`). Unset turns both off. Never logged.
+    pub edge_secret: Option<String>,
+    /// `GUEST_MAX_SESSIONS` — sessions one grant may play at once (default 2, at most 8); past it, its oldest ends.
+    pub guest_max_sessions: usize,
 }
 
 fn env_opt(key: &str) -> Option<String> {
@@ -219,6 +225,11 @@ impl Config {
             web_origins: parse_origins(&env_opt("WEB_ORIGINS").unwrap_or_default()),
             metrics_token: env_opt("METRICS_TOKEN"),
             log_requests: log_requests_on(env::var("LOG_REQUESTS").ok().as_deref()),
+            edge_secret: env_opt("EDGE_SECRET"),
+            guest_max_sessions: env_opt("GUEST_MAX_SESSIONS")
+                .and_then(|v| v.parse().ok())
+                .filter(|n| (1..=8).contains(n))
+                .unwrap_or(2),
         }
     }
 }

@@ -355,6 +355,9 @@ where
         "/remux/login" if parts.method == Method::POST => login(state, body).await,
         "/remux/session" if parts.method == Method::POST => create_session(state, parts, body).await,
         "/remux/releases" if parts.method == Method::POST => list_releases(state, parts, body).await,
+        "/remux/admin/kill" if parts.method == Method::POST && edge_authorized(state, &parts.headers) => {
+            admin_kill(state, body).await
+        }
         "/remux/login" | "/remux/session" | "/remux/releases" => method_not_allowed("POST"),
         _ => match path.strip_prefix("/remux/s/") {
             Some(rest) => session_route(state, parts, rest, body).await,
@@ -482,6 +485,62 @@ fn browser_of(state: &AppState, parts: &hyper::http::request::Parts) -> Option<S
     auth::cookie_browser(&state.cfg.url_key, &state.cfg.browser_key_hashes, Some(&cookie), unix_now())
 }
 
+/// Does the request carry den-edge's `x-den-edge-secret`? False when `EDGE_SECRET` is unset.
+fn edge_authorized(state: &AppState, headers: &hyper::HeaderMap) -> bool {
+    auth::edge_secret_ok(
+        state.cfg.edge_secret.as_deref(),
+        headers.get("x-den-edge-secret").map(|v| v.as_bytes()),
+    )
+}
+
+/// The grant owner den-edge names with `x-den-owner`, honoured only alongside a valid `x-den-edge-secret`.
+fn guest_owner(state: &AppState, headers: &hyper::HeaderMap) -> Option<String> {
+    if !edge_authorized(state, headers) {
+        return None;
+    }
+    let owner = headers.get("x-den-owner")?.to_str().ok()?;
+    auth::is_grant_owner(owner).then(|| owner.to_string())
+}
+
+/// Who a request plays as: a vouched-for guest grant naming a scout install, else a logged-in browser, else the
+/// scout install it names. `None` when it has neither.
+fn admission_of(
+    state: &AppState,
+    parts: &hyper::http::request::Parts,
+    browser: Option<String>,
+    scout: &Option<String>,
+) -> Option<session::Admission> {
+    match (guest_owner(state, &parts.headers), browser, scout) {
+        (Some(owner), _, Some(_)) => Some(session::Admission::Guest(owner)),
+        (_, Some(b), _) => Some(session::Admission::Browser(b)),
+        (_, None, Some(_)) => Some(session::Admission::Install),
+        _ => None,
+    }
+}
+
+/// `POST /remux/admin/kill`, with den-edge's secret: end every session of the grant named, as a client's DELETE
+/// would. Answers only to a valid secret, so without one the route does not exist.
+async fn admin_kill<B>(state: &Arc<AppState>, body: B) -> Response<Body>
+where
+    B: hyper::body::Body<Data = Bytes> + Send + 'static,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    #[derive(Deserialize)]
+    struct Kill {
+        owner: String,
+    }
+    let Some(req) = read_body(body)
+        .await
+        .and_then(|b| serde_json::from_slice::<Kill>(&b).ok())
+        .filter(|k| auth::is_grant_owner(&k.owner))
+    else {
+        return bad_request("Expected {\"owner\": \"grant:<8 hex>\"}.");
+    };
+    let ended = state.end_owner(&req.owner, "grant ended").await;
+    eprintln!("admin: ended {ended} session(s) of {}", req.owner);
+    httputil::json(StatusCode::OK, &serde_json::json!({ "ended": ended }), &[])
+}
+
 /// `POST /remux/releases`: what a session for the title could play, admitted as a session is — by the cookie, or
 /// the scout install named.
 async fn list_releases<B>(
@@ -514,10 +573,9 @@ where
     if req.video_codecs.len() > 8 || req.video_codecs.iter().any(|c| c.len() > 35) {
         return bad_request("videoCodecs is at most 8 short tags.");
     }
-    let admission = match (browser_of(state, parts), &req.scout) {
-        (Some(b), _) => session::Admission::Browser(b),
-        (None, Some(_)) => session::Admission::Install,
-        (None, None) => {
+    let admission = match admission_of(state, parts, browser_of(state, parts), &req.scout) {
+        Some(a) => a,
+        None => {
             return httputil::error(
                 StatusCode::UNAUTHORIZED,
                 "not_logged_in",
@@ -612,10 +670,9 @@ where
     }
     // A logged-in browser, or — with no cookie — whoever holds the scout install the request names: that
     // URL is the credential, as every addon's is. Without either there is nothing to play with.
-    let admission = match (browser, &req.scout) {
-        (Some(b), _) => session::Admission::Browser(b),
-        (None, Some(_)) => session::Admission::Install,
-        (None, None) => {
+    let admission = match admission_of(state, parts, browser, &req.scout) {
+        Some(a) => a,
+        None => {
             return httputil::error(
                 StatusCode::UNAUTHORIZED,
                 "not_logged_in",
