@@ -28,8 +28,13 @@ POST   /remux/session                   {imdb, season?, episode?, filename?, sco
                                         400 bad_request/bad_scout/bad_subtitles/bad_audio_track
                                         404 no_release/no_playable_release · 429 too_many_sessions/rate_limited
                                         502 scout_unavailable · 503 scout_unconfigured/transcode_unavailable
-POST   /remux/releases                  {imdb, season?, episode?, scout?} (a full scout install, or browser cookie/bearer)
-                                        → 200 {releases:[{label,filename,size}]}: what a session could play, in the
+POST   /remux/releases                  {imdb, season?, episode?, scout?, videoCodecs?, playable?} (a full scout install, or browser cookie/bearer)
+                                        → 200 {releases:[{label,filename,size,plays,why}]}: `plays` is "yes" | "convert" |
+                                        "no" for the player that sent `playable` (as /remux/session parses it) or
+                                        `videoCodecs`, by scout's attributes and by what opening a release has shown of
+                                        it (remembered in memory); `why` is a short reason, null for a yes. Without a
+                                        report every release is "yes". A session's `release.requested {filename, why}`
+                                        names the release it was asked for when it played another. What a session could play, in the
                                         order it would try them, for a player to name one as `filename`. No URLs
 GET    /remux/speed?bytes=<n>           200 application/octet-stream: n random bytes (2 MiB unnamed, 8 MiB at most),
                                         no-store, no credential; 400 for a count that isn't one · 429 rate_limited
@@ -108,7 +113,7 @@ itself is never logged. Brave on iOS sends Safari's User-Agent, so it reads as S
   An AV1 release is only ever copied — the box's UHD 630 has no AV1 decoder — so for a player that doesn't report
   it at the release's level, depth and HDR it is passed over, never converted: scout's `codec: "av1"` keeps it
   unopened, and the probe refuses one scout didn't name. A player sending no `playable` gets no AV1 at all, and
-  neither does `/remux/releases`, which carries no report. A release at another profile or at High tier plays
+  neither does `/remux/releases` without one. A release at another profile or at High tier plays
   nowhere: the web app asks about Main profile and Main tier only. The copy keeps its `av01` sample entry and
   `av1C`; the master names the AV1-ISOBMFF codec string — with its colour fields whenever the stream describes its
   colours, so HDR10 is `av01.0.13M.10.0.110.09.16.09.0` — and `VIDEO-RANGE=PQ` (or `HLG`) for HDR. The colours come
@@ -352,6 +357,15 @@ dependabot cannot bump it, so bump both lines by hand.
   transcoded its colours come out green and purple. A session skips it — the probe reads the profile — unless
   `playable.dolbyVision.p5` says the player shows profile 5 and it takes the release as it is: then it is copied,
   tagged `dvh1`.
+  **A profile 5 with no record.** Some releases (an Amazon WEB-DL, say) are profile 5 in the bitstream — every
+  frame carries its RPU — but the Matroska has no `dvcC`/`dvvC` and the HEVC VUI names no colours. For 10-bit HEVC
+  that names no transfer, the probe reads the first cued Cluster's first RPU (libdovi's profile guess: full-range base
+  layer, no residual is profile 5) and sets `dolby_vision_recordless`. For a player that shows profile 5 it is kept
+  like any other: the RPUs stay in, and ffmpeg, which writes a `dvcC` only from the source's side data, is
+  followed by a patch of the served `init.mp4` (`job::add_dovi_record`): `hvc1` becomes `dvh1` and a 24-byte `dvcC`
+  (profile 5, level 6, RPU present, no enhancement layer, compatibility 0) joins the `hvcC`, the sizes above it fixed;
+  a layout that is not a fragmented init is refused rather than patched. Everywhere else it is skipped, as a record
+  would be, and never converted.
 - **Bandwidth**: at home this is fine. Away from home every byte crosses the home **upload** link, so a
   remote session is bounded by it — a 4K remux will not fit. A player that sends `maxBitrate` gets a release that
   fits, or a 1080p or 720p transcode, or failing both the smallest copy; its measure is taken once, before the
