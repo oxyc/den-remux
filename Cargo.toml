@@ -31,7 +31,7 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 hmac = "0.12"
 sha2 = "0.10"
 subtle = "2"
-base64 = "0.22"
+base64 = "0.23"
 getrandom = "0.3"
 # Parse the first Dolby Vision RPU only for the narrowly gated malformed Profile 5 case. Keeping
 # this as the library (rather than duplicating Dolby's bitstream parser) uses its validated profile verdict.
