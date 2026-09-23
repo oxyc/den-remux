@@ -177,9 +177,27 @@ impl Unplayable {
     }
 }
 
+/// How long a read from a release's host may sit with no byte arriving, while it is being read.
+const SOURCE_READ_IDLE: Duration = Duration::from_secs(30);
+
+/// The client that reads releases: the probe's ranged reads, and a session's ffmpeg through its door (`source`), on
+/// one pool, so ffmpeg's reads go over the connection the probe opened. No total timeout: a read of the film runs as
+/// long as ffmpeg takes it, paused whenever the player is far enough ahead, so only a connection that won't open and
+/// a read that stops arriving — timed only while it is being read — end one.
+pub fn source_client(connect: Duration, read_idle: Duration) -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(connect)
+        .read_timeout(read_idle)
+        .user_agent(concat!("den-remux/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .expect("reqwest client")
+}
+
 pub struct AppState {
     pub cfg: Config,
     pub http: reqwest::Client,
+    /// Reads of the releases themselves (`source_client`).
+    pub source_http: reqwest::Client,
     /// For requests to scout: follows no redirect, so the service key cannot be carried off scout's
     /// origin (`scout::resolve` follows them by hand).
     pub scout_http: reqwest::Client,
@@ -209,6 +227,8 @@ pub struct AppState {
     pub transcode_ok: AtomicBool,
     /// Sessions transcoding now, against `MAX_TRANSCODES`.
     pub transcodes: Arc<AtomicUsize>,
+    /// Each session's loopback door to its release, which its ffmpeg reads through (`source`).
+    pub doors: crate::source::Doors,
 }
 
 /// A session replacing another of the same owner mid-film, which plays on until this one has started.
@@ -283,6 +303,7 @@ impl AppState {
         Arc::new(AppState {
             cfg,
             http: client(reqwest::redirect::Policy::default()),
+            source_http: source_client(Duration::from_secs(10), SOURCE_READ_IDLE),
             scout_http: client(reqwest::redirect::Policy::none()),
             sessions: Mutex::new(HashMap::new()),
             tombstones: Mutex::new(HashMap::new()),
@@ -300,6 +321,7 @@ impl AppState {
             scratch_ok: AtomicBool::new(false),
             transcode_ok: AtomicBool::new(false),
             transcodes: Arc::new(AtomicUsize::new(0)),
+            doors: Default::default(),
         })
     }
 
