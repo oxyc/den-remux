@@ -21,7 +21,7 @@ POST   /remux/login                     {key} → 204 + Set-Cookie + X-Den-Brows
 POST   /remux/session                   {imdb, season?, episode?, filename?, scout?, audio?, audioTrack?,
                                          subtitles?, subtitleLanguages?, videoCodecs?, playable?, startAt?, maxBitrate?, player?} (a full scout install,
                                          or browser cookie/bearer) → 201
-                                        {sid, playlist, release:{label,filename,size}, duration, expiresAt,
+                                        {sid, playlist, release:{label,filename,size}, duration, prebuffer, expiresAt,
                                          video:{codec: h264|hevc|av1|vp9, transcoded}, audioTrack, audioChannels,
                                          audioTracks:[{language,name,channels,commentary}], subtitles}
                                         401 not_logged_in · 403 scout_refused
@@ -148,13 +148,25 @@ itself is never logged. Brave on iOS sends Safari's User-Agent, so it reads as S
   its frame rate (60 fps where that isn't known). Profile 2 with a PQ or HLG transfer is HDR: `VIDEO-RANGE=PQ|HLG`.
 - **A remote player's link.** Away from home every byte crosses the home upload, so a player that reached den-remux
   off the LAN times its link with `GET /remux/speed` and sends `maxBitrate`, in bits a second (the web app sends 70 %
-  of what it measured). A release that plays as it is but whose average bitrate — its size × 8 over its duration —
-  is above it is kept aside while one that fits is looked for, in rank order as before. With none that fits, a
+  of what it measured). What a copy needs of that link is judged on the stretch of the film that costs most, not
+  its average: an encode at a constant quality can open on a cheap minute and then run at three times its average
+  for a scene, and a link that carries the average starves there. Each segment's bytes come from the index the
+  probe already reads — Matroska's Cues name the byte position of every keyframe's cluster, an MP4's `stsz` the
+  size of every video sample — scaled to what the session sends: the video and the one audio track it plays, as
+  copied or at the AAC encoder's rate, where the file says how big its tracks are (an MP4's sample tables, the
+  `NUMBER_OF_BYTES` statistics tags mkvmerge writes), else the whole file. A leaky bucket over them, from the segment
+  the player starts at, gives the least rate at which it waits at most 10 s before playing through without running
+  dry — with no more ahead than its player holds (`player`: `hls.js` two minutes or 150 MB, the cast page a minute or
+  50 MB, Safari and anything unnamed thirty seconds), so every stretch of the film must come in within that lead plus
+  its own length. A file with no such index is taken to need its average and half again, and the log says so. A release that plays
+  as it is but needs more than the link is kept aside while one that fits is looked for, in rank order as before.
+  The session's answer carries `prebuffer`: the seconds the player should buffer, on its link, before it starts.
+  With none that fits, a
   transcode is taken next: of a release that plays only converted, else of an HEVC one that plays as it is, where the
   preset comes in under it. The preset is 1080p at 8 Mbit/s where `maxBitrate` carries that and 5.1 audio, else 720p
   at 3 Mbit/s (4.5 max) — two and no more, since a transcode holds the box's one GPU slot for the film, and below 720p
-  a remote player does better with the smallest release as it is. With the GPU busy or nothing to convert, that
-  smallest copy plays: a stall now and then beats nothing. A named `filename` is weighed alone, the same way. Without
+  a remote player does better with the release that needs least as it is. With the GPU busy or nothing to convert,
+  that copy plays: a stall now and then beats nothing. A named `filename` is weighed alone, the same way. Without
   `maxBitrate` nothing changes. The session's log line names the link.
 - **Resume.** `startAt` is the second the player starts at. The media playlist names it (`EXT-X-START`, so
   Safari's native player starts there), and the first job starts a segment before it rather than at zero, so a

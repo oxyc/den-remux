@@ -132,6 +132,16 @@ pub enum AudioOut {
 }
 
 impl AudioOut {
+    /// The AAC encoder's bits a second: 64 kbit/s a channel. `None` for a copy, whose rate is the track's own.
+    pub fn aac_bitrate(self) -> Option<u64> {
+        match self {
+            AudioOut::Copy => None,
+            AudioOut::Stereo => Some(192_000),
+            AudioOut::Surround => Some(384_000),
+            AudioOut::Surround71 => Some(512_000),
+        }
+    }
+
     /// The channels the session's audio carries, from the source track's.
     pub fn channels(self, source: u32) -> u32 {
         match self {
@@ -233,14 +243,18 @@ pub fn args(spec: &Spec<'_>, ca_file: Option<&str>) -> Vec<String> {
             a.extend(s(&["-force_key_frames", "source", "-g", "1000"]));
         }
     }
-    match spec.audio_out {
-        // No encoder priming to account for: the packets keep the source's timestamps, as the copied video's do.
-        AudioOut::Copy => a.extend(s(&["-c:a", "copy"])),
-        AudioOut::Stereo => a.extend(s(&["-c:a", "aac", "-ac", "2", "-b:a", "192k"])),
-        // 64 kbit/s a channel, as the stereo track has.
-        AudioOut::Surround => a.extend(s(&["-c:a", "aac", "-ac", "6", "-b:a", "384k"])),
-        // 64 kbit/s a channel, as 5.1 has.
-        AudioOut::Surround71 => a.extend(s(&["-c:a", "aac", "-ac", "8", "-b:a", "512k"])),
+    // No encoder priming to account for with a copy: the packets keep the source's timestamps, as the copied video's do.
+    let channels = match spec.audio_out {
+        AudioOut::Copy => None,
+        AudioOut::Stereo => Some("2"),
+        AudioOut::Surround => Some("6"),
+        AudioOut::Surround71 => Some("8"),
+    };
+    match (channels, spec.audio_out.aac_bitrate()) {
+        (Some(ac), Some(rate)) => {
+            a.extend(s(&["-c:a", "aac", "-ac", ac, "-b:a", &format!("{}k", rate / 1000)]));
+        }
+        _ => a.extend(s(&["-c:a", "copy"])),
     }
     a.extend(s(&["-threads", "1", "-filter_threads", "1"]));
     a.extend(s(&["-max_muxing_queue_size", "1024", "-avoid_negative_ts", "disabled"]));

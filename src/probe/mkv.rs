@@ -19,6 +19,14 @@ const DURATION: u32 = 0x4489;
 const TRACKS: u32 = 0x1654AE6B;
 const TRACK_ENTRY: u32 = 0xAE;
 const TRACK_NUMBER: u32 = 0xD7;
+const TRACK_UID: u32 = 0x73C5;
+const TAGS: u32 = 0x1254C367;
+const TAG: u32 = 0x7373;
+const TARGETS: u32 = 0x63C0;
+const TAG_TRACK_UID: u32 = 0x63C5;
+const SIMPLE_TAG: u32 = 0x67C8;
+const TAG_NAME: u32 = 0x45A3;
+const TAG_STRING: u32 = 0x4487;
 const TRACK_TYPE: u32 = 0x83;
 const CODEC_ID: u32 = 0x86;
 const CODEC_PRIVATE: u32 = 0x63A2;
@@ -122,6 +130,7 @@ fn string(b: &[u8]) -> String {
 #[derive(Default)]
 struct Track {
     number: u64,
+    uid: u64,
     kind: u64,
     codec_id: String,
     private: Vec<u8>,
@@ -155,6 +164,7 @@ fn parse_tracks(b: &[u8]) -> Vec<Track> {
             for (id, v) in children(entry) {
                 match id {
                     TRACK_NUMBER => t.number = uint(v),
+                    TRACK_UID => t.uid = uint(v),
                     TRACK_TYPE => t.kind = uint(v),
                     CODEC_ID => t.codec_id = string(v),
                     CODEC_PRIVATE => t.private = v.to_vec(),
@@ -193,6 +203,26 @@ fn parse_tracks(b: &[u8]) -> Vec<Track> {
             t
         })
         .collect()
+}
+
+/// Each track's bytes over the file, by its TrackUID: the `NUMBER_OF_BYTES` statistics tag mkvmerge writes for every
+/// track (some tools name it with a language after it, `NUMBER_OF_BYTES-eng`).
+fn parse_track_bytes(tags: &[u8]) -> std::collections::HashMap<u64, u64> {
+    let mut out = std::collections::HashMap::new();
+    for (_, tag) in children(tags).filter(|(id, _)| *id == TAG) {
+        let uids: Vec<u64> = child(tag, TARGETS)
+            .map(|t| children(t).filter(|(id, _)| *id == TAG_TRACK_UID).map(|(_, v)| uint(v)).collect())
+            .unwrap_or_default();
+        let bytes = children(tag).filter(|(id, _)| *id == SIMPLE_TAG).find_map(|(_, simple)| {
+            let name = string(child(simple, TAG_NAME)?);
+            let is_bytes = name == "NUMBER_OF_BYTES" || name.starts_with("NUMBER_OF_BYTES-");
+            is_bytes.then(|| string(child(simple, TAG_STRING)?).parse::<u64>().ok()).flatten()
+        });
+        if let (Some(bytes), [uid]) = (bytes, uids.as_slice()) {
+            out.insert(*uid, bytes);
+        }
+    }
+    out
 }
 
 /// What a track's Colour element says.
@@ -405,7 +435,7 @@ pub async fn probe(src: &Source<'_>, head: &[u8]) -> Result<MediaInfo, ProbeErro
     }
     let seg_start = (pos + hl) as u64;
 
-    let (mut info, mut tracks, mut cues) = (None, None, None);
+    let (mut info, mut tracks, mut cues, mut tags) = (None, None, None, None);
     let mut seeks: Vec<(u32, u64)> = Vec::new();
     let mut p = seg_start as usize;
     while let Some((id, size, hl)) = head.get(p..).and_then(header) {
@@ -422,10 +452,22 @@ pub async fn probe(src: &Source<'_>, head: &[u8]) -> Result<MediaInfo, ProbeErro
             INFO => info = Some(body.to_vec()),
             TRACKS => tracks = Some(body.to_vec()),
             CUES => cues = Some(body.to_vec()),
+            TAGS => tags = Some(body.to_vec()),
             _ => {}
         }
         p = end;
     }
+    // The tags carry each track's size (`parse_track_bytes`), which the rest of the probe does without: a read of them
+    // that fails leaves the sizes unknown, and costs nothing else.
+    let fetch_tags = |at: Option<u64>| async move {
+        match at {
+            Some(rel) => fetch(src, seg_start + rel, TAGS)
+                .await
+                .inspect_err(|e| eprintln!("probe: the Tags could not be read: {e}"))
+                .ok(),
+            None => None,
+        }
+    };
 
     let find = |seeks: &[(u32, u64)], id: u32| seeks.iter().find(|(i, _)| *i == id).map(|(_, p)| *p);
     if info.is_none() {
@@ -443,7 +485,11 @@ pub async fn probe(src: &Source<'_>, head: &[u8]) -> Result<MediaInfo, ProbeErro
     let mut followed: Vec<u64> = Vec::new();
     while cues.is_none() {
         if let Some(rel) = find(&seeks, CUES) {
-            cues = Some(fetch(src, seg_start + rel, CUES).await?);
+            // Beside the Cues, usually at the end of the file too: read at the same time, not a round trip later.
+            let tags_at = find(&seeks, TAGS).filter(|_| tags.is_none());
+            let (read_cues, read_tags) = tokio::join!(fetch(src, seg_start + rel, CUES), fetch_tags(tags_at));
+            cues = Some(read_cues?);
+            tags = tags.or(read_tags);
             break;
         }
         let next = seeks.iter().find(|(i, p)| *i == SEEK_HEAD && !followed.contains(p)).map(|(_, p)| *p);
@@ -456,8 +502,13 @@ pub async fn probe(src: &Source<'_>, head: &[u8]) -> Result<MediaInfo, ProbeErro
         }
     }
 
+    if tags.is_none() {
+        tags = fetch_tags(find(&seeks, TAGS)).await;
+    }
+    let track_bytes = tags.as_deref().map(parse_track_bytes).unwrap_or_default();
     let info = info.ok_or(ProbeError::Truncated("Info"))?;
     let tracks = parse_tracks(&tracks.ok_or(ProbeError::Truncated("Tracks"))?);
+    let bytes_of = |t: &Track| track_bytes.get(&t.uid).copied().filter(|_| t.uid != 0);
     let cues = cues.ok_or_else(|| ProbeError::Unsupported("no keyframe index (Cues)".into()))?;
 
     let scale = child(&info, TIMESTAMP_SCALE).map(uint).filter(|s| *s > 0).unwrap_or(1_000_000) as f64;
@@ -478,6 +529,12 @@ pub async fn probe(src: &Source<'_>, head: &[u8]) -> Result<MediaInfo, ProbeErro
     if keyframes.is_empty() {
         return Err(ProbeError::Unsupported("the Cues index no video keyframes".into()));
     }
+    let mut byte_index: Vec<(f64, u64)> = parsed_cues
+        .iter()
+        .filter_map(|c| Some((secs(c.time as f64), seg_start.checked_add(c.cluster)?)))
+        .collect();
+    byte_index.sort_by(|a, b| a.0.total_cmp(&b.0));
+    byte_index.dedup_by(|b, a| a.0 == b.0);
     let mut hdr = super::is_hdr(video.transfer, video.primaries, video.matrix);
     let mut hlg = video.transfer == 18;
     let mut hevc_colour = None;
@@ -589,6 +646,7 @@ pub async fn probe(src: &Source<'_>, head: &[u8]) -> Result<MediaInfo, ProbeErro
             // FlagCommentary is recent; most releases only say so in the track's title.
             commentary: t.commentary
                 || t.name.as_deref().is_some_and(|n| n.to_ascii_lowercase().contains("commentary")),
+            bytes: bytes_of(t),
         })
         .collect();
     let subtitles = tracks
@@ -618,6 +676,8 @@ pub async fn probe(src: &Source<'_>, head: &[u8]) -> Result<MediaInfo, ProbeErro
         subtitles,
         keyframes,
         closed_gops,
+        byte_index,
+        video_bytes: bytes_of(video),
     })
 }
 
@@ -651,6 +711,33 @@ mod tests {
         // pointer, not stop there thinking it found the Cues.
         let seek = [0x4D, 0xBB, 0x8B, 0x53, 0xAB, 0x84, 0x1C, 0x53, 0xBB, 0x6B, 0x53, 0xAC, 0x81, 0x40];
         assert_eq!(parse_seek_head(&seek), vec![(CUES, 0x40)]);
+    }
+
+    #[test]
+    fn each_tracks_bytes_come_from_mkvmerges_statistics_tags() {
+        let el = |id: &[u8], body: &[u8]| [id, &[0x80 | body.len() as u8], body].concat();
+        let simple = |name: &str, value: &str| {
+            el(
+                &[0x67, 0xC8],
+                &[el(&[0x45, 0xA3], name.as_bytes()), el(&[0x44, 0x87], value.as_bytes())].concat(),
+            )
+        };
+        let tag = |uid: u8, stats: &[Vec<u8>]| {
+            el(&[0x73, 0x73], &[el(&[0x63, 0xC0], &el(&[0x63, 0xC5], &[uid])), stats.concat()].concat())
+        };
+        let tags = [
+            tag(1, &[simple("BPS", "5000000"), simple("NUMBER_OF_BYTES", "3200000000")]),
+            tag(2, &[simple("NUMBER_OF_BYTES-eng", "410000000")]),
+            tag(3, &[simple("BPS", "640000")]),
+            // A tag for the whole file, not a track: no TagTrackUID.
+            el(&[0x73, 0x73], &[el(&[0x63, 0xC0], &[]), simple("NUMBER_OF_BYTES", "9")].concat()),
+        ]
+        .concat();
+        let bytes = parse_track_bytes(&tags);
+        assert_eq!(bytes.get(&1), Some(&3_200_000_000));
+        assert_eq!(bytes.get(&2), Some(&410_000_000), "the language-suffixed name some tools write");
+        assert_eq!(bytes.get(&3), None, "a bitrate alone is not a size");
+        assert_eq!(bytes.len(), 2);
     }
 
     #[test]

@@ -278,6 +278,44 @@ fn leading_pictures(stbl: &[u8]) -> Option<bool> {
     Some(false)
 }
 
+/// The video bytes before each sync sample, in `stss` order — `keyframe_ticks`'s — from `stsz`. `None` without an
+/// `stsz` (a compact `stz2`, which nothing writes for video) or with one that doesn't cover the sync samples.
+fn sync_sample_bytes(stbl: &[u8]) -> Option<Vec<u64>> {
+    let stsz = child(stbl, b"stsz")?;
+    let (fixed, count) = (u32_at(stsz, 4)? as u64, u32_at(stsz, 8)? as u64);
+    if count > MAX_SAMPLES || (fixed == 0 && stsz.len() < 12 + count as usize * 4) {
+        return None;
+    }
+    let size = |sample: u64| {
+        if fixed > 0 {
+            Some(fixed)
+        } else {
+            u32_at(stsz, 12 + (sample as usize - 1) * 4).map(u64::from)
+        }
+    };
+    let sync = child(stbl, b"stss");
+    let n = match sync {
+        Some(b) => u32_at(b, 4)? as usize,
+        None => count as usize,
+    };
+    let (mut out, mut before, mut next) = (Vec::with_capacity(n.min(MAX_KEYFRAMES)), 0u64, 1u64);
+    for i in 0..n.min(MAX_KEYFRAMES) {
+        let sample = match sync {
+            Some(b) => u32_at(b, 8 + i * 4)? as u64,
+            None => i as u64 + 1,
+        };
+        if sample < next || sample > count {
+            return None;
+        }
+        while next < sample {
+            before += size(next)?;
+            next += 1;
+        }
+        out.push(before);
+    }
+    Some(out)
+}
+
 fn parse_moov(moov: &[u8]) -> Result<MediaInfo, ProbeError> {
     let mvhd = child(moov, b"mvhd").ok_or(ProbeError::Truncated("mvhd"))?;
     let (movie_ts, movie_dur) = if mvhd.first() == Some(&1) {
@@ -346,6 +384,12 @@ fn parse_moov(moov: &[u8]) -> Result<MediaInfo, ProbeError> {
         .into_iter()
         .map(|t| t as f64 / ts + offset)
         .collect();
+    let mut byte_index: Vec<(f64, u64)> = sync_sample_bytes(video.stbl)
+        .filter(|b| b.len() == keyframes.len())
+        .map(|b| keyframes.iter().copied().zip(b).collect())
+        .unwrap_or_default();
+    byte_index.sort_by(|a, b| a.0.total_cmp(&b.0));
+    byte_index.dedup_by(|b, a| a.0 == b.0);
     keyframes.sort_by(f64::total_cmp);
     keyframes.dedup();
     if keyframes.is_empty() {
@@ -362,6 +406,7 @@ fn parse_moov(moov: &[u8]) -> Result<MediaInfo, ProbeError> {
             name: None,
             default: true,
             commentary: false,
+            bytes: track_bytes(t.stbl),
         })
         .collect();
     // ffmpeg's subtitle streams: the text handlers, and closed captions, which it counts and this cannot convert.
@@ -404,7 +449,23 @@ fn parse_moov(moov: &[u8]) -> Result<MediaInfo, ProbeError> {
         subtitles,
         keyframes,
         closed_gops,
+        byte_index,
+        video_bytes: track_bytes(video.stbl),
     })
+}
+
+/// A track's bytes: its `stsz` sample sizes summed. `None` without one that covers its samples.
+fn track_bytes(stbl: &[u8]) -> Option<u64> {
+    let stsz = child(stbl, b"stsz")?;
+    let (fixed, count) = (u32_at(stsz, 4)? as u64, u32_at(stsz, 8)? as u64);
+    if count > MAX_SAMPLES {
+        return None;
+    }
+    if fixed > 0 {
+        return Some(fixed * count);
+    }
+    let table = stsz.get(12..12usize.checked_add((count as usize).checked_mul(4)?)?)?;
+    Some(table.as_chunks::<4>().0.iter().map(|b| u32::from_be_bytes(*b) as u64).sum())
 }
 
 #[cfg(test)]

@@ -723,6 +723,7 @@ where
         start_at: req.start_at.unwrap_or(0.0),
         max_bitrate: req.max_bitrate,
         client: client::label(parts.headers.get(hyper::header::USER_AGENT), req.player.as_deref()),
+        player: req.player.as_deref(),
     };
     let public = public_session_request(state, parts);
     let created = session::create(state, admission, &want, public).await;
@@ -762,6 +763,9 @@ where
                     })),
                 },
                 "duration": s.info.duration,
+                // Seconds to buffer before playing, on the link the player named, so a copy then plays through
+                // without running dry; null where that isn't known.
+                "prebuffer": s.prebuffer.map(|p| (p * 10.0).ceil() / 10.0),
                 "expiresAt": s.exp,
                 "audioTrack": s.audio,
                 // The channels the session's audio carries, beside the track's own in `audioTracks`: fewer is a

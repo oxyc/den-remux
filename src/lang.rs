@@ -102,6 +102,7 @@ mod tests {
             name: None,
             default,
             commentary,
+            bytes: None,
         }
     }
 

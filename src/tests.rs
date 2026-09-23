@@ -60,7 +60,16 @@ async fn matroska_cues_match_ffprobes_keyframes() {
         assert_eq!(langs, [Some("eng"), Some("swe")]);
         assert_eq!(info.audio[0].codec, "A_AC3");
         assert_eq!(info.audio[1].channels, 1);
+        assert_byte_index(&info, bytes.len());
     }
+}
+
+/// A byte index with an entry for every keyframe, going forward through the file as its keyframes do.
+fn assert_byte_index(info: &probe::MediaInfo, file: usize) {
+    let times: Vec<f64> = info.byte_index.iter().map(|(t, _)| *t).collect();
+    assert_eq!(times, info.keyframes);
+    assert!(info.byte_index.windows(2).all(|w| w[0].1 < w[1].1), "{:?}", info.byte_index);
+    assert!(info.byte_index.last().unwrap().1 < file as u64);
 }
 
 #[tokio::test]
@@ -141,8 +150,15 @@ async fn av1_matroska_and_mp4_give_the_same_av01_codec_string() {
 
 #[tokio::test]
 async fn mp4_sample_tables_match_ffprobes_keyframes() {
-    let info = probe_with_head(&fixture("h264.mp4"), crate::scout::HEAD_BYTES as usize).await;
+    let bytes = fixture("h264.mp4");
+    let info = probe_with_head(&bytes, crate::scout::HEAD_BYTES as usize).await;
     assert_keyframes(&info.keyframes, &H264_MP4_KF);
+    assert_byte_index(&info, bytes.len());
+    assert_eq!(info.byte_index[0].1, 0, "an MP4's index counts the video samples before each keyframe");
+    // Its tracks' sample sizes: all but the file's own boxes.
+    let (video, audio) = (info.video_bytes.unwrap(), info.audio[0].bytes.unwrap());
+    assert!(video > audio && audio > 0, "{video} {audio}");
+    assert!(video + audio < bytes.len() as u64 && video + audio > bytes.len() as u64 * 9 / 10);
     assert_eq!(info.container, "mp4");
     assert!((info.duration - 30.0).abs() < 0.05, "{}", info.duration);
     assert_eq!(info.audio[0].language.as_deref(), Some("fra"));
@@ -928,6 +944,8 @@ async fn the_releases_list_says_how_each_plays_for_the_player_that_asked() {
         subtitles: Vec::new(),
         keyframes: Vec::new(),
         closed_gops: true,
+        byte_index: Vec::new(),
+        video_bytes: None,
     };
     state.known().put("tt0000006/dv5.mkv".into(), &recordless);
     let (dv5, _) = ask(chrome).await;
@@ -2100,8 +2118,8 @@ async fn hevc_for_a_player_without_it_takes_the_one_transcode() {
     state.end_all("test").await;
 }
 
-/// With `maxBitrate` a release is copied only where its average bitrate fits: h264.mkv (217 kbit/s, ranked first)
-/// gives way to hevc.mkv (165). With nothing that fits, what plays only converted is transcoded at 720p; with the GPU
+/// With `maxBitrate` a release is copied only where what it needs of the link fits (`session::need`): h264.mkv
+/// (217 kbit/s on average, ranked first) gives way to hevc.mkv (165). With nothing that fits, what plays only converted is transcoded at 720p; with the GPU
 /// off, the copy that needs least plays rather than none — as it does when a 720p transcode would need more than the
 /// copy. Without `maxBitrate` nothing changes. Creating a session starts no ffmpeg.
 #[tokio::test]
