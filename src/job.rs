@@ -23,7 +23,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::io::AsyncReadExt;
 use tokio::process::{Child, Command};
@@ -402,8 +402,29 @@ pub struct Job {
     /// `Some(true)` once ffmpeg has exited cleanly (it reached the end), `Some(false)` on a failure.
     pub exit: Option<bool>,
     pub pid: u32,
+    /// The bytes of the GOPs it has written, counted as the session takes them.
+    pub bytes: u64,
+    began: Instant,
+    /// Since when it has been stopped, and how long it was stopped before that: time paused is no time pulling.
+    paused_since: Option<Instant>,
+    paused: Duration,
     child: Child,
     stderr: Option<tokio::task::JoinHandle<String>>,
+}
+
+/// A run's pull, as one log line: how much of the film it made, how fast while it ran, and why it is over.
+/// `running` and `paused` are seconds; `bytes` is what it wrote, which for a copy is about what it read — the video
+/// is copied as it is, and only the audio is re-encoded.
+fn pull_summary(id: u32, start: f64, media: f64, bytes: u64, running: f64, paused: f64, why: &str) -> String {
+    let mb = bytes as f64 / 1e6;
+    let rate = match running > 0.0 {
+        true => format!("{:.1}x realtime, {:.1} Mbit/s", media / running, bytes as f64 * 8.0 / 1e6 / running),
+        false => "not run".to_string(),
+    };
+    format!(
+        "job {id} from {start:.1}s: {media:.1}s of media, {mb:.1} MB in {running:.1}s running ({rate}), \
+         paused {paused:.0}s, {why}"
+    )
 }
 
 impl Job {
@@ -450,9 +471,21 @@ impl Job {
             stopped: false,
             exit: None,
             pid,
+            bytes: 0,
+            began: Instant::now(),
+            paused_since: None,
+            paused: Duration::ZERO,
             child,
             stderr,
         })
+    }
+
+    /// The run's pull so far (`pull_summary`), ending for `why`.
+    pub fn pull_line(&self, why: &str) -> String {
+        let paused = self.paused + self.paused_since.map_or(Duration::ZERO, |t| t.elapsed());
+        let running = self.began.elapsed().saturating_sub(paused);
+        let media = self.next_start - self.start;
+        pull_summary(self.id, self.start, media, self.bytes, running.as_secs_f64(), paused.as_secs_f64(), why)
     }
 
     /// Has ffmpeg exited? Reaps it if so.
@@ -471,6 +504,7 @@ impl Job {
         if self.exit.is_none() && !self.stopped {
             signal_group(self.pid, libc::SIGSTOP);
             self.stopped = true;
+            self.paused_since = Some(Instant::now());
         }
     }
 
@@ -478,6 +512,9 @@ impl Job {
         if self.exit.is_none() && self.stopped {
             signal_group(self.pid, libc::SIGCONT);
             self.stopped = false;
+            if let Some(since) = self.paused_since.take() {
+                self.paused += since.elapsed();
+            }
         }
     }
 
@@ -563,6 +600,19 @@ fn signal_group(pgid: u32, sig: libc::c_int) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_runs_pull_line_says_how_fast_it_made_the_film_while_it_ran() {
+        assert_eq!(
+            pull_summary(2, 75.3, 41.2, 23_100_000, 5.0, 60.4, "replaced"),
+            "job 2 from 75.3s: 41.2s of media, 23.1 MB in 5.0s running (8.2x realtime, 37.0 Mbit/s), \
+             paused 60s, replaced"
+        );
+        assert_eq!(
+            pull_summary(0, 0.0, 0.0, 0, 0.0, 0.0, "session ended"),
+            "job 0 from 0.0s: 0.0s of media, 0.0 MB in 0.0s running (not run), paused 0s, session ended"
+        );
+    }
 
     #[test]
     fn the_alignment_flags_are_all_there() {

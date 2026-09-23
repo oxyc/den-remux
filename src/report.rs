@@ -54,12 +54,19 @@ fn text(v: &Value, key: &str) -> Option<String> {
     v.get(key).and_then(Value::as_str).map(word).filter(|w| !w.is_empty())
 }
 
-/// One stall: `at=512s frozen 4200ms v=12.0 a=11.8`, what it says of itself. Its kind is `wait` (the player waited
-/// for data) or `frozen` (the clock ran with no new frame decoded); a null `ms` is a stall not yet over, `ms=?`.
+/// One stall: `at=512s frozen 4200ms v=12.0 a=11.8 idle=8200ms`, what it says of itself. Its kind is `wait` (the
+/// player waited for data) or `frozen` (the clock ran with no new frame decoded); a null `ms` is a stall not yet over,
+/// `ms=?`. `fetching` says a segment request was under way when it stopped — a slow delivery — and `idle=` that none
+/// was, and how long since the last segment arrived: a player that had stopped asking.
 fn stall(s: &Value) -> String {
     let ms = match s.get("ms") {
         Some(Value::Null) => Some("ms=?".to_string()),
         _ => num(s, "ms").map(|n| format!("{n:.0}ms")),
+    };
+    let requests = match s.get("loading").and_then(Value::as_bool) {
+        Some(true) => Some("fetching".to_string()),
+        Some(false) => Some(num(s, "idleMs").map_or("idle".to_string(), |n| format!("idle={n:.0}ms"))),
+        None => None,
     };
     let parts = [
         num(s, "at").map(|n| format!("at={n:.0}s")),
@@ -67,6 +74,7 @@ fn stall(s: &Value) -> String {
         ms,
         num(s, "videoAhead").map(|n| format!("v={n:.1}")),
         num(s, "audioAhead").map(|n| format!("a={n:.1}")),
+        requests,
     ];
     let out: Vec<String> = parts.into_iter().flatten().collect();
     if out.is_empty() {
@@ -103,6 +111,8 @@ pub fn stats_line(short: &str, s: &Value) -> String {
             num(f, "kbpsMedian").map(|n| format!("med={n:.0}k")),
             num(f, "kbpsP10").map(|n| format!("p10={n:.0}k")),
             num(f, "slowestMs").map(|n| format!("slowest={n:.0}ms")),
+            // Playing time with little video ahead and no segment asked for: the player idling, not the link.
+            num(f, "idleLowMs").filter(|n| *n > 0.0).map(|n| format!("idle_low={n:.0}ms")),
         ];
         for p in parts.into_iter().flatten() {
             line.push(' ');
@@ -244,6 +254,25 @@ mod tests {
         assert_eq!(failure(br#"{"code":3,"message":"DECODE","stats":{}}"#), Some((3, "DECODE".into())));
         assert_eq!(failure(br#"{"code":0,"message":"x"}"#), Some((0, "x".into())), "the old shape as it was");
         assert_eq!(failure(br#"{"code":0,"message":"playback stats (stall)","stats":{}}"#), None);
+    }
+
+    #[test]
+    fn a_stall_says_whether_a_segment_was_being_fetched_or_the_player_had_stopped_asking() {
+        let stats = serde_json::json!({
+            "fragments": {"count": 14, "idleLowMs": 12400},
+            "stallCount": 3,
+            "stalls": [
+                {"at": 90, "kind": "wait", "ms": 900, "videoAhead": 0, "audioAhead": 0, "loading": true, "idleMs": null},
+                {"at": 120, "kind": "frozen", "ms": 3000, "videoAhead": 1.2, "audioAhead": 4, "loading": false,
+                 "idleMs": 8200},
+                {"at": 150, "kind": "wait", "ms": 100, "loading": null, "idleMs": null},
+            ],
+        });
+        assert_eq!(
+            stats_line("AbCdEf", &stats),
+            "session AbCdEf: report ? ? frags=14 idle_low=12400ms stalls=3 (1 frozen) \
+             [at=90s wait 900ms v=0.0 a=0.0 fetching; at=120s frozen 3000ms v=1.2 a=4.0 idle=8200ms; at=150s wait 100ms]"
+        );
     }
 
     #[test]
