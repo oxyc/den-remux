@@ -21,7 +21,7 @@ COPY src ./src
 RUN touch src/main.rs && cargo build --release --locked   # `strip = true` in the release profile
 
 # ---- build: ffmpeg ---------------------------------------------------------
-FROM alpine:3.22 AS ffmpeg
+FROM alpine:3.24 AS ffmpeg
 RUN apk add --no-cache build-base nasm pkgconf openssl-dev zlib-dev libva-dev linux-headers
 # Checksummed: this source is compiled into the image and parses untrusted media, with nothing else
 # checking it. Dependabot has no ecosystem for it; bump both lines together.
@@ -82,7 +82,7 @@ RUN cargo test --locked -- --include-ignored
 # The libraries ffmpeg links, CA certificates (ffmpeg verifies the debrid's TLS against them), and on
 # amd64 — the box, with its UHD 630 — Intel's VAAPI driver. nonroot is 65532, the uid every den addon
 # image uses.
-FROM alpine:3.22
+FROM alpine:3.24
 RUN apk add --no-cache ca-certificates libssl3 zlib libva \
     && if [ "$(apk --print-arch)" = x86_64 ]; then apk add --no-cache intel-media-driver; fi \
     && adduser -D -H -u 65532 -s /sbin/nologin nonroot \
