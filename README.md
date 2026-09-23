@@ -152,9 +152,13 @@ itself is never logged. Brave on iOS sends Safari's User-Agent, so it reads as S
   its average: an encode at a constant quality can open on a cheap minute and then run at three times its average
   for a scene, and a link that carries the average starves there. Each segment's bytes come from the index the
   probe already reads — Matroska's Cues name the byte position of every keyframe's cluster, an MP4's `stsz` the
-  size of every video sample — scaled to the file's size, and a leaky bucket over them, from the segment the player
-  starts at, gives the least rate at which it waits at most 10 s before playing through without running dry. A
-  file with no such index is taken to need its average and half again, and the log says so. A release that plays
+  size of every video sample — scaled to what the session sends: the video and the one audio track it plays, as
+  copied or at the AAC encoder's rate, where the file says how big its tracks are (an MP4's sample tables, the
+  `NUMBER_OF_BYTES` statistics tags mkvmerge writes), else the whole file. A leaky bucket over them, from the segment
+  the player starts at, gives the least rate at which it waits at most 10 s before playing through without running
+  dry — with no more ahead than its player holds (`player`: `hls.js` two minutes or 150 MB, the cast page a minute or
+  50 MB, Safari and anything unnamed thirty seconds), so every stretch of the film must come in within that lead plus
+  its own length. A file with no such index is taken to need its average and half again, and the log says so. A release that plays
   as it is but needs more than the link is kept aside while one that fits is looked for, in rank order as before.
   The session's answer carries `prebuffer`: the seconds the player should buffer, on its link, before it starts.
   With none that fits, a

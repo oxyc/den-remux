@@ -723,6 +723,7 @@ where
         start_at: req.start_at.unwrap_or(0.0),
         max_bitrate: req.max_bitrate,
         client: client::label(parts.headers.get(hyper::header::USER_AGENT), req.player.as_deref()),
+        player: req.player.as_deref(),
     };
     let public = public_session_request(state, parts);
     let created = session::create(state, admission, &want, public).await;

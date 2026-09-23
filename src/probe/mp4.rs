@@ -406,6 +406,7 @@ fn parse_moov(moov: &[u8]) -> Result<MediaInfo, ProbeError> {
             name: None,
             default: true,
             commentary: false,
+            bytes: track_bytes(t.stbl),
         })
         .collect();
     // ffmpeg's subtitle streams: the text handlers, and closed captions, which it counts and this cannot convert.
@@ -449,7 +450,22 @@ fn parse_moov(moov: &[u8]) -> Result<MediaInfo, ProbeError> {
         keyframes,
         closed_gops,
         byte_index,
+        video_bytes: track_bytes(video.stbl),
     })
+}
+
+/// A track's bytes: its `stsz` sample sizes summed. `None` without one that covers its samples.
+fn track_bytes(stbl: &[u8]) -> Option<u64> {
+    let stsz = child(stbl, b"stsz")?;
+    let (fixed, count) = (u32_at(stsz, 4)? as u64, u32_at(stsz, 8)? as u64);
+    if count > MAX_SAMPLES {
+        return None;
+    }
+    if fixed > 0 {
+        return Some(fixed * count);
+    }
+    let table = stsz.get(12..12usize.checked_add((count as usize).checked_mul(4)?)?)?;
+    Some(table.as_chunks::<4>().0.iter().map(|b| u32::from_be_bytes(*b) as u64).sum())
 }
 
 #[cfg(test)]

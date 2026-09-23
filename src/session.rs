@@ -1087,6 +1087,8 @@ pub struct Want<'a> {
     pub max_bitrate: Option<u64>,
     /// Which browser asked, for the log (`client::label`): `Chrome 151 · macOS · hls.js`.
     pub client: String,
+    /// The HLS player it plays in (`native`, `hls.js`, `cast`): how far ahead it buffers (`buffer_of`).
+    pub player: Option<&'a str>,
 }
 
 /// What the player decodes, as its own tests found (`playable` in `POST /remux/session`): the highest level it
@@ -1457,32 +1459,84 @@ impl std::fmt::Display for Need {
     }
 }
 
-/// `Need` for a release of `size` bytes played from `start_at`; `None` when neither its index nor its size and
-/// duration say.
-pub(crate) fn need(info: &MediaInfo, size: Option<u64>, start_at: f64) -> Option<Need> {
+/// How far ahead a player buffers, by the one it named (`player` in `POST /remux/session`): hls.js as den-edge sets it
+/// up, two minutes or 150 MB; the cast page's hls.js, a minute or 50 MB, a receiver having little memory; Safari's
+/// own player, and any that didn't say, about thirty seconds.
+pub(crate) fn buffer_of(player: Option<&str>) -> playlist::Buffer {
+    match player {
+        Some("hls.js") => playlist::Buffer { secs: 120.0, bytes: Some(150_000_000) },
+        Some("cast") => playlist::Buffer { secs: 60.0, bytes: Some(50_000_000) },
+        _ => playlist::Buffer { secs: 30.0, bytes: None },
+    }
+}
+
+/// What a session would deliver of a release, and to what: where the player starts, how far ahead it buffers, and the
+/// bytes it is sent — the video and the one audio track it plays (`delivered_bytes`), else the whole file.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Delivery {
+    pub start_at: f64,
+    pub buffer: playlist::Buffer,
+    pub bytes: Option<u64>,
+}
+
+impl Delivery {
+    /// A session of `want` on a release of `size` bytes: `start_at` as the session will take it, a start at or past
+    /// the end being a start from zero.
+    pub(crate) fn of(info: &MediaInfo, size: Option<u64>, want: &Want<'_>) -> Delivery {
+        Delivery {
+            start_at: effective_start(want.start_at, info.duration),
+            buffer: buffer_of(want.player),
+            bytes: delivered_bytes(info, want).or(size),
+        }
+    }
+}
+
+/// Where a session starts: `start_at`, or 0 for one at or past the end, which starts the title over.
+pub(crate) fn effective_start(start_at: f64, duration: f64) -> f64 {
+    Some(start_at).filter(|t| *t > 0.0 && *t < duration).unwrap_or(0.0)
+}
+
+/// The bytes a session sends of a release: its video, and the audio track `want` gets — as the track is where it is
+/// copied, at the AAC encoder's rate where it is converted. `None` where the file doesn't say how big its tracks are.
+/// The other audio tracks and the subtitles a Matroska file interleaves with them are never sent.
+fn delivered_bytes(info: &MediaInfo, want: &Want<'_>) -> Option<u64> {
+    let video = info.video_bytes?;
+    let n = match want.audio_track {
+        Some(n) if n < info.audio.len() => n,
+        _ => crate::lang::pick_audio(&info.audio, want.audio),
+    };
+    let track = info.audio.get(n)?;
+    let (_, out) = audio_plan(&track.codec, track.channels, want.playable);
+    let audio = match out.aac_bitrate() {
+        Some(rate) => (rate as f64 * info.duration / 8.0) as u64,
+        None => track.bytes?,
+    };
+    Some(video + audio)
+}
+
+/// `Need` for a release as `delivery` would send it; `None` when neither its index nor its size and duration say.
+pub(crate) fn need(info: &MediaInfo, delivery: &Delivery) -> Option<Need> {
     let segs = playlist::segments(&info.keyframes, info.duration, playlist::TARGET_SECS);
-    match playlist::segment_bytes(&segs, &info.byte_index, size) {
+    match playlist::segment_bytes(&segs, &info.byte_index, delivery.bytes) {
         Some(bytes) => {
-            let rate = playlist::needed_rate(&segs, &bytes, start_segment(&segs, start_at), MAX_PREBUFFER);
+            let from = start_segment(&segs, delivery.start_at);
+            let rate = playlist::needed_rate(&segs, &bytes, from, MAX_PREBUFFER, delivery.buffer);
             Some(Need { bitrate: rate as u64, indexed: true })
         }
-        None => average_bitrate(size, info.duration)
+        None => average_bitrate(delivery.bytes, info.duration)
             .map(|a| Need { bitrate: (a as f64 * NO_INDEX_HEADROOM) as u64, indexed: false }),
     }
 }
 
-/// How long a player on a `max_bitrate` link waits before a copy started at `start_at` plays through
-/// (`playlist::startup_delay`): what it can take as its pre-buffer target. `None` without a link or a byte index.
-pub(crate) fn prebuffer(
-    info: &MediaInfo,
-    size: Option<u64>,
-    start_at: f64,
-    max_bitrate: Option<u64>,
-) -> Option<f64> {
+/// How long a player on a `max_bitrate` link waits before a copy as `delivery` sends it plays through
+/// (`playlist::startup_delay`): what it can take as its pre-buffer target. `None` without a link or a byte index, and
+/// where no wait would do.
+pub(crate) fn prebuffer(info: &MediaInfo, delivery: &Delivery, max_bitrate: Option<u64>) -> Option<f64> {
     let rate = max_bitrate.filter(|r| *r > 0)? as f64;
     let segs = playlist::segments(&info.keyframes, info.duration, playlist::TARGET_SECS);
-    let bytes = playlist::segment_bytes(&segs, &info.byte_index, size)?;
-    Some(playlist::startup_delay(&segs, &bytes, start_segment(&segs, start_at), rate))
+    let bytes = playlist::segment_bytes(&segs, &info.byte_index, delivery.bytes)?;
+    let from = start_segment(&segs, delivery.start_at);
+    Some(playlist::startup_delay(&segs, &bytes, from, rate, delivery.buffer)).filter(|w| w.is_finite())
 }
 
 /// Whether a copy of the release needs more than the player's `maxBitrate`. Without one every release fits, and so does
@@ -1892,13 +1946,13 @@ pub async fn create(
                 Ok((r, info))
                     if over(
                         want.max_bitrate,
-                        need(&info, r.size.or(c.attributes.size_bytes), want.start_at),
+                        need(&info, &Delivery::of(&info, r.size.or(c.attributes.size_bytes), want)),
                     ) =>
                 {
                     eprintln!(
                         "session: {imdb} \"{}\" needs {} — more than the player's {} kbit/s",
                         c.attributes.label,
-                        need(&info, r.size.or(c.attributes.size_bytes), want.start_at)
+                        need(&info, &Delivery::of(&info, r.size.or(c.attributes.size_bytes), want))
                             .map_or_else(String::new, |n| n.to_string()),
                         want.max_bitrate.unwrap_or(0) / 1000
                     );
@@ -1928,7 +1982,8 @@ pub async fn create(
     };
     let preset = job::preset_for(want.max_bitrate);
     let bitrate = |t: &(&scout::Stream, (scout::Resolved, MediaInfo))| {
-        need(&t.1 .1, t.1 .0.size.or(t.0.attributes.size_bytes), want.start_at).map(|n| n.bitrate)
+        need(&t.1 .1, &Delivery::of(&t.1 .1, t.1 .0.size.or(t.0.attributes.size_bytes), want))
+            .map(|n| n.bitrate)
     };
     if chosen.is_none() {
         // Nothing plays as it is and fits: a conversion at the preset the link takes — of the first release that plays
@@ -2004,7 +2059,7 @@ pub async fn create(
     st.scratch_ok.store(true, Relaxed);
     let segments = playlist::segments(&info.keyframes, info.duration, playlist::TARGET_SECS);
     // A resume at or past the end starts the title over.
-    let start_at = Some(want.start_at).filter(|t| *t > 0.0 && *t < info.duration).unwrap_or(0.0);
+    let start_at = effective_start(want.start_at, info.duration);
     let first_segment = start_segment(&segments, start_at);
     let codecs = info.codecs.clone().unwrap_or_else(|| {
         // A file without a codec configuration record; name the commonest profile rather than none.
@@ -2066,7 +2121,7 @@ pub async fn create(
     let closed_gops = transcode.is_some() || info.closed_gops;
     let prebuffer = match transcode {
         Some(_) => None,
-        None => prebuffer(&info, size, start_at, want.max_bitrate),
+        None => prebuffer(&info, &Delivery::of(&info, size, want), want.max_bitrate),
     };
     let session = Arc::new(Session {
         prebuffer,
@@ -2244,6 +2299,7 @@ mod tests {
             keyframes: vec![0.0],
             closed_gops: true,
             byte_index: Vec::new(),
+            video_bytes: None,
         }
     }
 
@@ -2444,6 +2500,7 @@ mod tests {
             start_at: 0.0,
             max_bitrate: None,
             client: "test".into(),
+            player: None,
         };
         assert!(!no_picture(want.playable, true, &release), "the BT.2020 base layer has a picture");
     }
@@ -2640,24 +2697,109 @@ mod tests {
         (info, at)
     }
 
+    /// Delivering all of `size` bytes from `start_at` to a player that buffers as `player` does.
+    fn delivery(size: u64, start_at: f64, player: Option<&str>) -> Delivery {
+        Delivery { start_at, buffer: buffer_of(player), bytes: Some(size) }
+    }
+
     #[test]
     fn a_link_that_covers_the_average_but_not_the_heavy_stretch_is_refused() {
         let (info, size) = front_loaded();
         assert_eq!(average_bitrate(Some(size), info.duration), Some(2_500_000));
-        let from_start = need(&info, Some(size), 0.0).unwrap();
+        // hls.js holds two minutes and 150 MB: all of the heavy stretch. Everything to its end, 1320 Mbit, must be in by
+        // the time its last 6 s segment plays (234 s) plus the 10 s allowed: 1320 / 244.
+        let deep = delivery(size, 0.0, Some("hls.js"));
+        let from_start = need(&info, &deep).unwrap();
         assert!(from_start.indexed);
-        // Everything to the end of the heavy minutes, 1320 Mbit, must be in by the time their last 6 s segment plays
-        // (234 s) plus the 10 s allowed: 1320 / 244.
         assert!((5_400_000..5_420_000).contains(&from_start.bitrate), "{from_start:?}");
         assert!(over(Some(4_000_000), Some(from_start)), "4 Mbit/s carries the average, not the film");
         assert!(!over(Some(6_000_000), Some(from_start)));
-        let wait = prebuffer(&info, Some(size), 0.0, Some(6_000_000)).unwrap();
+        let wait = prebuffer(&info, &deep, Some(6_000_000)).unwrap();
         assert!((0.0..=MAX_PREBUFFER).contains(&wait), "{wait}");
-        assert!(prebuffer(&info, Some(size), 0.0, Some(4_000_000)).unwrap() > MAX_PREBUFFER);
+        // At 4 Mbit/s even two minutes ahead can't carry the 1200 Mbit stretch (it needs 5.1): no wait up front would do.
+        assert_eq!(prebuffer(&info, &deep, Some(4_000_000)), None);
+        assert!(prebuffer(&info, &deep, Some(5_300_000)).unwrap() > MAX_PREBUFFER);
         // Resumed at the heavy stretch, the cheap opening no longer builds a lead: 6 Mbit/s isn't enough there.
-        let resumed = need(&info, Some(size), 121.0).unwrap();
+        let resumed = need(&info, &delivery(size, 121.0, Some("hls.js"))).unwrap();
         assert!(resumed.bitrate > 9_000_000, "{resumed:?}");
         assert!(over(Some(6_000_000), Some(resumed)));
+    }
+
+    #[test]
+    fn a_player_that_holds_thirty_seconds_needs_the_heavy_stretch_carried_as_it_plays() {
+        let (info, size) = front_loaded();
+        // Safari's thirty seconds ahead: the stretch's 1200 Mbit come in 30 s plus the 114 s between its first and last
+        // segment's starts, whatever the cheap opening did.
+        let native = delivery(size, 0.0, Some("native"));
+        let held = need(&info, &native).unwrap();
+        assert!((8_300_000..8_350_000).contains(&held.bitrate), "{held:?}");
+        assert!(over(Some(6_000_000), Some(held)), "what carries it for hls.js starves Safari");
+        assert_eq!(prebuffer(&info, &native, Some(6_000_000)), None, "and no wait up front would do");
+        assert!(prebuffer(&info, &native, Some(9_000_000)).is_some_and(|w| w <= MAX_PREBUFFER));
+        assert_eq!(
+            buffer_of(None),
+            buffer_of(Some("native")),
+            "a player that says nothing is taken for the least"
+        );
+    }
+
+    #[test]
+    fn the_demand_is_what_the_session_sends_not_every_track_in_the_file() {
+        let (info, size) = front_loaded();
+        // Half the file is video; the rest, two 3 Mbit/s audio tracks.
+        let track = |bytes| crate::probe::AudioTrack {
+            codec: "A_EAC3".into(),
+            language: Some("eng".into()),
+            channels: 6,
+            name: None,
+            default: true,
+            commentary: false,
+            bytes: Some(bytes),
+        };
+        let info = crate::probe::MediaInfo {
+            video_bytes: Some(size / 2),
+            audio: vec![track(size / 4), track(size / 4)],
+            ..info
+        };
+        let want = |playable| Want { playable, player: Some("hls.js"), ..test_want() };
+        // Copied, the one track played: three quarters of the file.
+        let eac3 = Playable { eac3: true, ..Default::default() };
+        assert_eq!(Delivery::of(&info, Some(size), &want(Some(&eac3))).bytes, Some(size / 2 + size / 4));
+        // Converted to stereo AAC: the video and 192 kbit/s for 720 s.
+        assert_eq!(Delivery::of(&info, Some(size), &want(None)).bytes, Some(size / 2 + 17_280_000));
+        let whole = need(&info, &delivery(size, 0.0, Some("hls.js"))).unwrap().bitrate;
+        let sent = need(&info, &Delivery::of(&info, Some(size), &want(None))).unwrap().bitrate;
+        assert!(sent < whole * 6 / 10, "{sent} of {whole}");
+        // Where the file doesn't say how big its tracks are, the whole file stands in.
+        let untold = crate::probe::MediaInfo { video_bytes: None, ..info.clone() };
+        assert_eq!(Delivery::of(&untold, Some(size), &want(None)).bytes, Some(size));
+    }
+
+    #[test]
+    fn a_resume_past_the_end_is_weighed_from_the_start() {
+        let (info, size) = front_loaded();
+        let want_at = |start_at| Delivery::of(&info, Some(size), &Want { start_at, ..test_want() }).start_at;
+        assert_eq!(want_at(5_000.0), 0.0, "a start the session will make from zero");
+        assert_eq!(want_at(720.0), 0.0);
+        assert_eq!(want_at(121.0), 121.0);
+    }
+
+    fn test_want() -> Want<'static> {
+        Want {
+            id: "tt1",
+            filename: None,
+            scout: None,
+            audio: &[],
+            audio_track: None,
+            subtitles: None,
+            subtitle_languages: &[],
+            video_codecs: &[],
+            playable: None,
+            start_at: 0.0,
+            max_bitrate: None,
+            client: "test".into(),
+            player: None,
+        }
     }
 
     #[test]
@@ -2665,16 +2807,24 @@ mod tests {
         let plain = info(VideoCodec::H264, "avc1.640028", false);
         let plain = crate::probe::MediaInfo { duration: 30.0, ..plain };
         // 3.75 MB over 30 s is 1 Mbit/s.
-        let n = need(&plain, Some(3_750_000), 0.0).unwrap();
+        let n = need(&plain, &delivery(3_750_000, 0.0, None)).unwrap();
         assert_eq!(n, Need { bitrate: 1_500_000, indexed: false });
         assert!(n.to_string().contains("no byte index"), "the log says it is a guess: {n}");
         assert!(!over(None, Some(n)), "no maxBitrate: every release fits");
         assert!(!over(Some(1_500_000), Some(n)), "at the limit fits");
         assert!(over(Some(1_499_999), Some(n)));
-        assert_eq!(need(&plain, None, 0.0), None, "an unknown size says nothing");
+        let unknown = Delivery { bytes: None, ..delivery(0, 0.0, None) };
+        assert_eq!(need(&plain, &unknown), None, "an unknown size says nothing");
         assert!(!over(Some(1), None), "and nothing said fits");
-        assert_eq!(need(&crate::probe::MediaInfo { duration: 0.0, ..plain.clone() }, Some(1), 0.0), None);
-        assert_eq!(prebuffer(&plain, Some(3_750_000), 0.0, Some(1)), None, "no index, no pre-buffer");
+        assert_eq!(
+            need(&crate::probe::MediaInfo { duration: 0.0, ..plain.clone() }, &delivery(1, 0.0, None)),
+            None
+        );
+        assert_eq!(
+            prebuffer(&plain, &delivery(3_750_000, 0.0, None), Some(1)),
+            None,
+            "no index, no pre-buffer"
+        );
     }
 
     #[test]

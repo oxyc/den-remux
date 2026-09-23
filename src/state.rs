@@ -543,6 +543,7 @@ mod tests {
             keyframes: vec![0.0],
             closed_gops: true,
             byte_index: Vec::new(),
+            video_bytes: None,
         };
         (Resolved { url: url.into(), head: vec![7; 200_000], size: Some(1) }, info)
     }

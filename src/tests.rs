@@ -155,6 +155,10 @@ async fn mp4_sample_tables_match_ffprobes_keyframes() {
     assert_keyframes(&info.keyframes, &H264_MP4_KF);
     assert_byte_index(&info, bytes.len());
     assert_eq!(info.byte_index[0].1, 0, "an MP4's index counts the video samples before each keyframe");
+    // Its tracks' sample sizes: all but the file's own boxes.
+    let (video, audio) = (info.video_bytes.unwrap(), info.audio[0].bytes.unwrap());
+    assert!(video > audio && audio > 0, "{video} {audio}");
+    assert!(video + audio < bytes.len() as u64 && video + audio > bytes.len() as u64 * 9 / 10);
     assert_eq!(info.container, "mp4");
     assert!((info.duration - 30.0).abs() < 0.05, "{}", info.duration);
     assert_eq!(info.audio[0].language.as_deref(), Some("fra"));
@@ -941,6 +945,7 @@ async fn the_releases_list_says_how_each_plays_for_the_player_that_asked() {
         keyframes: Vec::new(),
         closed_gops: true,
         byte_index: Vec::new(),
+        video_bytes: None,
     };
     state.known().put("tt0000006/dv5.mkv".into(), &recordless);
     let (dv5, _) = ask(chrome).await;
