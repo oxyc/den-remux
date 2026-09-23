@@ -227,6 +227,57 @@ fn keyframe_ticks(stbl: &[u8], media_time: i64) -> Option<Vec<i64>> {
     Some(out)
 }
 
+/// How far past the second sync sample `leading_pictures` looks for one presented before it: a GOP is shorter.
+const LEADING_LOOKAHEAD: u64 = 512;
+
+/// Whether a picture decoded after the second sync sample, before the next, is presented before it — a leading
+/// picture, which only an open GOP has. The second, because a file's first keyframe is an IDR even where every
+/// later one opens a GOP. `None` where the tables don't say.
+fn leading_pictures(stbl: &[u8]) -> Option<bool> {
+    let (stts, total) = timing_runs(child(stbl, b"stts")?)?;
+    // No composition offsets: every picture is presented in decode order.
+    let Some(ctts) = child(stbl, b"ctts") else { return Some(false) };
+    let (ctts, count) = timing_runs(ctts)?;
+    let sync = child(stbl, b"stss");
+    let (first, next) = match sync.map(|b| (u32_at(b, 4), u32_at(b, 12), u32_at(b, 16))) {
+        // No stss: every sample is a sync sample.
+        None => return Some(false),
+        Some((Some(n), Some(second), third)) if n >= 2 => {
+            (second as u64, if n >= 3 { third? as u64 } else { total + 1 })
+        }
+        // One keyframe: no segment opens on a later one.
+        Some((Some(_), ..)) => return Some(false),
+        Some(_) => return None,
+    };
+    if count != total || first == 0 || first > total {
+        return None;
+    }
+    let (mut ti, mut t_start, mut ticks) = (0usize, 1u64, 0i64);
+    let (mut ci, mut c_start) = (0usize, 1u64);
+    let mut key = None;
+    for sample in first..next.min(first + LEADING_LOOKAHEAD).min(total + 1) {
+        while sample >= t_start + u32_at(stts, ti)? as u64 {
+            let n = u32_at(stts, ti)? as u64;
+            ticks = ticks.checked_add((n as i64).checked_mul(u32_at(stts, ti + 4)? as i64)?)?;
+            t_start += n;
+            ti += 8;
+        }
+        while sample >= c_start + u32_at(ctts, ci)? as u64 {
+            c_start += u32_at(ctts, ci)? as u64;
+            ci += 8;
+        }
+        let dts =
+            ticks.checked_add(((sample - t_start) as i64).checked_mul(u32_at(stts, ti + 4)? as i64)?)?;
+        let cts = dts.checked_add(u32_at(ctts, ci + 4)? as i32 as i64)?;
+        match key {
+            None => key = Some(cts),
+            Some(k) if cts < k => return Some(true),
+            Some(_) => {}
+        }
+    }
+    Some(false)
+}
+
 fn parse_moov(moov: &[u8]) -> Result<MediaInfo, ProbeError> {
     let mvhd = child(moov, b"mvhd").ok_or(ProbeError::Truncated("mvhd"))?;
     let (movie_ts, movie_dur) = if mvhd.first() == Some(&1) {
@@ -324,6 +375,11 @@ fn parse_moov(moov: &[u8]) -> Result<MediaInfo, ProbeError> {
             forced: false,
         })
         .collect();
+    let closed_gops = match codec {
+        VideoCodec::Av1 | VideoCodec::Vp9 => true,
+        VideoCodec::H264 | VideoCodec::Hevc => leading_pictures(video.stbl) == Some(false),
+        VideoCodec::Other(_) => false,
+    };
     Ok(MediaInfo {
         container: "mp4",
         duration: movie_dur / movie_ts,
@@ -347,6 +403,7 @@ fn parse_moov(moov: &[u8]) -> Result<MediaInfo, ProbeError> {
         audio,
         subtitles,
         keyframes,
+        closed_gops,
     })
 }
 

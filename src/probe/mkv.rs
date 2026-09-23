@@ -266,6 +266,16 @@ fn rpu_nal<'a>(frame: &'a [u8], hvcc: &[u8]) -> Option<&'a [u8]> {
 /// Walk a possibly truncated Cluster/BlockGroup prefix. A block can declare more bytes than the bounded audit read;
 /// its available prefix is still enough when the RPU occurs before the cutoff.
 fn rpu_from_elements<'a>(b: &'a [u8], track: u64, hvcc: &[u8], nested: bool) -> Option<&'a [u8]> {
+    first_in_blocks(b, track, nested, &|frame| rpu_nal(frame, hvcc))
+}
+
+/// The first of `track`'s frames in a possibly truncated Cluster/BlockGroup prefix that `pick` takes something from.
+fn first_in_blocks<'a, T>(
+    b: &'a [u8],
+    track: u64,
+    nested: bool,
+    pick: &dyn Fn(&'a [u8]) -> Option<T>,
+) -> Option<T> {
     let mut at = 0;
     while let Some((id, size, hl)) = b.get(at..).and_then(header) {
         let size = usize::try_from(size?).ok()?;
@@ -278,12 +288,12 @@ fn rpu_from_elements<'a>(b: &'a [u8], track: u64, hvcc: &[u8], nested: bool) -> 
             BLOCK if nested => block_frame(body, track),
             _ => None,
         };
-        if let Some(nal) = frame.and_then(|f| rpu_nal(f, hvcc)) {
-            return Some(nal);
+        if let Some(found) = frame.and_then(pick) {
+            return Some(found);
         }
         if id == BLOCK_GROUP && !nested {
-            if let Some(nal) = rpu_from_elements(body, track, hvcc, true) {
-                return Some(nal);
+            if let Some(found) = first_in_blocks(body, track, true, pick) {
+                return Some(found);
             }
         }
         if declared_end > b.len() {
@@ -313,6 +323,30 @@ async fn first_rpu_profile(
     Ok(rpu_from_elements(&available[..payload_len], track, hvcc, false)
         .and_then(|nal| dolby_vision::rpu::dovi_rpu::DoviRpu::parse_unspec62_nalu(nal).ok())
         .map(|rpu| rpu.dovi_profile))
+}
+
+/// Bytes read for the GOP check: the start of a cluster, where its keyframe's first NAL units are.
+const GOP_AUDIT_BYTES: u64 = 64 * 1024;
+
+/// Whether the keyframe the cluster at `cluster_at` opens with is one nothing decoded after it reaches back past: an
+/// IDR (`super::idr_keyframe`). `None` when the cluster, the block or its first picture isn't within the bytes read.
+async fn keyframe_is_idr(
+    src: &Source<'_>,
+    cluster_at: u64,
+    track: u64,
+    codec: &VideoCodec,
+    private: &[u8],
+) -> Result<Option<bool>, ProbeError> {
+    let bytes = src.read(cluster_at, GOP_AUDIT_BYTES).await?;
+    let (id, size, hl) = header(&bytes).ok_or(ProbeError::Truncated("Cluster"))?;
+    if id != CLUSTER {
+        return Err(ProbeError::Unsupported("a video Cue points outside a Cluster".into()));
+    }
+    let available = &bytes[hl..];
+    let payload_len = size.unwrap_or(available.len() as u64).min(available.len() as u64) as usize;
+    Ok(first_in_blocks(&available[..payload_len], track, false, &|frame| {
+        super::idr_keyframe(codec, private, frame)
+    }))
 }
 
 /// A genuine Profile 5 uses IPT-PQ-c2, which has no HEVC VUI code point. BT.2020 YCbCr plus PQ/HLG therefore proves
@@ -474,6 +508,26 @@ pub async fn probe(src: &Source<'_>, head: &[u8]) -> Result<MediaInfo, ProbeErro
     } else {
         (VideoCodec::Other(video.codec_id.clone()), None)
     };
+    let closed_gops = match codec {
+        VideoCodec::Av1 | VideoCodec::Vp9 => true,
+        VideoCodec::H264 | VideoCodec::Hevc => {
+            // The second keyframe: a file's first is an IDR even where every later one is a CRA.
+            let mut cued: Vec<Cue> = parsed_cues.clone();
+            cued.sort_by_key(|c| c.time);
+            let at = cued.get(1).or(cued.first()).and_then(|c| seg_start.checked_add(c.cluster));
+            match at {
+                Some(at) => keyframe_is_idr(src, at, video.number, &codec, &video.private)
+                    .await
+                    .unwrap_or_else(|e| {
+                        eprintln!("probe: reading a keyframe for its GOP failed: {e}");
+                        None
+                    })
+                    .unwrap_or(false),
+                None => false,
+            }
+        }
+        VideoCodec::Other(_) => false,
+    };
     let mut dolby_vision = video.dovi;
     let dolby_vision_record_mismatch = hevc_colour.is_some_and(|c| contradictory_profile5(dolby_vision, c));
     // A hostile CueClusterPosition must not wrap into an unrelated range.
@@ -563,6 +617,7 @@ pub async fn probe(src: &Source<'_>, head: &[u8]) -> Result<MediaInfo, ProbeErro
         audio,
         subtitles,
         keyframes,
+        closed_gops,
     })
 }
 

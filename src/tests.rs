@@ -158,6 +158,23 @@ async fn a_moov_after_the_media_is_found_by_walking_box_headers() {
     assert!((info.duration - 8.0).abs() < 0.05);
 }
 
+/// `open-gop.mkv` and `open-gop.mp4` open every GOP past the first on a CRA whose leading pictures reference the GOP
+/// before; every other fixture's GOPs are closed. Only the closed are named independent segments.
+#[tokio::test]
+async fn open_gops_are_told_from_closed_ones() {
+    for name in ["open-gop.mkv", "open-gop.mp4"] {
+        let info = probe_with_head(&fixture(name), crate::scout::HEAD_BYTES as usize).await;
+        assert_keyframes(&info.keyframes, &[0.0, 3.0, 6.0, 9.0]);
+        assert_eq!(info.video, VideoCodec::Hevc, "{name}");
+        assert!(!info.closed_gops, "{name}");
+    }
+    let closed = ["h264.mkv", "hevc.mkv", "hdr10.mkv", "h264.mp4", "moov-at-end.mp4", "av1.mkv", "av1.mp4"];
+    for name in closed {
+        let info = probe_with_head(&fixture(name), crate::scout::HEAD_BYTES as usize).await;
+        assert!(info.closed_gops, "{name}");
+    }
+}
+
 #[tokio::test]
 async fn neither_container_is_refused() {
     let err = probe::probe(&Source::Mem(b"RIFF....AVI "), b"RIFF....AVI ").await.unwrap_err();
@@ -910,6 +927,7 @@ async fn the_releases_list_says_how_each_plays_for_the_player_that_asked() {
         audio: Vec::new(),
         subtitles: Vec::new(),
         keyframes: Vec::new(),
+        closed_gops: true,
     };
     state.known().put("tt0000006/dv5.mkv".into(), &recordless);
     let (dv5, _) = ask(chrome).await;

@@ -535,6 +535,7 @@ mod tests {
             audio: Vec::new(),
             subtitles: Vec::new(),
             keyframes: vec![0.0],
+            closed_gops: true,
         };
         (Resolved { url: url.into(), head: vec![7; 200_000], size: Some(1) }, info)
     }
