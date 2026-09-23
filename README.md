@@ -56,8 +56,9 @@ GET    /remux/s/<sid>/<sig>/sub<N>_<W>.vtt
 GET    /remux/s/<sid>/<sig>/speed?bytes=<n>
                                         the same bounded speed probe, authorized by this session URL; two attempts
 POST   /remux/s/<sid>/<sig>/report      {code, message} (the player couldn't play it) and/or {stats} (how playing went:
-                                        browser, engine, fragments, bandwidth estimate, frames, stalls, errors — every
-                                        field optional) — each logged against the session as one bounded line, 204;
+                                        event, browser, engine, buffers, fragments, bandwidth estimate, frames, stall
+                                        totals and wait/frozen stalls, errors — every field optional) — each logged
+                                        against the session as one bounded line (code 0 beside stats is no failure), 204;
                                         64 KiB at most; at most three attempts per session, including malformed reports
 DELETE /remux/s/<sid>/<sig>             204; the session's URLs answer 410 from then on
 GET    /health, /remux/health           200 {status} — ok, or degraded with a reason (Maintenance); the second is
