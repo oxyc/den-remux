@@ -16,7 +16,7 @@
 //! cookie can never be presented as a URL signature or the other way round.
 
 use base64::Engine;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
@@ -32,7 +32,7 @@ pub const BROWSER_TOKEN_HEADER: &str = "x-den-browser-token";
 pub const SIG_LEN: usize = 22;
 
 fn mac(key: &[u8], domain: &str, parts: &[&str]) -> [u8; 32] {
-    let mut m = <HmacSha256 as Mac>::new_from_slice(key).expect("HMAC takes a key of any length");
+    let mut m = <HmacSha256 as KeyInit>::new_from_slice(key).expect("HMAC takes a key of any length");
     m.update(domain.as_bytes());
     for p in parts {
         // A separator that cannot occur in any part, so ("ab","c") and ("a","bc") sign differently.
