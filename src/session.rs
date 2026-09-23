@@ -349,6 +349,7 @@ impl Session {
             let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
             gops.push(Gop { job: job.id, idx: (job.read - 1) as u32, start, dur, path, size });
             *bytes += size;
+            job.bytes += size;
             st.scratch_bytes.fetch_add(size, Relaxed);
             *failures = 0;
             if init.is_none() {
@@ -373,6 +374,8 @@ impl Session {
             }
         }
         if newly_exited {
+            let why = if job.exit == Some(true) { "reached the end" } else { "failed" };
+            eprintln!("session {}: {}", self.short(), job.pull_line(why));
             if job.exit == Some(true) {
                 finished.push(job.id);
             } else {
@@ -505,6 +508,14 @@ impl Session {
         match Job::spawn(&st.cfg.ffmpeg, id, start, &spec) {
             Ok(new) => {
                 if let Some(old) = i.job.replace(new) {
+                    // A run that already exited said so when it did.
+                    if old.exit.is_none() {
+                        eprintln!(
+                            "session {}: {}",
+                            self.short(),
+                            old.pull_line(&format!("replaced for segment {n}"))
+                        );
+                    }
                     tokio::spawn(old.stop());
                 }
                 st.jobs_started.fetch_add(1, Relaxed);
@@ -884,6 +895,9 @@ impl Session {
             i.job.take()
         };
         if let Some(j) = job {
+            if j.exit.is_none() {
+                eprintln!("session {}: {}", self.short(), j.pull_line("session ended"));
+            }
             j.stop().await;
         }
         let dir = self.dir.clone();
