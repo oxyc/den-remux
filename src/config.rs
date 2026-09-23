@@ -44,6 +44,9 @@ pub struct Config {
     /// 2), under `MAX_SESSIONS`: one household, or one leaked install URL, cannot take every slot.
     pub max_sessions_per_install: usize,
     pub session_idle: Duration,
+    /// How long a session replacing another mid-film may go without serving a segment before it is taken as
+    /// abandoned (`AppState::reserve`): `REPLACE_GRACE_SECS`, not set from the environment.
+    pub replace_grace: Duration,
     pub scratch_dir: PathBuf,
     pub scratch_max_bytes: u64,
     pub ffmpeg: String,
@@ -179,6 +182,10 @@ const MIN_SCRATCH_BYTES: u64 = 64 * 1024 * 1024;
 /// it is refreshed every 30 s while the session exists, so the two don't part.
 pub const SESSION_IDLE_SECS: u64 = 600;
 
+/// How long a mid-film replacement has to serve its first segment before it is ended as abandoned: a start is
+/// admitted at most 30 s of pre-buffer (`LONG_PREBUFFER`), and the first segment is asked for long before that.
+pub const REPLACE_GRACE_SECS: u64 = 60;
+
 impl Config {
     pub fn from_env() -> Config {
         let (url_key, url_key_ephemeral) = match env_opt("REMUX_URL_KEY") {
@@ -217,6 +224,7 @@ impl Config {
                     .filter(|s| *s >= 30)
                     .unwrap_or(SESSION_IDLE_SECS),
             ),
+            replace_grace: Duration::from_secs(REPLACE_GRACE_SECS),
             scratch_dir: env_opt("SCRATCH_DIR").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/cache")),
             scratch_max_bytes: env_opt("SCRATCH_MAX_BYTES")
                 .and_then(|v| v.parse().ok())

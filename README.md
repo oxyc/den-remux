@@ -19,15 +19,17 @@ This is the MVP ("phase 2") of oxyc/den#11: movies and episodes, cached releases
 ```
 POST   /remux/login                     {key} → 204 + Set-Cookie + X-Den-Browser-Token; 401 bad_key · 429 rate_limited
 POST   /remux/session                   {imdb, season?, episode?, filename?, scout?, audio?, audioTrack?,
-                                         subtitles?, subtitleLanguages?, videoCodecs?, playable?, startAt?, maxBitrate?, player?} (a full scout install,
+                                         subtitles?, subtitleLanguages?, videoCodecs?, playable?, startAt?, maxBitrate?, player?,
+                                         exclude?, transcode?: "never", fitsOnly?, replaces?} (a full scout install,
                                          or browser cookie/bearer) → 201
-                                        {sid, playlist, release:{label,filename,size}, duration, prebuffer, expiresAt,
+                                        {sid, playlist, release:{label,filename,size}, duration, prebuffer, need,
+                                         segments:[[start,bytes],…], expiresAt,
                                          video:{codec: h264|hevc|av1|vp9, transcoded}, audioTrack, audioChannels,
                                          audioTracks:[{language,name,channels,commentary}], subtitles}
-                                        401 not_logged_in · 403 scout_refused
+                                        401 not_logged_in · 403 scout_refused/not_your_session · 409 replacement_pending
                                         400 bad_request/bad_scout/bad_subtitles/bad_audio_track
-                                        404 no_release/no_playable_release · 429 too_many_sessions/rate_limited
-                                        502 scout_unavailable · 503 scout_unconfigured/transcode_unavailable
+                                        404 no_release/no_playable_release/no_copy/no_fitting_copy
+                                        429 too_many_sessions/rate_limited · 502 scout_unavailable · 503 scout_unconfigured
 POST   /remux/releases                  {imdb, season?, episode?, scout?, videoCodecs?, playable?} (a full scout install, or browser cookie/bearer)
                                         → 200 {releases:[{label,filename,size,plays,why}]}: `plays` is "yes" | "convert" |
                                         "no" for the player that sent `playable` (as /remux/session parses it) or
@@ -108,8 +110,8 @@ itself is never logged. Brave on iOS sends Safari's User-Agent, so it reads as S
   track (foreign-language parts only), a bitmap track (PGS, VOBSUB) and a track that names no language are not offered.
 - **Video codecs.** `videoCodecs` is what the player takes (`["h264"]` for Firefox or an old
   Chromecast); empty is H.264 and HEVC. Without HEVC, H.264 releases are tried first, and an HEVC-only
-  title is transcoded to H.264 on the GPU (Hardware transcode, below) — or refused with
-  `transcode_unavailable` while transcoding is off or in use.
+  title is transcoded to H.264 on the GPU (Hardware transcode, below) — or refused up front with `no_copy` while
+  transcoding is off or in use.
 - **What the player decodes.** `playable` — `{h264, h264High10, hevcMain, hevcMain10, hevcHighTier, hdr, eac3,
   aacMultichannel, dolbyVision: {p5, p8}, av1, av1Main10, av1Hdr, flac, aac71, vp9, vp9Profile2}`, the
   highest level it takes of 8-bit H.264 and of H.264 High 10 (`level_idc`, 0x33 is 5.1), of 8-bit and 10-bit HEVC
@@ -160,14 +162,29 @@ itself is never logged. Brave on iOS sends Safari's User-Agent, so it reads as S
   50 MB, Safari and anything unnamed thirty seconds), so every stretch of the film must come in within that lead plus
   its own length. A file with no such index is taken to need its average and half again, and the log says so. A release that plays
   as it is but needs more than the link is kept aside while one that fits is looked for, in rank order as before.
-  The session's answer carries `prebuffer`: the seconds the player should buffer, on its link, before it starts.
-  With none that fits, a
-  transcode is taken next: of a release that plays only converted, else of an HEVC one that plays as it is, where the
-  preset comes in under it. The preset is 1080p at 8 Mbit/s where `maxBitrate` carries that and 5.1 audio, else 720p
-  at 3 Mbit/s (4.5 max) — two and no more, since a transcode holds the box's one GPU slot for the film, and below 720p
-  a remote player does better with the release that needs least as it is. With the GPU busy or nothing to convert,
-  that copy plays: a stall now and then beats nothing. A named `filename` is weighed alone, the same way. Without
-  `maxBitrate` nothing changes. The session's log line names the link.
+  The session's answer carries `prebuffer`: the seconds the player should buffer, on its link, before it starts;
+  `need`; and `segments`, each segment's start and bytes as sent, so a player can work the bucket out again at the
+  rate it is actually getting. With none that fits, in order: a copy that needs a head start of at most 30 s (a hard
+  cap: the player holds, with a countdown, until `prebuffer`); a transcode, of a release that plays only converted,
+  else of an HEVC one that plays as it is; the copy that starves least; and else a refusal. A transcode is sized to
+  the link, resolution kept before bitrate: 1080p from 8 Mbit/s down to 4, then 720p down to 2, then 540p down to 1,
+  each with a peak of 1.5 times its average that has to fit the link beside the audio. A transcode that fits no size
+  ranks below the copy that starves least. Every transcode chosen is logged with its size and rate, for whom, and why no
+  copy would do. A named `filename` is weighed alone, the same way. Without `maxBitrate` nothing changes. The session's
+  log line names the link.
+- **A transcode is decided at selection, never as a way out of playback.** Members and guests alike, first come first
+  served on the one GPU slot. With the slot in use, or transcoding off, a title that only a transcode would play gets
+  `404 no_copy` up front ("can't be played on this device right now"), not a wait. A player replacing a session
+  mid-film — another audio track, another release, casting — sends `"transcode":"never"`. A player switching away from
+  a release its link can't carry also names it in `exclude` and sends `"fitsOnly":true` with the rate it is getting:
+  it takes a copy that link carries, or `404 no_fitting_copy` and keeps playing what it has.
+- **A replacement plays beside the session it replaces.** A browser holds one session, and past its share a new one
+  ends the oldest at once — mid-film that stopped the picture while the new one was probed, and left nothing playing
+  where none could be made. A player replacing its session sends `"replaces":"<sid>"`: the old one is kept, one past
+  the share, until the new one serves a segment, and ends then; a replacement that serves none within 60 s is ended
+  as abandoned and the old one plays on. The sid must be the caller's own (`403 not_your_session`), and one
+  replacement is under way at a time (`409 replacement_pending`). `MAX_SESSIONS` still counts the kept session: where
+  the box has no room for both, the old one gives way at once, as without `replaces`.
 - **Resume.** `startAt` is the second the player starts at. The media playlist names it (`EXT-X-START`, so
   Safari's native player starts there), and the first job starts a segment before it rather than at zero, so a
   resume runs ffmpeg once instead of twice. Negative is a 400; at or past the end starts from zero.
@@ -350,7 +367,7 @@ Every variable is unprefixed; `.env.example` lists them with their defaults.
 | `TRUSTED_PROXIES` | — | Proxy IPs (comma-separated) whose `X-Forwarded-For` names the visitor, for the limit on logins and new sessions: `tailscale serve`'s host. |
 | `WEB_ORIGINS` | — | Pages on another origin that may log in and start sessions (comma-separated): the Den web app on its public name. Session files are readable from anywhere already. |
 | `METRICS_TOKEN` | — | Turns on `/metrics` behind `Authorization: Bearer <token>`; otherwise it is a 404. |
-| `EDGE_SECRET` | — | **Secret**, shared with den-edge (`REMUX_EDGE_SECRET`). With it, a request to `/remux/session` or `/remux/releases` carrying `x-den-edge-secret` and `x-den-owner: grant:<8 hex>` plays as that guest grant: its own cap (`GUEST_MAX_SESSIONS`), never a transcode, never counted against a host. It also turns on `POST /remux/admin/kill {"owner":"grant:<gid>"}` → `{"ended": n}`, which ends that grant's sessions. Unset, the headers are ignored and the admin route is a 404. |
+| `EDGE_SECRET` | — | **Secret**, shared with den-edge (`REMUX_EDGE_SECRET`). With it, a request to `/remux/session` or `/remux/releases` carrying `x-den-edge-secret` and `x-den-owner: grant:<8 hex>` plays as that guest grant: its own cap (`GUEST_MAX_SESSIONS`), never counted against a host; converted for as a host is, on the same one GPU slot. It also turns on `POST /remux/admin/kill {"owner":"grant:<gid>"}` → `{"ended": n}`, which ends that grant's sessions. Unset, the headers are ignored and the admin route is a 404. |
 | `GUEST_MAX_SESSIONS` | `2` | Sessions one guest grant plays at once (1–8); past it, its oldest ends. |
 | `LOG_REQUESTS` | off | `1` writes `<METHOD> <path> <status> <ms>ms[ rid=<X-Request-Id>]` per response. |
 | `PORT` | `8095` | |

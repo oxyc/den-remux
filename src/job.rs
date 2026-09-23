@@ -103,17 +103,40 @@ pub const HD1080: Preset =
 /// For a link that can't carry that: 720p at 3 Mbit/s, about what streaming services give 720p.
 pub const HD720: Preset =
     Preset { width: 1280, height: 720, bitrate: 3_000_000, peak: 4_500_000, buffer: 6_000_000 };
+/// 540p at 1.5 Mbit/s, for a link that can't carry 720p.
+pub const SD540: Preset =
+    Preset { width: 960, height: 540, bitrate: 1_500_000, peak: 2_250_000, buffer: 3_000_000 };
 
 /// The most audio a session adds to its video: AAC 5.1.
 const AUDIO_MAX: u64 = 384_000;
+/// A transcode's peak over its average, which `h264_vaapi`'s rate control holds it to (`-maxrate`), over a buffer of
+/// twice the average (`-bufsize`).
+const PEAK_RATIO: f64 = 1.5;
 
-/// The preset for a player's `maxBitrate` (bits a second): 1080p where it carries 1080p with its audio, or nothing is
-/// said, else 720p. Two and no more: a transcode takes the box's one GPU slot for the whole film, and below 720p at
-/// 3 Mbit/s a remote player is better served by the smallest release as it is.
-pub fn preset_for(max_bitrate: Option<u64>) -> Preset {
-    match max_bitrate {
-        Some(max) if max < HD1080.bitrate + AUDIO_MAX => HD720,
-        _ => HD1080,
+/// The transcode for a player's `maxBitrate` (bits a second): as sharp as the link allows, resolution kept before
+/// bitrate. Each size's rate comes down, to the most whose peak fits the link with the most audio beside it — a link
+/// that carries only a transcode's average starves in every scene that asks for its peak — until it reaches that
+/// size's floor: 1080p down to 4 Mbit/s, about what streaming services give 1080p; then 720p down to 2; then 540p down
+/// to 1. 1080p at 8 Mbit/s where nothing is said. `None` for a link below the last floor: no transcode fits it.
+pub fn preset_for(max_bitrate: Option<u64>) -> Option<Preset> {
+    let Some(max) = max_bitrate else { return Some(HD1080) };
+    let fits = (max.saturating_sub(AUDIO_MAX) as f64 / PEAK_RATIO) as u64;
+    [(HD1080, 4_000_000), (HD720, 2_000_000), (SD540, 1_000_000)].into_iter().find_map(|(size, floor)| {
+        let bitrate = size.bitrate.min(fits);
+        (bitrate >= floor).then(|| Preset {
+            bitrate,
+            peak: (bitrate as f64 * PEAK_RATIO) as u64,
+            buffer: bitrate * 2,
+            ..size
+        })
+    })
+}
+
+impl Preset {
+    /// Seconds a player on a link of `rate` bits a second buffers before this plays through: its rate control's
+    /// buffer, the most it can run ahead of `peak`, delivered at the link's rate.
+    pub fn head_start(&self, rate: u64) -> f64 {
+        self.buffer as f64 / rate.max(1) as f64
     }
 }
 
@@ -858,12 +881,22 @@ mod tests {
     }
 
     #[test]
-    fn a_link_below_1080p_gets_the_720p_transcode() {
-        assert_eq!(preset_for(None), HD1080, "nothing said: as before");
-        assert_eq!(preset_for(Some(50_000_000)), HD1080);
-        assert_eq!(preset_for(Some(8_384_000)), HD1080, "8 Mbit/s of video and 5.1 AAC");
-        assert_eq!(preset_for(Some(8_383_999)), HD720);
-        assert_eq!(preset_for(Some(2_000_000)), HD720, "nothing smaller: 720p is the floor");
+    fn a_transcode_keeps_1080p_and_brings_its_rate_down_to_fit_the_link() {
+        assert_eq!(preset_for(None), Some(HD1080), "nothing said: as before");
+        assert_eq!(preset_for(Some(50_000_000)), Some(HD1080));
+        assert_eq!(preset_for(Some(12_384_000)), Some(HD1080), "a 12 Mbit/s peak and 5.1 AAC");
+        // The link a remote viewer on 6.6 Mbit/s measured: still 1080p, at about 4.1 Mbit/s, its peak inside the link.
+        let remote = preset_for(Some(6_600_000)).unwrap();
+        assert_eq!((remote.width, remote.height), (1920, 1080));
+        assert!(remote.bitrate <= 4_500_000 && remote.bitrate >= 4_000_000, "{remote:?}");
+        assert!(remote.peak + 384_000 <= 6_600_000, "{remote:?}");
+        assert!(remote.head_start(6_600_000) <= 30.0, "its head start fits the cap");
+        // Below 1080p's 4 Mbit/s floor, 720p; below 720p's 2, 540p; below 540p's 1, nothing.
+        assert_eq!(preset_for(Some(6_383_999)).map(|p| p.height), Some(720));
+        assert_eq!(preset_for(Some(6_384_000)).map(|p| p.height), Some(1080));
+        assert_eq!(preset_for(Some(3_383_999)).map(|p| p.height), Some(540));
+        assert_eq!(preset_for(Some(1_884_000)).map(|p| (p.height, p.bitrate)), Some((540, 1_000_000)));
+        assert_eq!(preset_for(Some(1_883_999)), None, "below the floor no transcode fits");
     }
 
     #[test]

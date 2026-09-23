@@ -666,15 +666,37 @@ where
         /// The page's HLS player, `native` or `hls.js`: for the log, and a native player's session answers only
         /// once its `init.mp4` is ready (`Session::prepare`).
         player: Option<String>,
+        /// Releases not to open, by filename (`session::Want::exclude`).
+        #[serde(default)]
+        exclude: Vec<String>,
+        /// `never`: no transcode for this request (`session::Want::no_transcode`); absent lets selection take one.
+        transcode: Option<String>,
+        /// Only a copy that fits the link (`session::Want::fits_only`).
+        #[serde(default)]
+        fits_only: bool,
+        /// The sid of this caller's session this one replaces mid-film (`session::Want::replaces`).
+        replaces: Option<String>,
     }
     let Some(req) = read_body(body).await.and_then(|b| serde_json::from_slice::<Create>(&b).ok()) else {
         return bad_request(
             "Expected {\"imdb\": \"tt…\", \"season\"?: n, \"episode\"?: n, \"filename\"?: \"…\", \"scout\"?: \"…\", \
              \"audio\"?: [\"en\", …], \"audioTrack\"?: n, \"subtitles\"?: \"…\", \"subtitleLanguages\"?: [\"en\", …], \
              \"videoCodecs\"?: [\"h264\", \"hevc\"], \"playable\"?: {\"h264\", \"h264High10\", \"hevcMain\", \"hevcMain10\", \"hevcHighTier\", \"hdr\", \"eac3\", \"aacMultichannel\", \"dolbyVision\": {\"p5\", \"p8\"}, \"av1\", \"av1Main10\", \"av1Hdr\", \"flac\", \"aac71\", \"vp9\", \"vp9Profile2\"}, \
-             \"startAt\"?: seconds, \"maxBitrate\"?: bits a second, \"player\"?: \"native\" | \"hls.js\"}.",
+             \"startAt\"?: seconds, \"maxBitrate\"?: bits a second, \"player\"?: \"native\" | \"hls.js\" | \"cast\", \
+             \"exclude\"?: [\"filename\", …], \"transcode\"?: \"never\", \"fitsOnly\"?: bool, \"replaces\"?: \"sid\"}.",
         );
     };
+    if req.replaces.as_deref().is_some_and(|sid| !auth::is_id(sid)) {
+        return bad_request("replaces is the sid of a session this browser or install started.");
+    }
+    let no_transcode = match req.transcode.as_deref() {
+        None | Some("allow") => false,
+        Some("never") => true,
+        Some(_) => return bad_request("transcode is \"never\", or absent."),
+    };
+    if req.exclude.len() > 16 || req.exclude.iter().any(|f| f.len() > 512) {
+        return bad_request("exclude is at most 16 filenames.");
+    }
     if req.start_at.is_some_and(|t| !t.is_finite() || t < 0.0) {
         return bad_request("startAt is seconds into the title, 0 or more.");
     }
@@ -724,6 +746,10 @@ where
         max_bitrate: req.max_bitrate,
         client: client::label(parts.headers.get(hyper::header::USER_AGENT), req.player.as_deref()),
         player: req.player.as_deref(),
+        exclude: &req.exclude,
+        no_transcode,
+        fits_only: req.fits_only,
+        replaces: req.replaces.as_deref(),
     };
     let public = public_session_request(state, parts);
     let created = session::create(state, admission, &want, public).await;
@@ -766,6 +792,13 @@ where
                 // Seconds to buffer before playing, on the link the player named, so a copy then plays through
                 // without running dry; null where that isn't known.
                 "prebuffer": s.prebuffer.map(|p| (p * 10.0).ceil() / 10.0),
+                // What a copy needs of a link, bits a second, to start within 10 s and never run dry — and each
+                // segment's `[start, bytes]` as the session sends it, from which a player can work that out again at
+                // the rate it is getting.
+                "need": s.need.map(|n| n.bitrate),
+                "segments": s.demand.as_ref().map(|d| d.iter()
+                    .map(|(start, bytes)| serde_json::json!([(start * 1000.0).round() / 1000.0, bytes]))
+                    .collect::<Vec<_>>()),
                 "expiresAt": s.exp,
                 "audioTrack": s.audio,
                 // The channels the session's audio carries, beside the track's own in `audioTracks`: fewer is a
@@ -878,7 +911,14 @@ where
                         s.serve_subtitle_window(state, n, w).await
                     }
                     None => match session::seg_index(f).filter(|n| *n < s.segments.len()) {
-                        Some(n) => s.serve_segment(state, n, head).await,
+                        Some(n) => {
+                            let served = s.serve_segment(state, n, head).await;
+                            // A replacement mid-film takes over once it serves media.
+                            if !head && served.status().is_success() {
+                                state.replacement_played(&s).await;
+                            }
+                            served
+                        }
                         None => httputil::not_found(),
                     },
                 },

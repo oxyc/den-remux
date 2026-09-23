@@ -582,6 +582,7 @@ fn test_config(origin: &str, max_sessions: usize, idle: Duration, scout_key: Opt
         max_sessions,
         max_sessions_per_install: 2,
         session_idle: idle,
+        replace_grace: Duration::from_secs(crate::config::REPLACE_GRACE_SECS),
         scratch_dir: dir,
         scratch_max_bytes: 1 << 30,
         ffmpeg: tool("FFMPEG_PATH", "ffmpeg"),
@@ -1088,6 +1089,127 @@ async fn sessions_are_capped_but_a_browser_may_switch_titles() {
     state.end_all("test").await;
 }
 
+/// A browser's session with its signed base URL.
+async fn start(state: &Arc<AppState>, cookie: &str, body: &str) -> (String, String) {
+    let r = call(state, "POST", "/remux/session", Some(cookie), body).await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let created = r.json();
+    let base = created["playlist"].as_str().unwrap().trim_end_matches("master.m3u8").to_string();
+    (created["sid"].as_str().unwrap().to_string(), base)
+}
+
+fn replacing(sid: &str) -> String {
+    format!(r#"{{"imdb":"tt0000001","audioTrack":0,"transcode":"never","replaces":"{sid}"}}"#)
+}
+
+/// A change mid-film — another track, another release — is a new session. A browser plays one, so without more the
+/// old one ended as soon as the new was asked for: the picture stopped while the new one was probed, and stayed
+/// stopped where none could be made. Named as a replacement, the old plays on until the new one serves media.
+#[tokio::test]
+#[ignore = "needs ffmpeg"]
+async fn a_replacement_plays_beside_its_session_until_it_serves_media() {
+    let origin = origin().await;
+    let state = test_state(&origin, 4, Duration::from_secs(600));
+    let phone = login(&state, "phone-key").await;
+    let (old, old_base) = start(&state, &phone, r#"{"imdb":"tt0000001"}"#).await;
+    let (new, new_base) = start(&state, &phone, &replacing(&old)).await;
+    assert!(state.session(&old).is_some(), "the session replaced ended before its replacement played");
+    assert_eq!(call(&state, "GET", &format!("{old_base}seg0.m4s"), None, "").await.status, StatusCode::OK);
+    assert_eq!(state.sessions().len(), 2, "one past the browser's share, while the replacement starts");
+
+    assert_eq!(call(&state, "GET", &format!("{new_base}seg0.m4s"), None, "").await.status, StatusCode::OK);
+    assert!(state.session(&old).is_none(), "the replacement served media and the old session played on");
+    assert!(state.session(&new).is_some());
+    assert_eq!(call(&state, "GET", &format!("{old_base}seg1.m4s"), None, "").await.status, StatusCode::GONE);
+    state.end_all("test").await;
+}
+
+/// Without naming what it replaces, a browser still never holds two sessions: its old one ends at once. Nor does a
+/// replacement get past `MAX_SESSIONS`: where the box has no room for both, the old one gives way as before.
+#[tokio::test]
+async fn only_a_named_replacement_with_room_for_both_keeps_the_old_session() {
+    let origin = origin().await;
+    let state = test_state(&origin, 2, Duration::from_secs(600));
+    let phone = login(&state, "phone-key").await;
+    let (first, _) = start(&state, &phone, r#"{"imdb":"tt0000001"}"#).await;
+    let (second, _) = start(&state, &phone, r#"{"imdb":"tt0000001","audioTrack":0}"#).await;
+    assert!(state.session(&first).is_none(), "an unnamed replacement left the browser two sessions");
+    assert_eq!(state.sessions().len(), 1);
+
+    let laptop = login(&state, "laptop-key").await;
+    start(&state, &laptop, r#"{"imdb":"tt0000001"}"#).await;
+    let (third, _) = start(&state, &phone, &replacing(&second)).await;
+    assert!(state.session(&second).is_none(), "a full box kept a session past MAX_SESSIONS");
+    assert!(state.session(&third).is_some());
+    assert_eq!(state.sessions().len(), 2);
+    state.end_all("test").await;
+}
+
+#[tokio::test]
+async fn a_replacement_names_only_the_callers_own_session() {
+    let origin = origin().await;
+    let state = test_state(&origin, 4, Duration::from_secs(600));
+    let phone = login(&state, "phone-key").await;
+    let laptop = login(&state, "laptop-key").await;
+    let (theirs, _) = start(&state, &phone, r#"{"imdb":"tt0000001"}"#).await;
+    let r = call(&state, "POST", "/remux/session", Some(&laptop), &replacing(&theirs)).await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN, "{}", r.text());
+    assert_eq!(r.json()["error"], "not_your_session");
+    assert!(state.session(&theirs).is_some());
+    assert_eq!(state.sessions().len(), 1);
+    let r = call(&state, "POST", "/remux/session", Some(&phone), &replacing("not an id")).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+    state.end_all("test").await;
+}
+
+/// One replacement under way at a time, and none of a replacement still starting: a browser holds at most one
+/// session past its share. Ending the one under way frees the next.
+#[tokio::test]
+async fn one_replacement_is_under_way_at_a_time() {
+    let origin = origin().await;
+    let state = test_state(&origin, 4, Duration::from_secs(600));
+    let phone = login(&state, "phone-key").await;
+    let (old, _) = start(&state, &phone, r#"{"imdb":"tt0000001"}"#).await;
+    let (new, new_base) = start(&state, &phone, &replacing(&old)).await;
+    for named in [&old, &new] {
+        let r = call(&state, "POST", "/remux/session", Some(&phone), &replacing(named)).await;
+        assert_eq!(r.status, StatusCode::CONFLICT, "{}", r.text());
+        assert_eq!(r.json()["error"], "replacement_pending");
+    }
+    assert_eq!(state.sessions().len(), 2);
+    assert_eq!(call(&state, "DELETE", &new_base, None, "").await.status, StatusCode::NO_CONTENT);
+    let (_, _) = start(&state, &phone, &replacing(&old)).await;
+    assert!(state.session(&old).is_some());
+    assert_eq!(state.sessions().len(), 2);
+    state.end_all("test").await;
+}
+
+/// A replacement that serves nothing within the grace window was given up on: it ends, and the session it was to
+/// replace plays on, free to be replaced again.
+#[tokio::test]
+async fn an_abandoned_replacement_is_ended_after_the_grace_window() {
+    let origin = origin().await;
+    let state = state_from(Config {
+        replace_grace: Duration::from_millis(300),
+        ..test_config(&origin, 4, Duration::from_secs(600), Some(SCOUT_KEY))
+    });
+    let phone = login(&state, "phone-key").await;
+    let (old, _) = start(&state, &phone, r#"{"imdb":"tt0000001"}"#).await;
+    let (new, _) = start(&state, &phone, &replacing(&old)).await;
+    let mut ended = false;
+    for _ in 0..30 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if state.session(&new).is_none() {
+            ended = true;
+            break;
+        }
+    }
+    assert!(ended, "a replacement that never played outlived the grace window");
+    assert!(state.session(&old).is_some(), "the session still playing was ended");
+    start(&state, &phone, &replacing(&old)).await;
+    state.end_all("test").await;
+}
+
 /// A player that loses its connection for five minutes comes back to its session, which still serves the next segment;
 /// only past the idle window does it end. Pinned so a shorter window can't creep in by accident.
 #[tokio::test]
@@ -1453,22 +1575,37 @@ async fn a_guest_has_its_own_cap_and_never_evicts_a_host() {
     state.end_all("test").await;
 }
 
-/// A grant never takes the GPU: a release that needs converting is refused as it is when no transcode is free,
-/// and the transcode stays there for a host.
+/// A guest is converted for as a host is, first come first served on the one slot: a guest whose only playable option
+/// is a conversion gets one while the slot is free, and a clear refusal up front while it isn't — for a host just the
+/// same. The guest's session is served on the same signed routes as any other.
 #[tokio::test]
-async fn a_guest_is_never_transcoded() {
+async fn a_guest_is_converted_for_when_the_slot_is_free() {
     let origin = origin().await;
     let state = test_state(&origin, 4, Duration::from_secs(600));
     state.transcode_ok.store(true, Relaxed);
     let body = format!(r#"{{"imdb":"tt0000002","scout":"{origin}/cfg","videoCodecs":["h264"]}}"#);
     let r = call_with(&state, "POST", "/remux/session", None, &edge("grant:0a1b2c3d"), &body).await;
-    assert_eq!(r.status, StatusCode::SERVICE_UNAVAILABLE, "{}", r.text());
-    assert_eq!(r.json()["error"], "transcode_unavailable");
-    assert_eq!(state.transcodes.load(Relaxed), 0);
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let guest = r.json();
+    assert_eq!(guest["video"]["transcoded"], true);
+    assert_eq!(state.transcodes.load(Relaxed), 1);
+    let master = call(&state, "GET", guest["playlist"].as_str().unwrap(), None, "").await;
+    assert_eq!(master.status, StatusCode::OK);
+    assert!(master.text().contains("CODECS=\"avc1.640029,"), "{}", master.text());
 
+    // The slot is the guest's now: the host is refused up front, as the next guest would be.
     let r = call(&state, "POST", "/remux/session", None, &body).await;
-    assert_eq!(r.status, StatusCode::CREATED, "the host has the transcode: {}", r.text());
-    assert_eq!(r.json()["video"]["transcoded"], true);
+    assert_eq!(
+        (r.status, r.json()["error"].as_str()),
+        (StatusCode::NOT_FOUND, Some("no_copy")),
+        "{}",
+        r.text()
+    );
+    state.end_session(guest["sid"].as_str().unwrap(), "test").await;
+    let r = call_with(&state, "POST", "/remux/session", None, &edge("grant:deadbeef"), &body).await;
+    assert_eq!(r.status, StatusCode::CREATED, "the slot came back: {}", r.text());
+    let r2 = call_with(&state, "POST", "/remux/session", None, &edge("grant:0a1b2c3d"), &body).await;
+    assert_eq!((r2.status, r2.json()["error"].as_str()), (StatusCode::NOT_FOUND, Some("no_copy")));
     state.end_all("test").await;
 }
 
@@ -1552,14 +1689,14 @@ async fn kill_without_the_secret_looks_like_an_unknown_route() {
 #[tokio::test]
 async fn cancelling_a_reservation_gives_back_both_limits() {
     let state = test_state("http://127.0.0.1:9", 2, Duration::from_secs(600));
-    let first = state.reserve("phone", 1).await.unwrap();
-    assert!(state.reserve("phone", 1).await.is_none());
-    let second = state.reserve("laptop", 1).await.unwrap();
-    assert!(state.reserve("other", 1).await.is_none());
+    let first = state.reserve("phone", 1, None).await.unwrap();
+    assert!(state.reserve("phone", 1, None).await.is_err());
+    let second = state.reserve("laptop", 1, None).await.unwrap();
+    assert!(state.reserve("other", 1, None).await.is_err());
     drop(first);
-    let replacement = state.reserve("phone", 1).await.unwrap();
+    let replacement = state.reserve("phone", 1, None).await.unwrap();
     drop((second, replacement));
-    assert!(state.reserve("other", 1).await.is_some());
+    assert!(state.reserve("other", 1, None).await.is_ok());
 }
 
 #[tokio::test]
@@ -2071,9 +2208,9 @@ async fn a_releases_own_subtitles_arrive_with_its_video() {
     state.end_all("test").await;
 }
 
-/// A player without HEVC gets an HEVC-only title through the GPU alone: refused while transcoding is
-/// off, then one transcode at a time, given back when its session ends. Creating a session starts no
-/// ffmpeg, so no GPU is needed here.
+/// A player without HEVC gets an HEVC-only title through the GPU alone: refused up front while transcoding is off —
+/// "can't be played here right now", not a wait a player would retry — then one transcode at a time, given back when
+/// its session ends. Creating a session starts no ffmpeg, so no GPU is needed here.
 #[tokio::test]
 async fn hevc_for_a_player_without_it_takes_the_one_transcode() {
     let origin = origin().await;
@@ -2081,8 +2218,9 @@ async fn hevc_for_a_player_without_it_takes_the_one_transcode() {
     let h264_only = r#"{"imdb":"tt0000002","videoCodecs":["h264"]}"#;
     let phone = login(&state, "phone-key").await;
     let r = call(&state, "POST", "/remux/session", Some(&phone), h264_only).await;
-    assert_eq!(r.status, StatusCode::SERVICE_UNAVAILABLE, "{}", r.text());
-    assert_eq!(r.json()["error"], "transcode_unavailable");
+    assert_eq!(r.status, StatusCode::NOT_FOUND, "{}", r.text());
+    assert_eq!(r.json()["error"], "no_copy");
+    assert!(r.headers.get("retry-after").is_none(), "nothing to wait for");
 
     state.transcode_ok.store(true, Relaxed);
     let r = call(&state, "POST", "/remux/session", Some(&phone), h264_only).await;
@@ -2098,7 +2236,7 @@ async fn hevc_for_a_player_without_it_takes_the_one_transcode() {
 
     let laptop = login(&state, "laptop-key").await;
     let r = call(&state, "POST", "/remux/session", Some(&laptop), h264_only).await;
-    assert_eq!(r.json()["error"], "transcode_unavailable", "MAX_TRANSCODES is 1");
+    assert_eq!(r.json()["error"], "no_copy", "MAX_TRANSCODES is 1");
     let r = call(&state, "POST", "/remux/session", Some(&laptop), r#"{"imdb":"tt0000002"}"#).await;
     let copied = serde_json::json!({
         "codec": "hevc", "transcoded": false, "width": 320, "height": 180, "tonemapped": false
@@ -2119,9 +2257,10 @@ async fn hevc_for_a_player_without_it_takes_the_one_transcode() {
 }
 
 /// With `maxBitrate` a release is copied only where what it needs of the link fits (`session::need`): h264.mkv
-/// (217 kbit/s on average, ranked first) gives way to hevc.mkv (165). With nothing that fits, what plays only converted is transcoded at 720p; with the GPU
-/// off, the copy that needs least plays rather than none — as it does when a 720p transcode would need more than the
-/// copy. Without `maxBitrate` nothing changes. Creating a session starts no ffmpeg.
+/// (217 kbit/s on average, ranked first) gives way to hevc.mkv (165). With nothing that fits, what plays only converted
+/// is transcoded at the preset whose peak the link carries; a link below the smallest's peak takes the copy that
+/// starves least instead, as does one with the GPU off. Without `maxBitrate` nothing changes. Creating a session starts
+/// no ffmpeg.
 #[tokio::test]
 async fn a_player_naming_its_link_gets_a_release_that_fits_it() {
     let origin = origin().await;
@@ -2153,19 +2292,134 @@ async fn a_player_naming_its_link_gets_a_release_that_fits_it() {
     }
 
     state.transcode_ok.store(true, Relaxed);
-    let (j, master) = start(format!(r#"{h264},"maxBitrate":100000"#)).await;
-    assert_eq!(j["release"]["filename"], "hevc.mkv");
+    // 100 kbit/s carries not even 540p's peak: a conversion would starve worse than the copy that needs least.
+    let (j, _) = start(format!(r#"{h264},"maxBitrate":100000"#)).await;
+    assert_eq!(
+        (j["release"]["filename"].as_str(), j["video"]["transcoded"].as_bool()),
+        (Some("h264.mkv"), Some(false))
+    );
+    // The HEVC-only title for an H.264-only player on a 6.6 Mbit/s link: converted, 1080p at 4.1 Mbit/s, its 6.2 Mbit/s
+    // peak inside the link.
+    let body = format!(r#"{{"imdb":"tt0000002","scout":"{origin}/cfg",{h264},"maxBitrate":6600000}}"#);
+    let r = call(&state, "POST", "/remux/session", None, &body).await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let j = r.json();
     assert_eq!(j["video"]["transcoded"], true);
-    assert!(master.contains("BANDWIDTH=4692000,AVERAGE-BANDWIDTH=3000000,"), "the 720p preset: {master}");
+    assert!(j["prebuffer"].as_f64().is_some_and(|p| p <= 30.0), "{j}");
+    let master = call(&state, "GET", j["playlist"].as_str().unwrap(), None, "").await.text();
+    assert!(master.contains("BANDWIDTH=6408000,AVERAGE-BANDWIDTH=4144000,"), "{master}");
+    state.end_all("test").await;
     let (j, master) = start(h264.to_string()).await;
     assert_eq!(
         (j["release"]["filename"].as_str(), j["video"]["transcoded"].as_bool()),
         (Some("h264.mkv"), Some(false))
     );
-    assert!(!master.contains("BANDWIDTH=4692000"), "{master}");
+    assert!(!master.contains("BANDWIDTH=6408000"), "{master}");
 
     let body = format!(r#"{{"imdb":"tt0000014","scout":"{origin}/cfg","maxBitrate":0}}"#);
     assert_eq!(call(&state, "POST", "/remux/session", None, &body).await.status, StatusCode::BAD_REQUEST);
+}
+
+/// Selection's order once nothing fits within ten seconds' head start: a copy that asks at most thirty, then a
+/// transcode sized to the link, then the copy that starves least — a transcode that would starve too ranks below it.
+/// h264.mkv, the one copy an H.264-only player takes of tt0000014, is made ten minutes long with a heavy first minute by
+/// seeding what its opening found; hevc.mkv plays for it only converted.
+#[tokio::test]
+async fn a_copy_within_thirty_seconds_then_a_transcode_then_the_least_starving_copy() {
+    let origin = origin().await;
+    let bytes = fixture("h264.mkv");
+    let probed = probe_with_head(&bytes, crate::scout::HEAD_BYTES as usize).await;
+    // A minute at `heavy` bits a second, then nine at 1 Mbit/s; a keyframe every 2 s.
+    let seeded = |heavy: f64| {
+        let keyframes: Vec<f64> = (0..300).map(|i| i as f64 * 2.0).collect();
+        let (mut at, mut index) = (0u64, Vec::new());
+        for &t in &keyframes {
+            index.push((t, at));
+            at += ((if t < 60.0 { heavy } else { 1e6 }) * 2.0 / 8.0) as u64;
+        }
+        let info = probe::MediaInfo { duration: 600.0, keyframes, byte_index: index, ..probed.clone() };
+        (
+            crate::scout::Resolved {
+                url: "http://127.0.0.1:9/h264.mkv".into(),
+                head: bytes.clone(),
+                size: Some(at),
+            },
+            info,
+        )
+    };
+    let state = test_state(&origin, 4, Duration::from_secs(600));
+    state.transcode_ok.store(true, Relaxed);
+    let key = format!("{}/0/h264.mkv", crate::auth::install_id(&format!("{origin}/cfg")));
+    let start = |heavy: f64, link: u64| {
+        let (state, origin, key) = (state.clone(), origin.clone(), key.clone());
+        let (resolved, info) = seeded(heavy);
+        async move {
+            state.opened().put(key, &resolved, &info, std::time::Instant::now());
+            let body = format!(
+                r#"{{"imdb":"tt0000014","scout":"{origin}/cfg","playable":{{"h264":51}},"maxBitrate":{link}}}"#
+            );
+            let r = call(&state, "POST", "/remux/session", None, &body).await;
+            assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+            state.end_all("test").await;
+            r.json()
+        }
+    };
+    let picked = |j: &serde_json::Value| {
+        (j["release"]["filename"].as_str().map(String::from), j["video"]["transcoded"].as_bool())
+    };
+    // 8.1 Mbit/s for a minute on 6.6: about 20 s of head start, which the copy is given over a conversion.
+    let j = start(8.14e6, 6_600_000).await;
+    assert_eq!(picked(&j), (Some("h264.mkv".into()), Some(false)), "{j}");
+    assert!(j["prebuffer"].as_f64().is_some_and(|p| (10.0..=30.0).contains(&p)), "{j}");
+    // 12 Mbit/s: no head start carries it, and a 1080p conversion at the link's rate does.
+    let j = start(12e6, 6_600_000).await;
+    assert_eq!(picked(&j), (Some("hevc.mkv".into()), Some(true)), "{j}");
+    // On 1.5 Mbit/s not even 540p fits: a conversion would starve as well, so the copy that starves least plays.
+    let j = start(12e6, 1_500_000).await;
+    assert_eq!(picked(&j), (Some("h264.mkv".into()), Some(false)), "{j}");
+    assert!(j["prebuffer"].is_null(), "no head start carries it: {j}");
+}
+
+/// A transcode is chosen at selection or not at all: a player replacing a session mid-film says `never` and gets a
+/// copy or a clear no. A player switching away from a release names it (`exclude`), and with `fitsOnly` takes only a
+/// copy its link carries. The session answer carries each segment's bytes as sent.
+#[tokio::test]
+async fn a_switch_takes_another_copy_or_nothing() {
+    let origin = origin().await;
+    let state = test_state(&origin, 4, Duration::from_secs(600));
+    state.transcode_ok.store(true, Relaxed);
+    let hevc_only = r#""playable":{"h264":51}"#;
+    let body =
+        |imdb: &str, extra: &str| format!(r#"{{"imdb":"{imdb}","scout":"{origin}/cfg",{hevc_only}{extra}}}"#);
+    let r = call(&state, "POST", "/remux/session", None, &body("tt0000002", r#","transcode":"never""#)).await;
+    assert_eq!(
+        (r.status, r.json()["error"].as_str()),
+        (StatusCode::NOT_FOUND, Some("no_copy")),
+        "{}",
+        r.text()
+    );
+    assert_eq!(state.transcodes.load(Relaxed), 0);
+    let r = call(&state, "POST", "/remux/session", None, &body("tt0000002", r#","transcode":"ask""#)).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "no ask: selection decides");
+
+    let both = r#""playable":{"h264":51,"hevcMain":153}"#;
+    let both = |extra: &str| format!(r#"{{"imdb":"tt0000014","scout":"{origin}/cfg",{both}{extra}}}"#);
+    let r =
+        call(&state, "POST", "/remux/session", None, &both(r#","exclude":["h264.mkv"],"transcode":"never""#))
+            .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    assert_eq!(r.json()["release"]["filename"], "hevc.mkv", "the one switched away from is not opened");
+    let segments = r.json()["segments"].as_array().cloned().unwrap_or_default();
+    assert!(segments.len() > 1 && r.json()["need"].as_u64().is_some_and(|n| n > 0), "{}", r.text());
+    state.end_all("test").await;
+    let fits = r#","fitsOnly":true,"exclude":["h264.mkv"],"maxBitrate":100000"#;
+    let r = call(&state, "POST", "/remux/session", None, &both(fits)).await;
+    assert_eq!((r.status, r.json()["error"].as_str()), (StatusCode::NOT_FOUND, Some("no_fitting_copy")));
+    let r = call(&state, "POST", "/remux/session", None, &both(r#","fitsOnly":true,"maxBitrate":50000000"#))
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    assert_eq!(state.transcodes.load(Relaxed), 0);
+    state.end_all("test").await;
 }
 
 /// `/remux/speed` sends the bytes asked for — 2 MiB unasked, 8 MiB at most — random and never stored, to anyone, as
