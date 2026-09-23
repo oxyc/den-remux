@@ -214,7 +214,11 @@ people watching, not titles clicked.
 - **Tickets and debrid links stay here.** The browser names a title and gets back one release's session.
   Scout's play URL and the debrid link it leads to are used only by this process and its ffmpeg, so every
   byte leaves from the homelab's IP. `SCOUT_INSTALL_URL`, this service's own install, is a fallback for
-  driving it by hand.
+  driving it by hand. ffmpeg itself reads the release through a door on 127.0.0.1 (`src/source.rs`), a random
+  path per session: the file's head from the bytes the probe already holds, and the rest over this process's
+  pooled connections to the host, warm from the probe. Reading the link itself, ffmpeg made a fresh TCP and TLS
+  connection for each of the three seeks a Matroska start makes; on a 200 ms path that was 2.6 s to a resumed
+  job's `init.mp4`, and through the door it is 0.7 s. The link never appears on ffmpeg's command line.
 - **A browser key is for what needs den-remux to vouch.** An availability-only scout install, or the
   `SCOUT_INSTALL_URL` fallback, plays only for a browser that posted its key once; the server holds only
   SHA-256 hashes (`BROWSER_KEY_HASHES`, optional). The cookie it gets is `HttpOnly; Secure;

@@ -31,6 +31,7 @@ mod redact;
 mod report;
 mod scout;
 mod session;
+mod source;
 mod state;
 mod subs;
 

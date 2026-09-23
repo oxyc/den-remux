@@ -200,6 +200,8 @@ pub struct AppState {
     pub transcode_ok: AtomicBool,
     /// Sessions transcoding now, against `MAX_TRANSCODES`.
     pub transcodes: Arc<AtomicUsize>,
+    /// Each session's loopback door to its release, which its ffmpeg reads through (`source`).
+    pub doors: crate::source::Doors,
 }
 
 /// A held slot against `MAX_SESSIONS`; released when dropped.
@@ -260,6 +262,7 @@ impl AppState {
             scratch_ok: AtomicBool::new(false),
             transcode_ok: AtomicBool::new(false),
             transcodes: Arc::new(AtomicUsize::new(0)),
+            doors: Default::default(),
         })
     }
 

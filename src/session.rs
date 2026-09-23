@@ -192,6 +192,9 @@ pub struct Session {
     /// Scout's play URL for the release and the scout it came from, for fetching a fresh debrid link
     /// when the one ffmpeg reads stops working mid-session. Both are secrets.
     play_url: String,
+    /// The loopback door its ffmpeg reads the release through (`source`); `None` for a release of unknown size, which
+    /// ffmpeg reads directly.
+    door: Option<crate::source::Door>,
     source: scout::ScoutSource,
     /// What the release's link and probe are remembered under (`opened_key`), so a link that stops working is
     /// forgotten there too.
@@ -502,7 +505,8 @@ impl Session {
         let id = i.next_job;
         i.next_job += 1;
         let dir = self.dir.join(format!("j{id}"));
-        let input = i.input.clone();
+        // Through the session's door where there is one: the head from memory, the rest over warm connections.
+        let input = self.door.as_ref().and_then(|d| st.doors.url(d)).unwrap_or_else(|| i.input.clone());
         let spec = Spec {
             input: &input,
             seek,
@@ -593,7 +597,12 @@ impl Session {
         st.opened().forget(&self.opened_key);
         let play_url = crate::config::local(&self.play_url, &st.cfg.origin_aliases);
         match scout::resolve(&st.scout_http, &play_url, &self.source).await {
-            Ok(r) => self.lock().input = r.url,
+            Ok(r) => {
+                if let Some(door) = &self.door {
+                    door.set_upstream(&r.url);
+                }
+                self.lock().input = r.url;
+            }
             Err(e) => eprintln!(
                 "session {}: re-resolving the release failed: {}",
                 self.short(),
@@ -2038,6 +2047,8 @@ pub async fn create(
         },
         segments,
         play_url: c.url.clone(),
+        // Only where the file named its own size (`Content-Range`): the door answers ranges of it.
+        door: resolved.size.map(|size| st.doors.open(st.http.clone(), &resolved.url, &resolved.head, size)),
         source,
         opened_key,
         info,

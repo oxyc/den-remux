@@ -2262,3 +2262,53 @@ async fn session_routes_refuse_without_the_right_credentials() {
     assert_eq!(call(&state, "GET", "/metrics", None, "").await.status, StatusCode::NOT_FOUND);
     assert_eq!(call(&state, "GET", "/health", None, "").await.json()["status"], "ok");
 }
+
+/// How long a job takes to its `init.mp4` and first GOP reading the release directly and through its door, against
+/// a Matroska file at `DOOR_BENCH_URL` (a server that answers ranges, as far away as the case in hand) from the
+/// keyframe at `DOOR_BENCH_SEEK` seconds. The door is opened the way a session opens it: after reading the head and
+/// the file's last 64 KiB — where the probe finds the Cues — over the same client.
+#[tokio::test]
+#[ignore = "needs ffmpeg and a DOOR_BENCH_URL"]
+async fn a_job_starts_sooner_through_the_door() {
+    let Ok(url) = std::env::var("DOOR_BENCH_URL") else { return };
+    let seek: f64 = std::env::var("DOOR_BENCH_SEEK").ok().and_then(|s| s.parse().ok()).unwrap_or(0.0);
+    let state = test_state("http://127.0.0.1:9", 2, Duration::from_secs(600));
+    let get = |range: String| state.http.get(&url).header("range", range).send();
+    let head = get(format!("bytes=0-{}", crate::scout::HEAD_BYTES - 1)).await.unwrap();
+    let size: u64 =
+        head.headers()["content-range"].to_str().unwrap().rsplit('/').next().unwrap().parse().unwrap();
+    let head = head.bytes().await.unwrap();
+    get(format!("bytes={}-", size - 64 * 1024)).await.unwrap().bytes().await.unwrap();
+    let door = state.doors.open(state.http.clone(), &url, &head, size);
+    let through = state.doors.url(&door).unwrap();
+    for (label, input) in [("direct", url.clone()), ("door", through)] {
+        let dir = temp_dir();
+        let spec = crate::job::Spec {
+            input: &input,
+            seek: crate::job::seek_for(seek),
+            video: crate::job::Video::Copy { tag: None, dovi: crate::job::Dovi::Absent },
+            audio: 0,
+            audio_out: crate::job::AudioOut::Copy,
+            text: &[],
+            dir: &dir,
+        };
+        std::fs::create_dir_all(&dir).unwrap();
+        let began = std::time::Instant::now();
+        let mut child =
+            tokio::process::Command::new("ffmpeg").args(crate::job::args(&spec, None)).spawn().unwrap();
+        let (mut init, mut gop) = (None, None);
+        while gop.is_none() && began.elapsed() < Duration::from_secs(60) {
+            if init.is_none() && dir.join("init.mp4").exists() {
+                init = Some(began.elapsed());
+            }
+            let list = std::fs::read_to_string(dir.join("gops.m3u8")).unwrap_or_default();
+            if !crate::job::parse_gops(&list).is_empty() {
+                gop = Some(began.elapsed());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let _ = child.kill().await;
+        eprintln!("{label}: init.mp4 after {init:?}, first GOP after {gop:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
