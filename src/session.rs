@@ -188,6 +188,11 @@ pub struct Session {
     /// How long a player on the link it named waits before a copy plays through without running dry (`prebuffer`):
     /// its pre-buffer target. `None` for a transcode, or without a link or a byte index.
     pub prebuffer: Option<f64>,
+    /// What a copy asks of a link (`need`); `None` for a transcode, whose rate is its preset's.
+    pub need: Option<Need>,
+    /// Each segment's start and bytes as the session sends them (`playlist::segment_bytes`), for a copy with a byte
+    /// index: what a player needs to work out, as the film plays, whether its link keeps up.
+    pub demand: Option<Vec<(f64, u64)>>,
     pub master: String,
     pub media: String,
     reports: AtomicU8,
@@ -1089,6 +1094,13 @@ pub struct Want<'a> {
     pub client: String,
     /// The HLS player it plays in (`native`, `hls.js`, `cast`): how far ahead it buffers (`buffer_of`).
     pub player: Option<&'a str>,
+    /// Releases not to open, by filename: the one a player is switching away from.
+    pub exclude: &'a [String],
+    /// No transcode for this request: a player replacing a session mid-film, which a conversion never replaces one.
+    pub no_transcode: bool,
+    /// Only a copy that fits the link will do: no copy that would starve on it, and no transcode. A player switching
+    /// away from a release its link can't carry asks this, and keeps playing what it has when nothing fits.
+    pub fits_only: bool,
 }
 
 /// What the player decodes, as its own tests found (`playable` in `POST /remux/session`): the highest level it
@@ -1431,6 +1443,10 @@ fn average_bitrate(size: Option<u64>, duration: f64) -> Option<u64> {
 /// for a release is too slow for it. Ten seconds is under the thirty that hls.js and Safari hold ahead, so a player
 /// can build that lead at all, and about what a person waits for a start before giving up on it.
 const MAX_PREBUFFER: f64 = 10.0;
+/// The hard cap on any head start: a copy that asks at most this ranks next after those within `MAX_PREBUFFER`, and
+/// the player shows a countdown while it waits. Longer than this and a viewer is left in front of a spinner, which is
+/// never acceptable; such a copy ranks below a transcode.
+const LONG_PREBUFFER: f64 = 30.0;
 /// What a release with no byte index is taken to need over its average. An encode at a constant quality peaks at
 /// three or four times its average for seconds at a time, but over the stretches a buffer has to carry, half again is
 /// what the indexed releases measured.
@@ -1440,7 +1456,7 @@ const NO_INDEX_HEADROOM: f64 = 1.5;
 /// `MAX_PREBUFFER` and then never runs dry (`playlist::needed_rate`) — or, from a file with no byte index, its average
 /// with `NO_INDEX_HEADROOM`, which `indexed` says it is.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct Need {
+pub struct Need {
     pub bitrate: u64,
     pub indexed: bool,
 }
@@ -1567,7 +1583,7 @@ pub enum Admission {
     /// availability-only, revoked or foreign one does not.
     Install,
     /// A guest's grant, vouched for by den-edge (`EDGE_SECRET`): the install is as for `Install`, but the sessions
-    /// belong to the grant (`grant:<gid>`), are capped by `GUEST_MAX_SESSIONS`, and are never transcoded.
+    /// belong to the grant (`grant:<gid>`), are capped by `GUEST_MAX_SESSIONS`, and share the one transcode with every host.
     Guest(String),
 }
 
@@ -1838,7 +1854,16 @@ pub async fn create(
     // opened at all. The named release stays first unless it can't play. Scout has already ranked a list for a
     // browser that sent its report in the same order; this is what orders one for a player that sent none.
     let mut ranked: Vec<(Fit, &scout::Stream)> = Vec::new();
+    // A transcode is chosen here, before playback, or not at all: never for a player replacing a session mid-film.
+    let may_convert = !want.no_transcode && !want.fits_only;
     for c in &candidates {
+        if want.exclude.iter().any(|f| f == c.filename()) {
+            eprintln!(
+                "session: {imdb} skipped \"{}\" unopened: the player is switching away from it",
+                c.attributes.label
+            );
+            continue;
+        }
         let remembered = unplayable_key(imdb, c).and_then(|k| st.unplayable().get(&k, unix_now()));
         if let Some(why) = remembered {
             eprintln!("session: {imdb} skipped \"{}\" unopened: remembered: {why}", c.attributes.label);
@@ -1857,6 +1882,8 @@ pub async fn create(
                     requested_why = scouted_verdict(&c.attributes, want.playable, takes_hevc).1;
                 }
             }
+            // Only a transcode could play it, and none may be started: not worth opening.
+            Fit::Convert if !may_convert => {}
             f => ranked.push((f, c)),
         }
     }
@@ -1980,15 +2007,47 @@ pub async fn create(
         }
         (chosen, fallback, too_big)
     };
-    let preset = job::preset_for(want.max_bitrate);
-    let bitrate = |t: &(&scout::Stream, (scout::Resolved, MediaInfo))| {
-        need(&t.1 .1, &Delivery::of(&t.1 .1, t.1 .0.size.or(t.0.attributes.size_bytes), want))
-            .map(|n| n.bitrate)
+    // Nothing plays as it is with a head start of `MAX_PREBUFFER` or less. What comes next, in order: a copy that asks
+    // at most `LONG_PREBUFFER` of it, a transcode, the copy that starves least — and else a refusal, up front, which a
+    // retry would not change.
+    // The transcode the link carries at its peak; none fits a link below the floor's, and one that would starve ranks
+    // below the copy that starves least — taken only where no copy plays at all.
+    let fitting = job::preset_for(want.max_bitrate);
+    let preset = fitting.unwrap_or(job::SD540);
+    let fallback_seen = fallback.is_some();
+    let delivery = |t: &(&scout::Stream, (scout::Resolved, MediaInfo))| {
+        Delivery::of(&t.1 .1, t.1 .0.size.or(t.0.attributes.size_bytes), want)
     };
-    if chosen.is_none() {
-        // Nothing plays as it is and fits: a conversion at the preset the link takes — of the first release that plays
-        // only converted, else of the first HEVC copy too big for the link that the preset comes in under.
+    let bitrate =
+        |t: &(&scout::Stream, (scout::Resolved, MediaInfo))| need(&t.1 .1, &delivery(t)).map(|n| n.bitrate);
+    let head_start = |t: &(&scout::Stream, (scout::Resolved, MediaInfo))| {
+        prebuffer(&t.1 .1, &delivery(t), want.max_bitrate).unwrap_or(f64::INFINITY)
+    };
+    if chosen.is_none() && !want.fits_only {
+        let longer = (0..too_big.len())
+            .filter(|&i| head_start(&too_big[i]) <= LONG_PREBUFFER)
+            .min_by(|&a, &b| head_start(&too_big[a]).total_cmp(&head_start(&too_big[b])));
+        if let Some(i) = longer {
+            let (c, found) = too_big.swap_remove(i);
+            chosen = Some((c, found, None));
+        }
+    }
+    let who = if guest { "a guest" } else { "a member" };
+    if chosen.is_none() && may_convert && (fitting.is_some() || too_big.is_empty()) {
+        // A conversion at the preset the link takes — of the first release that plays only converted, else of the
+        // first HEVC copy too big for the link that the preset comes in under.
         let from_too_big = fallback.is_none();
+        let nearest = (0..too_big.len()).min_by_key(|&i| bitrate(&too_big[i]).unwrap_or(u64::MAX));
+        let why = match (from_too_big, nearest.map(|i| &too_big[i])) {
+            (true, Some(t)) => format!(
+                "no copy plays within a {LONG_PREBUFFER:.0}s head start on the {} kbit/s link; the nearest, \"{}\", \
+                 needs {}",
+                want.max_bitrate.unwrap_or(0) / 1000,
+                t.0.attributes.label,
+                need(&t.1 .1, &delivery(t)).map_or_else(|| "an unknown rate".to_string(), |n| n.to_string())
+            ),
+            _ => "no release plays in this player as it is".to_string(),
+        };
         let convert = fallback.or_else(|| {
             let hevc = |t: &(&scout::Stream, (scout::Resolved, MediaInfo))| {
                 t.1 .1.video == VideoCodec::Hevc && bitrate(t).is_some_and(|b| b > preset.bitrate)
@@ -1997,22 +2056,33 @@ pub async fn create(
             Some(too_big.remove(i))
         });
         if let Some((c, found)) = convert {
-            // A guest never takes the GPU, which is the host's.
-            match if guest { None } else { st.reserve_transcode() } {
-                Some(slot) => chosen = Some((c, found, Some(slot))),
-                // The GPU is busy: it still plays as it is, below.
+            match st.reserve_transcode() {
+                Some(slot) => {
+                    // Every conversion is the box's GPU for a whole film: the log says why no copy would do.
+                    eprintln!(
+                        "session: {imdb} converting \"{}\" for {who} to {}p at {} kbit/s (at most {}){}: {why}",
+                        c.attributes.label,
+                        preset.height,
+                        preset.bitrate / 1000,
+                        preset.peak / 1000,
+                        if fitting.is_none() { ", more than the link carries" } else { "" }
+                    );
+                    chosen = Some((c, found, Some(slot)));
+                }
+                // The GPU is off or in use: it still plays as it is, below.
                 None if from_too_big => too_big.push((c, found)),
                 None => {
                     no_transcode = true;
                     eprintln!(
-                        "session: {imdb} skipped \"{}\": it needs converting, and no transcode is free",
+                        "session: {imdb} can't play \"{}\" for {who}: it needs converting ({why}), and no transcode \
+                         is free",
                         c.attributes.label
                     );
                 }
             }
         }
     }
-    if chosen.is_none() {
+    if chosen.is_none() && !want.fits_only {
         // Last, the copy too big for the link that needs the least: a stall now and then beats nothing to play.
         if let Some(i) = (0..too_big.len()).min_by_key(|&i| bitrate(&too_big[i]).unwrap_or(u64::MAX)) {
             let (c, found) = too_big.swap_remove(i);
@@ -2020,11 +2090,20 @@ pub async fn create(
         }
     }
     let Some((c, (resolved, info), transcode)) = chosen else {
-        if no_transcode {
+        if want.fits_only {
             return Err(api(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "transcode_unavailable",
-                "This player takes no HEVC, and the GPU transcode is off or in use; try again when the other session ends.",
+                StatusCode::NOT_FOUND,
+                "no_fitting_copy",
+                "No other release plays here as it is within what the link carries.",
+            ));
+        }
+        // Only a conversion would have played it: the GPU in use, or none may be started for this request.
+        if no_transcode || (fallback_seen && !may_convert) {
+            return Err(api(
+                StatusCode::NOT_FOUND,
+                "no_copy",
+                "This can't be played on this device right now: no release plays here as it is, and none can be \
+                 converted now.",
             ));
         }
         return Err(api(StatusCode::NOT_FOUND, "no_playable_release", "No cached release could be opened."));
@@ -2119,12 +2198,22 @@ pub async fn create(
     let opened_key = opened_key(&source.base, c);
     // A transcode's keyframes are its encoder's IDRs, in closed GOPs; a copy's are the release's own.
     let closed_gops = transcode.is_some() || info.closed_gops;
-    let prebuffer = match transcode {
-        Some(_) => None,
-        None => prebuffer(&info, &Delivery::of(&info, size, want), want.max_bitrate),
+    let (prebuffer, need, demand) = match transcode {
+        Some(_) => (want.max_bitrate.map(|rate| preset.head_start(rate)), None, None),
+        None => {
+            let delivery = Delivery::of(&info, size, want);
+            let bytes = playlist::segment_bytes(&segments, &info.byte_index, delivery.bytes);
+            (
+                prebuffer(&info, &delivery, want.max_bitrate),
+                need(&info, &delivery),
+                bytes.map(|b| segments.iter().zip(b).map(|(s, b)| (s.start, b.round() as u64)).collect()),
+            )
+        }
     };
     let session = Arc::new(Session {
         prebuffer,
+        need,
+        demand,
         master: playlist::master(
             &codecs,
             dv_signal.as_ref(),
@@ -2501,6 +2590,9 @@ mod tests {
             max_bitrate: None,
             client: "test".into(),
             player: None,
+            exclude: &[],
+            no_transcode: false,
+            fits_only: false,
         };
         assert!(!no_picture(want.playable, true, &release), "the BT.2020 base layer has a picture");
     }
@@ -2799,6 +2891,9 @@ mod tests {
             max_bitrate: None,
             client: "test".into(),
             player: None,
+            exclude: &[],
+            no_transcode: false,
+            fits_only: false,
         }
     }
 
