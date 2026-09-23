@@ -428,10 +428,10 @@ where
             "Expected {code, message} or {stats}.",
         );
     };
-    if let Some((code, message)) = r.error {
+    if let Some((code, message)) = r.failure() {
         eprintln!(
             "session {short}: the player couldn't play it: error {code} \"{}\"",
-            redact::player_message(&message)
+            redact::player_message(message)
         );
     }
     if let Some(stats) = &r.stats {

@@ -20,6 +20,15 @@ pub struct Report {
     pub stats: Option<Value>,
 }
 
+impl Report {
+    /// The error the player couldn't play past, when there was one. Den Web sends its stats with
+    /// `{code: 0, message: "playback stats (<event>)"}`, which is no failure: the stats line says what sent them.
+    pub fn failure(&self) -> Option<(u16, &str)> {
+        let (code, message) = self.error.as_ref()?;
+        (*code != 0 || self.stats.is_none()).then_some((*code, message.as_str()))
+    }
+}
+
 /// A report, when the body is one: a JSON object with `code` and `message`, or `stats`, or both.
 pub fn parse(body: &[u8]) -> Option<Report> {
     let v: Value = serde_json::from_slice(body).ok()?;
@@ -45,11 +54,17 @@ fn text(v: &Value, key: &str) -> Option<String> {
     v.get(key).and_then(Value::as_str).map(word).filter(|w| !w.is_empty())
 }
 
-/// One stall: `at=512s 4200ms v=0.0 a=6.1`, what it says of itself.
+/// One stall: `at=512s frozen 4200ms v=12.0 a=11.8`, what it says of itself. Its kind is `wait` (the player waited
+/// for data) or `frozen` (the clock ran with no new frame decoded); a null `ms` is a stall not yet over, `ms=?`.
 fn stall(s: &Value) -> String {
+    let ms = match s.get("ms") {
+        Some(Value::Null) => Some("ms=?".to_string()),
+        _ => num(s, "ms").map(|n| format!("{n:.0}ms")),
+    };
     let parts = [
         num(s, "at").map(|n| format!("at={n:.0}s")),
-        num(s, "ms").map(|n| format!("{n:.0}ms")),
+        text(s, "kind"),
+        ms,
         num(s, "videoAhead").map(|n| format!("v={n:.1}")),
         num(s, "audioAhead").map(|n| format!("a={n:.1}")),
     ];
@@ -62,14 +77,24 @@ fn stall(s: &Value) -> String {
 }
 
 /// The report's stats as one bounded log line for session `short`:
-/// `session AbCdEf: report chrome/macos hls.js frags=120 med=4100k p10=900k slowest=9800ms est=3800k dropped=0/5400
-/// stalls=3 [at=512s 4200ms v=0.0 a=6.1; …] errors=bufferStalledError x2,fragLoadError(fatal)`.
+/// `session AbCdEf: report end chrome/windows hls.js buffers=separate frags=120 med=4100k p10=900k slowest=9800ms
+/// est=3800k dropped=0/5400 stalls=7 (4 frozen) 18400ms [at=512s frozen 4200ms v=12.0 a=11.8; …]
+/// errors=bufferStalledError x2,fragLoadError(fatal)`. What sent it (`event`: stall, hidden, end) leads, when named.
 pub fn stats_line(short: &str, s: &Value) -> String {
-    let mut line = format!(
-        "session {short}: report {} {}",
+    let mut line = format!("session {short}: report");
+    if let Some(event) = text(s, "event") {
+        line.push(' ');
+        line.push_str(&event);
+    }
+    line.push_str(&format!(
+        " {} {}",
         text(s, "browser").unwrap_or_else(|| "?".into()),
         text(s, "engine").unwrap_or_else(|| "?".into())
-    );
+    ));
+    // Whether a stall's videoAhead and audioAhead are each track's own buffer or one combined.
+    if let Some(buffers) = text(s, "buffers") {
+        line.push_str(&format!(" buffers={buffers}"));
+    }
     if let Some(f) = s.get("fragments").filter(|f| f.is_object()) {
         let parts = [
             num(f, "count").map(|n| format!("frags={n:.0}")),
@@ -92,28 +117,41 @@ pub fn stats_line(short: &str, s: &Value) -> String {
         (Some(d), None) => line.push_str(&format!(" dropped={d:.0}")),
         _ => {}
     }
-    if let Some(stalls) = s.get("stalls").and_then(Value::as_array) {
-        line.push_str(&format!(" stalls={}", stalls.len()));
+    // `stallCount` and `stalledMs` are totals over every stall; the `stalls` list the player sends is capped.
+    let stalls = s.get("stalls").and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default();
+    let count = num(s, "stallCount").map(|n| n.max(0.0) as usize);
+    if count.is_some() || s.get("stalls").is_some_and(Value::is_array) {
+        let total = count.unwrap_or(0).max(stalls.len());
+        line.push_str(&format!(" stalls={total}"));
+        if stalls.iter().any(|st| st.get("kind").is_some()) {
+            let frozen = stalls.iter().filter(|st| st.get("kind").and_then(Value::as_str) == Some("frozen"));
+            line.push_str(&format!(" ({} frozen)", frozen.count()));
+        }
+        if let Some(ms) = num(s, "stalledMs") {
+            line.push_str(&format!(" {ms:.0}ms"));
+        }
         if !stalls.is_empty() {
             let mut shown: Vec<String> = stalls.iter().take(MAX_STALLS).map(stall).collect();
-            if stalls.len() > MAX_STALLS {
-                shown.push(format!("+{} more", stalls.len() - MAX_STALLS));
+            if total > shown.len() {
+                shown.push(format!("+{} more", total - shown.len()));
             }
             line.push_str(&format!(" [{}]", shown.join("; ")));
         }
     }
     if let Some(errors) = s.get("errors").and_then(Value::as_array).filter(|e| !e.is_empty()) {
-        // Each kind once, in the order first seen, with how often it came and whether it was ever fatal.
-        let mut kinds: Vec<(String, usize, bool)> = Vec::new();
+        // Each kind once, in the order first seen, with how often it came (an entry's own `count`, else once) and
+        // whether it was ever fatal.
+        let mut kinds: Vec<(String, u64, bool)> = Vec::new();
         for e in errors {
             let name = text(e, "details").unwrap_or_else(|| "?".into());
             let fatal = e.get("fatal").and_then(Value::as_bool).unwrap_or(false);
+            let times = num(e, "count").map_or(1, |n| (n.max(1.0)) as u64);
             match kinds.iter_mut().find(|(n, _, _)| *n == name) {
                 Some(k) => {
-                    k.1 += 1;
+                    k.1 = k.1.saturating_add(times);
                     k.2 |= fatal;
                 }
-                None => kinds.push((name, 1, fatal)),
+                None => kinds.push((name, times, fatal)),
             }
         }
         let mut shown: Vec<String> = kinds
@@ -176,6 +214,42 @@ mod tests {
              slowest=9800ms est=3800k dropped=0/5400 stalls=1 [at=512s 4200ms v=0.0 a=6.1] \
              errors=bufferStalledError x2,fragLoadError(fatal)"
         );
+    }
+
+    #[test]
+    fn den_webs_final_stats_name_the_event_buffers_frozen_stalls_and_error_counts() {
+        let body = br#"{"code":0,"message":"playback stats (end)","stats":{
+            "event":"end","browser":"chrome/windows","engine":"hls.js","buffers":"separate",
+            "fragments":{"count":80,"kbpsMedian":4100,"kbpsP10":900,"slowestMs":9800},
+            "bandwidthEstimateKbps":3800,"droppedFrames":3,"totalFrames":5400,
+            "stallCount":7,"stalledMs":18400,
+            "stalls":[{"at":512,"kind":"frozen","ms":4200,"videoAhead":12,"audioAhead":11.8},
+                      {"at":900.4,"kind":"wait","ms":null,"videoAhead":0,"audioAhead":0.2}],
+            "errors":[{"details":"bufferStalledError","fatal":false,"count":2},
+                      {"details":"bufferNudgeOnStall","count":1},{"details":"bufferStalledError","count":3}]}}"#;
+        let r = parse(body).expect("a report");
+        assert!(r.failure().is_none(), "code 0 alongside stats is no failure");
+        assert_eq!(
+            stats_line("AbCdEf", r.stats.as_ref().unwrap()),
+            "session AbCdEf: report end chrome/windows hls.js buffers=separate frags=80 med=4100k p10=900k \
+             slowest=9800ms est=3800k dropped=3/5400 stalls=7 (1 frozen) 18400ms \
+             [at=512s frozen 4200ms v=12.0 a=11.8; at=900s wait ms=? v=0.0 a=0.2; +5 more] \
+             errors=bufferStalledError x5,bufferNudgeOnStall"
+        );
+    }
+
+    #[test]
+    fn only_a_nonzero_code_or_one_without_stats_is_a_failure() {
+        let failure = |body: &[u8]| parse(body).unwrap().failure().map(|(c, m)| (c, m.to_string()));
+        assert_eq!(failure(br#"{"code":3,"message":"DECODE","stats":{}}"#), Some((3, "DECODE".into())));
+        assert_eq!(failure(br#"{"code":0,"message":"x"}"#), Some((0, "x".into())), "the old shape as it was");
+        assert_eq!(failure(br#"{"code":0,"message":"playback stats (stall)","stats":{}}"#), None);
+    }
+
+    #[test]
+    fn stall_totals_stand_without_a_list() {
+        let stats = serde_json::json!({"event": "hidden", "stallCount": 2, "stalledMs": 3100});
+        assert_eq!(stats_line("AbCdEf", &stats), "session AbCdEf: report hidden ? ? stalls=2 3100ms");
     }
 
     #[test]

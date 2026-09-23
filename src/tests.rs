@@ -170,6 +170,9 @@ async fn a_report_takes_the_old_shape_and_stats_and_refuses_what_is_neither_or_t
     assert_eq!(post(r#"{"code":3,"message":"DECODE"}"#.into()).await.status(), StatusCode::NO_CONTENT);
     let stats = r#"{"stats":{"engine":"hls.js","fragments":{"count":3},"stalls":[{"at":1,"ms":900}]}}"#;
     assert_eq!(post(stats.into()).await.status(), StatusCode::NO_CONTENT);
+    let den_web = r#"{"code":0,"message":"playback stats (stall)","stats":{"event":"stall","stallCount":1,
+        "stalls":[{"at":3,"kind":"frozen","ms":null}]}}"#;
+    assert_eq!(post(den_web.into()).await.status(), StatusCode::NO_CONTENT);
     for garbage in ["{}", "nonsense", r#"{"stats":7}"#] {
         assert_eq!(post(garbage.into()).await.status(), StatusCode::BAD_REQUEST, "{garbage}");
     }
