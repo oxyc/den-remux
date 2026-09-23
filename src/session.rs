@@ -964,6 +964,38 @@ pub(crate) fn known_key(title: &str, s: &scout::Stream) -> String {
     format!("{title}/{}", s.filename())
 }
 
+/// What `AppState::unplayable` remembers a release under: the title, the release's size and its name. Scout gives
+/// no infohash or file index — its play URL is a ticket minted afresh with every listing — and its
+/// `behaviorHints.filename` is what it names as a release's identity across listings. The size tells apart two files
+/// under one name (a repack, one episode of a season pack from another), and the title keeps a pack's name for one
+/// episode from standing for the next. `None` without a size: a name alone is too little to rule a release out by.
+pub(crate) fn unplayable_key(title: &str, s: &scout::Stream) -> Option<String> {
+    let size = s.attributes.size_bytes.filter(|n| *n > 0)?;
+    Some(format!("{title}/{size}/{}", s.filename()))
+}
+
+/// Why opening a release failed. `lasting` when the file itself is why — no browser would play it — so the next
+/// session skips it unopened; a timeout, a network error or a debrid's refusal never is, and neither is what depends
+/// on the player (`create` decides that on an opened release, which `open` returns as `Ok`).
+pub(crate) struct OpenFailure {
+    pub why: String,
+    pub lasting: bool,
+}
+
+impl OpenFailure {
+    fn passing(why: String) -> Self {
+        OpenFailure { why, lasting: false }
+    }
+}
+
+/// Whether a head that starts neither container is the file's own first bytes, and not an error page a debrid sent
+/// in its place: as long as was asked for (or the whole file), and not text.
+fn the_files_own_head(r: &scout::Resolved) -> bool {
+    let full = r.head.len() as u64 == scout::HEAD_BYTES.min(r.size.unwrap_or(u64::MAX));
+    let text = r.head.iter().find(|b| !b.is_ascii_whitespace()).is_some_and(|b| matches!(b, b'<' | b'{'));
+    full && !r.head.is_empty() && !text
+}
+
 /// Try one candidate: follow its play URL, read the head, and probe it — or take all of that from a recent
 /// open of the same release by the same install. What the probe found is remembered for `releases`' verdicts.
 async fn open(
@@ -971,23 +1003,29 @@ async fn open(
     src: &scout::ScoutSource,
     title: &str,
     s: &scout::Stream,
-) -> Result<(scout::Resolved, MediaInfo), String> {
+) -> Result<(scout::Resolved, MediaInfo), OpenFailure> {
     let key = opened_key(&src.base, s);
     if let Some(hit) = st.opened().get(&key, Instant::now()) {
         return Ok(hit);
     }
     // A ticket on scout's public name (d-play) is fetched at its LAN address, like the install it came from.
-    let r =
-        scout::resolve(&st.scout_http, &crate::config::local(&s.url, &st.cfg.origin_aliases), src).await?;
-    let info = crate::probe::probe(&Source::Http { client: &st.http, url: &r.url }, &r.head)
+    let r = scout::resolve(&st.scout_http, &crate::config::local(&s.url, &st.cfg.origin_aliases), src)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(OpenFailure::passing)?;
+    let info = match crate::probe::probe(&Source::Http { client: &st.http, url: &r.url }, &r.head).await {
+        Ok(info) => info,
+        Err(e) => {
+            let neither =
+                matches!(&e, crate::probe::ProbeError::Unsupported(w) if w == crate::probe::NEITHER);
+            return Err(OpenFailure { why: e.to_string(), lasting: neither && the_files_own_head(&r) });
+        }
+    };
     st.known().put(known_key(title, s), &info);
     if let VideoCodec::Other(c) = &info.video {
-        return Err(format!("video is {c}, which needs a re-encode"));
+        return Err(OpenFailure { why: format!("video is {c}, which needs a re-encode"), lasting: true });
     }
     if info.audio.is_empty() {
-        return Err("no audio track".into());
+        return Err(OpenFailure { why: "no audio track".into(), lasting: true });
     }
     st.opened().put(key, &r, &info, Instant::now());
     Ok((r, info))
@@ -1536,7 +1574,8 @@ fn scouted_verdict(
 /// `POST /remux/releases`: the releases a session could play, in the order it would try them, so a player can name
 /// one (`filename`), each with how it plays for a player that says what it decodes (`playable`, `videoCodecs`):
 /// by scout's attributes, or — once a session has opened the release — by what the probe found. The caller gets
-/// their labels, names and sizes — never a URL. Without a report every release is `yes`.
+/// their labels, names and sizes — never a URL. Without a report every release is `yes`, but one a session found
+/// plays in no browser (`AppState::unplayable`).
 pub async fn releases(
     st: &Arc<AppState>,
     admission: Admission,
@@ -1564,7 +1603,10 @@ pub async fn releases(
     Ok(candidates
         .into_iter()
         .map(|stream| {
-            let (plays, why) = if !reported {
+            let nowhere = unplayable_key(id, &stream).and_then(|k| st.unplayable().get(&k, unix_now()));
+            let (plays, why) = if let Some(why) = nowhere {
+                (Plays::No, Some(why))
+            } else if !reported {
                 (Plays::Yes, None)
             } else if let Some(info) = st.known().get(&known_key(id, &stream)) {
                 probed_verdict(&info, playable, takes_hevc)
@@ -1641,12 +1683,32 @@ pub async fn create(
     let takes_hevc = player_takes_hevc(want.playable, want.video_codecs);
     // Why the release the player named was passed over, where it was: `release.requested` in the answer.
     let mut requested_why: Option<String> = None;
+    // Left out of `candidates` by their names, which a person reading the log should see was on purpose.
+    for s in list.iter().filter(|s| s.attributes.cached == Some(true) && !s.attributes.three_d) {
+        if let Some(ext) = scout::left_out_by_name(s) {
+            eprintln!(
+                "session: {imdb} skipped \"{}\" unopened: {ext} is not a container this service opens",
+                s.attributes.label
+            );
+            if want.filename == Some(s.filename()) {
+                requested_why = Some(format!("{ext} files can't be played here"));
+            }
+        }
+    }
     // What scout says of each release decides, before any is opened, which are tried first — those that play as
     // they are, then those that play only converted, scout's ranking holding within each — and which aren't
     // opened at all. The named release stays first unless it can't play. Scout has already ranked a list for a
     // browser that sent its report in the same order; this is what orders one for a player that sent none.
     let mut ranked: Vec<(Fit, &scout::Stream)> = Vec::new();
     for c in &candidates {
+        let remembered = unplayable_key(imdb, c).and_then(|k| st.unplayable().get(&k, unix_now()));
+        if let Some(why) = remembered {
+            eprintln!("session: {imdb} skipped \"{}\" unopened: remembered: {why}", c.attributes.label);
+            if want.filename == Some(c.filename()) {
+                requested_why = Some(why);
+            }
+            continue;
+        }
         match fit(&c.attributes, want.playable, takes_hevc) {
             Fit::Never => {
                 eprintln!(
@@ -1684,7 +1746,8 @@ pub async fn create(
                 tried += 1;
                 opening.push_back(async move {
                     let opened = tokio::time::timeout(OPEN_TIMEOUT, open(st, source, imdb, c)).await;
-                    (c, opened.unwrap_or_else(|_| Err(format!("not open after {}s", OPEN_TIMEOUT.as_secs()))))
+                    let late = || OpenFailure::passing(format!("not open after {}s", OPEN_TIMEOUT.as_secs()));
+                    (c, opened.unwrap_or_else(|_| Err(late())))
                 });
             }
             // In the order they were started, which is rank order.
@@ -1760,12 +1823,12 @@ pub async fn create(
                     chosen = Some((c, found, None));
                     break;
                 }
-                Err(why) => {
-                    eprintln!(
-                        "session: {imdb} skipped \"{}\": {}",
-                        c.attributes.label,
-                        crate::redact::scrub(&why, &secrets)
-                    );
+                Err(failure) => {
+                    let why = crate::redact::scrub(&failure.why, &secrets);
+                    eprintln!("session: {imdb} skipped \"{}\": {why}", c.attributes.label);
+                    if let Some(key) = unplayable_key(imdb, c).filter(|_| failure.lasting) {
+                        st.remember_unplayable(key, why);
+                    }
                     if want.filename == Some(c.filename()) {
                         requested_why = Some("it could not be opened".into());
                     }

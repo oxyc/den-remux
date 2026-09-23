@@ -789,6 +789,9 @@ pub async fn read_capped(mut resp: reqwest::Response, cap: u64) -> Result<Vec<u8
     Ok(out)
 }
 
+/// Why `probe` refuses a head that starts neither container.
+pub const NEITHER: &str = "neither Matroska nor MP4";
+
 /// Probe a file whose first bytes are `head`, dispatching on its magic rather than its name.
 pub async fn probe(src: &Source<'_>, head: &[u8]) -> Result<MediaInfo, ProbeError> {
     if head.starts_with(&[0x1A, 0x45, 0xDF, 0xA3]) {
@@ -797,7 +800,7 @@ pub async fn probe(src: &Source<'_>, head: &[u8]) -> Result<MediaInfo, ProbeErro
     if head.len() >= 8 && matches!(&head[4..8], b"ftyp" | b"moov" | b"free" | b"mdat" | b"wide" | b"skip") {
         return mp4::probe(src, head).await;
     }
-    Err(ProbeError::Unsupported("neither Matroska nor MP4".into()))
+    Err(ProbeError::Unsupported(NEITHER.into()))
 }
 
 /// `avc1.PPCCLL` from an `avcC` record: profile, constraint flags, level.

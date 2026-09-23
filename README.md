@@ -33,7 +33,7 @@ POST   /remux/releases                  {imdb, season?, episode?, scout?, videoC
                                         "no" for the player that sent `playable` (as /remux/session parses it) or
                                         `videoCodecs`, by scout's attributes and by what opening a release has shown of
                                         it (remembered in memory); `why` is a short reason, null for a yes. Without a
-                                        report every release is "yes". A session's `release.requested {filename, why}`
+                                        report every release is "yes", but one a session found plays in no browser. A session's `release.requested {filename, why}`
                                         names the release it was asked for when it played another. What a session could play, in the
                                         order it would try them, for a player to name one as `filename`. No URLs
 GET    /remux/speed?bytes=<n>           200 application/octet-stream: n random bytes (2 MiB unnamed, 8 MiB at most),
@@ -55,8 +55,11 @@ GET    /remux/s/<sid>/<sig>/sub<N>_<W>.vtt
                                         past it, else 503 + Retry-After: 2 (no-store)
 GET    /remux/s/<sid>/<sig>/speed?bytes=<n>
                                         the same bounded speed probe, authorized by this session URL; two attempts
-POST   /remux/s/<sid>/<sig>/report      {code, message}: the player couldn't play it — logged against the session, 204;
-                                        at most three attempts per session, including malformed reports
+POST   /remux/s/<sid>/<sig>/report      {code, message} (the player couldn't play it) and/or {stats} (how playing went:
+                                        event, browser, engine, buffers, fragments, bandwidth estimate, frames, stall
+                                        totals and wait/frozen stalls, errors — every field optional) — each logged
+                                        against the session as one bounded line (code 0 beside stats is no failure), 204;
+                                        64 KiB at most; at most three attempts per session, including malformed reports
 DELETE /remux/s/<sid>/<sig>             204; the session's URLs answer 410 from then on
 GET    /health, /remux/health           200 {status} — ok, or degraded with a reason (Maintenance); the second is
                                         what a client probes under the /remux mount (den-spec routes-v1)
@@ -327,7 +330,7 @@ Every variable is unprefixed; `.env.example` lists them with their defaults.
 | `MAX_SESSIONS` | `2` | Sessions at once; the next gets 429 `too_many_sessions`. |
 | `MAX_SESSIONS_PER_INSTALL` | `2` | Sessions one scout install plays at once without a login; past it, its oldest ends. |
 | `SESSION_IDLE_SECS` | `600` | A session with no request for this long is ended (min 30). |
-| `SCRATCH_DIR` | `/cache` | Where GOP files go. den-remux's alone: every `s-*` directory in it is deleted at start. |
+| `SCRATCH_DIR` | `/cache` | Where GOP files go. den-remux's alone: every `s-*` directory in it is deleted at start. `unplayable.json` keeps, across restarts, the releases a session found play in no browser (neither Matroska nor MP4, a video nothing here copies or converts, no audio): skipped unopened for 7 days, 10 000 at most. |
 | `SCRATCH_MAX_BYTES` | `1073741824` | Cap across sessions; past it a job pauses once the requested segment is done (min 64 MiB). |
 | `FFMPEG_PATH` | `ffmpeg` | The image sets `/usr/local/bin/ffmpeg`. (There is no `FFPROBE_PATH`: probing is done in-process.) |
 | `MAX_TRANSCODES` | `1` | Sessions transcoding on the GPU at once; `0` turns transcoding off. Copies do not count. |

@@ -9,7 +9,8 @@
 //!                        it was asked for was passed over.
 //!   GET  /remux/speed?bytes=<n>             → n random bytes (8 MiB at most), for a remote player to time its link
 //!   GET  /remux/s/<sid>/<sig>/…             → HLS (fMP4) and a session-bound speed probe
-//!   POST /remux/s/<sid>/<sig>/report {code, message} → the player couldn't play it, into the log
+//!   POST /remux/s/<sid>/<sig>/report {code?, message?, stats?} → why the player couldn't play it, and how playing
+//!                        went (`report::stats_line`), into the log
 //!   DELETE /remux/s/<sid>/<sig>             → end it (410 from then on)
 //!   GET  /health, /metrics
 //!
@@ -27,6 +28,7 @@ mod lang;
 mod playlist;
 mod probe;
 mod redact;
+mod report;
 mod scout;
 mod session;
 mod state;
@@ -401,31 +403,41 @@ where
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
     // Two install URLs with sealed configs fit well inside this.
-    http_body_util::Limited::new(body, 16 * 1024).collect().await.ok().map(|c| c.to_bytes())
+    read_body_up_to(body, 16 * 1024).await
 }
 
-/// A player's report of why it couldn't play the session `short`, into the log.
+/// A request body of at most `cap` bytes; `None` past it.
+async fn read_body_up_to<B>(body: B, cap: usize) -> Option<Bytes>
+where
+    B: hyper::body::Body<Data = Bytes> + Send + 'static,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    http_body_util::Limited::new(body, cap).collect().await.ok().map(|c| c.to_bytes())
+}
+
+/// A player's report on the session `short` — why it couldn't play it, how playing went — into the log.
 async fn report<B>(short: &str, body: B) -> Response<Body>
 where
     B: hyper::body::Body<Data = Bytes> + Send + 'static,
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
-    #[derive(serde::Deserialize)]
-    struct Report {
-        code: u16,
-        message: String,
+    let Some(r) = read_body_up_to(body, report::MAX_BODY).await.and_then(|b| report::parse(&b)) else {
+        return httputil::error(
+            StatusCode::BAD_REQUEST,
+            "bad_report",
+            "Expected {code, message} or {stats}.",
+        );
+    };
+    if let Some((code, message)) = r.failure() {
+        eprintln!(
+            "session {short}: the player couldn't play it: error {code} \"{}\"",
+            redact::player_message(message)
+        );
     }
-    match read_body(body).await.and_then(|b| serde_json::from_slice::<Report>(&b).ok()) {
-        Some(r) => {
-            eprintln!(
-                "session {short}: the player couldn't play it: error {} \"{}\"",
-                r.code,
-                redact::player_message(&r.message)
-            );
-            Response::builder().status(StatusCode::NO_CONTENT).body(httputil::full("")).unwrap()
-        }
-        None => httputil::error(StatusCode::BAD_REQUEST, "bad_report", "Expected {code, message}."),
+    if let Some(stats) = &r.stats {
+        eprintln!("{}", report::stats_line(short, stats));
     }
+    Response::builder().status(StatusCode::NO_CONTENT).body(httputil::full("")).unwrap()
 }
 
 fn bad_request(detail: &str) -> Response<Body> {
@@ -893,6 +905,7 @@ async fn run(cfg: Config) -> std::io::Result<()> {
     let state = AppState::new(cfg);
     state::sweep_scratch(&state.cfg.scratch_dir);
     state.scratch_ok.store(state::check_scratch(&state.cfg.scratch_dir), Relaxed);
+    state.load_unplayable();
     state.ffmpeg_ok.store(state::check_ffmpeg(&state.cfg.ffmpeg).await, Relaxed);
     let transcode = state.cfg.max_transcodes > 0
         && state::check_transcode(&state.cfg.ffmpeg, &state.cfg.vaapi_device).await;

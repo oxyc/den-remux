@@ -164,6 +164,28 @@ async fn neither_container_is_refused() {
     assert!(matches!(err, probe::ProbeError::Unsupported(_)), "{err}");
 }
 
+#[tokio::test]
+async fn a_report_takes_the_old_shape_and_stats_and_refuses_what_is_neither_or_too_big() {
+    let post = |body: String| crate::report("abcdef", Full::new(Bytes::from(body)));
+    assert_eq!(post(r#"{"code":3,"message":"DECODE"}"#.into()).await.status(), StatusCode::NO_CONTENT);
+    let stats = r#"{"stats":{"engine":"hls.js","fragments":{"count":3},"stalls":[{"at":1,"ms":900}]}}"#;
+    assert_eq!(post(stats.into()).await.status(), StatusCode::NO_CONTENT);
+    let den_web = r#"{"code":0,"message":"playback stats (stall)","stats":{"event":"stall","stallCount":1,
+        "stalls":[{"at":3,"kind":"frozen","ms":null}]}}"#;
+    assert_eq!(post(den_web.into()).await.status(), StatusCode::NO_CONTENT);
+    for garbage in ["{}", "nonsense", r#"{"stats":7}"#] {
+        assert_eq!(post(garbage.into()).await.status(), StatusCode::BAD_REQUEST, "{garbage}");
+    }
+    // Past the 16 KiB other requests get, within the report's own cap.
+    let errors = |n: usize| vec![r#"{"details":"bufferStalledError","fatal":false}"#; n].join(",");
+    let big = format!(r#"{{"stats":{{"errors":[{}]}}}}"#, errors(500));
+    assert!(big.len() > 16 * 1024 && big.len() < crate::report::MAX_BODY);
+    assert_eq!(post(big).await.status(), StatusCode::NO_CONTENT);
+    let oversized = format!(r#"{{"stats":{{"errors":[{}]}}}}"#, errors(2000));
+    assert!(oversized.len() > crate::report::MAX_BODY);
+    assert_eq!(post(oversized).await.status(), StatusCode::BAD_REQUEST);
+}
+
 // ---- integration: real ffmpeg ------------------------------------------------------------------
 
 fn tool(env: &str, default: &str) -> String {
@@ -216,6 +238,9 @@ static NEVER_OPENED: AtomicU32 = AtomicU32::new(0);
 static COUNTED_PLAYS: AtomicU32 = AtomicU32::new(0);
 /// Play URLs the fake scout was asked to follow under `/p/av1/`.
 static AV1_PLAYS: AtomicU32 = AtomicU32::new(0);
+/// Play URLs the fake scout was asked to follow under `/p/unplayable/`, `/p/errorpage/`.
+static UNPLAYABLE_PLAYS: AtomicU32 = AtomicU32::new(0);
+static ERROR_PAGE_PLAYS: AtomicU32 = AtomicU32::new(0);
 /// Lists and subtitles the `flaky` den-subtitles install was asked for.
 static FLAKY_LISTS: AtomicU32 = AtomicU32::new(0);
 static FLAKY_SUBTITLES: AtomicU32 = AtomicU32::new(0);
@@ -356,6 +381,23 @@ async fn origin_handle(
             ]});
             return origin_full(200, body.to_string());
         }
+        if imdb == "tt0000016" {
+            // Ahead of one that plays: a release named .m2ts, one whose bytes are MPEG-TS, and one whose debrid
+            // answers with an error page.
+            let release = |path: &str, filename: &str| {
+                serde_json::json!({"url": format!("http://{addr}/{p}/{path}"),
+                                   "attributes": {"cached": true, "codec": "h264", "sizeBytes": 307_200,
+                                                  "label": filename},
+                                   "behaviorHints": {"filename": filename}})
+            };
+            let body = serde_json::json!({"streams": [
+                release("unplayable/mpegts", "Film.BluRay.m2ts"),
+                release("unplayable/mpegts", "Film.mkv"),
+                release("errorpage/errorpage", "Film.WEB.mkv"),
+                release("h264.mkv", "h264.mkv"),
+            ]});
+            return origin_full(200, body.to_string());
+        }
         if imdb == "tt0000008" {
             // Four releases that won't open, ahead of one that does.
             let release = |url: String, filename: String| {
@@ -410,6 +452,13 @@ async fn origin_handle(
             }
             None => rest,
         };
+        if rest.starts_with("unplayable/") {
+            UNPLAYABLE_PLAYS.fetch_add(1, Relaxed);
+        }
+        if rest.starts_with("errorpage/") {
+            ERROR_PAGE_PLAYS.fetch_add(1, Relaxed);
+        }
+        let rest = rest.trim_start_matches("unplayable/").trim_start_matches("errorpage/");
         return Response::builder()
             .status(302)
             .header("location", format!("http://{files}/f/{rest}"))
@@ -421,7 +470,17 @@ async fn origin_handle(
         Some(n) => (true, n),
         None => (false, rest),
     };
-    let Ok(data) = std::fs::read(testdata(name)) else { return origin_full(404, "") };
+    if name == "errorpage" {
+        return origin_full(200, "<html><body>Service temporarily unavailable</body></html>");
+    }
+    // MPEG-TS sync bytes: a file that is neither Matroska nor MP4.
+    let data = match name {
+        "mpegts" => vec![0x47; 300 * 1024],
+        _ => match std::fs::read(testdata(name)) {
+            Ok(data) => data,
+            Err(_) => return origin_full(404, ""),
+        },
+    };
     let size = data.len();
     let range =
         req.headers().get("range").and_then(|v| v.to_str().ok()).and_then(|r| r.strip_prefix("bytes=")).map(
@@ -1159,6 +1218,43 @@ async fn the_search_goes_past_three_releases_that_wont_open() {
     assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
     assert_eq!(r.json()["release"]["filename"], "h264.mkv", "the fifth release");
     state.end_all("test").await;
+}
+
+/// A release whose file is in neither container is opened once: the next session skips it unopened, and so does the
+/// next process, which reads the verdict back from scratch. A release named .m2ts is never opened, and one whose
+/// debrid sent an error page in its place is tried again. No ffmpeg needed.
+#[tokio::test]
+async fn a_release_that_plays_nowhere_is_opened_once() {
+    let origin = origin().await;
+    let state = test_state(&origin, 4, Duration::from_secs(600));
+    let body = format!(r#"{{"imdb":"tt0000016","scout":"{origin}/cfg"}}"#);
+    for _ in 0..2 {
+        let r = call(&state, "POST", "/remux/session", None, &body).await;
+        assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+        assert_eq!(r.json()["release"]["filename"], "h264.mkv");
+        state.end_all("test").await;
+    }
+    assert_eq!(UNPLAYABLE_PLAYS.load(Relaxed), 1, "the MPEG-TS file was opened again, or the .m2ts at all");
+    assert_eq!(ERROR_PAGE_PLAYS.load(Relaxed), 2, "an error page is the moment's, not the file's");
+
+    let key = "tt0000016/307200/Film.mkv";
+    let now = crate::state::unix_now();
+    let why = state.unplayable().get(key, now).expect("remembered");
+    assert!(why.contains(probe::NEITHER), "{why}");
+    let path = state.cfg.scratch_dir.join(crate::state::UNPLAYABLE_FILE);
+    for _ in 0..50 {
+        if path.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let restarted = state_from(Config {
+        scratch_dir: state.cfg.scratch_dir.clone(),
+        ..test_config(&origin, 4, Duration::ZERO, None)
+    });
+    restarted.load_unplayable();
+    assert_eq!(restarted.unplayable().get(key, now), Some(why));
+    assert!(restarted.unplayable().get("tt0000016/307200/Film.WEB.mkv", now).is_none());
 }
 
 /// Another audio track of the release playing — a second session naming it — opens from what den-remux
