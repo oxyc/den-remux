@@ -86,6 +86,11 @@ pub struct MediaInfo {
     /// Keyframe presentation times in seconds, ascending — the timeline ffmpeg reports with
     /// `-copyts -start_at_zero`, which is the one the segments are cut on.
     pub keyframes: Vec<f64>,
+    /// Every segment, starting on a keyframe, decodes without the one before it: seen in the file, not assumed. A
+    /// keyframe past the first is looked at — Matroska's picture NAL unit (`idr_keyframe`), an MP4's composition times
+    /// (no picture after it presented before it) — and AV1 and VP9 key frames reset every reference. False for an open
+    /// GOP, whose leading pictures reach into the segment before, and wherever the probe could not tell.
+    pub closed_gops: bool,
 }
 
 #[derive(Debug)]
@@ -106,6 +111,32 @@ impl fmt::Display for ProbeError {
             ProbeError::Fetch(why) => write!(f, "read failed: {why}"),
         }
     }
+}
+
+/// Whether a keyframe is an IDR — no picture decoded after it refers to one before it — by the first picture NAL unit
+/// in `frame`, whose units are length-prefixed with the length size its `avcC`/`hvcC` (`config`) names. H.264's IDR is
+/// type 5, where an open GOP's keyframe is a plain I slice (1) at a recovery point. HEVC's are 19 and 20 (an IDR's
+/// RADL leading pictures reach back to nothing), where an open GOP's is a CRA (21), whose RASL leading pictures
+/// reference the GOP before; a BLA (16–18) is taken as open too. `None` for another codec, or no picture in `frame`.
+pub fn idr_keyframe(codec: &VideoCodec, config: &[u8], frame: &[u8]) -> Option<bool> {
+    let (length_size, hevc) = match codec {
+        VideoCodec::H264 => ((*config.get(4)? & 3) as usize + 1, false),
+        VideoCodec::Hevc => ((*config.get(21)? & 3) as usize + 1, true),
+        _ => return None,
+    };
+    let mut at = 0usize;
+    while at + length_size <= frame.len() {
+        let len = frame[at..at + length_size].iter().fold(0usize, |n, b| n << 8 | *b as usize);
+        at += length_size;
+        let first = *frame.get(at)?;
+        match hevc {
+            true if (first >> 1) & 0x3f < 32 => return Some(matches!((first >> 1) & 0x3f, 19 | 20)),
+            false if (1..=5).contains(&(first & 0x1f)) => return Some(first & 0x1f == 5),
+            _ => {}
+        }
+        at = at.checked_add(len)?;
+    }
+    None
 }
 
 /// Is this what a container says of the colours HDR (H.273 code points)? The transfer says so outright — PQ (16)
@@ -863,6 +894,32 @@ pub fn hevc_codecs(hvcc: &[u8]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_idr_is_told_from_an_open_gops_keyframe_by_its_first_picture() {
+        // 4-byte lengths: an avcC's byte 4, an hvcC's byte 21, low two bits 3.
+        let avcc = [1, 0x64, 0, 0x28, 0xff];
+        let mut hvcc = [0u8; 23];
+        hvcc[21] = 3;
+        let frame = |units: &[&[u8]]| {
+            units
+                .iter()
+                .flat_map(|u| (u.len() as u32).to_be_bytes().into_iter().chain(u.iter().copied()))
+                .collect()
+        };
+        // H.264: an SEI (6) first is passed over; an IDR slice (5) is closed, a plain I slice (1) is not.
+        let idr: Vec<u8> = frame(&[&[0x06, 1], &[0x65, 0x88]]);
+        assert_eq!(idr_keyframe(&VideoCodec::H264, &avcc, &idr), Some(true));
+        assert_eq!(idr_keyframe(&VideoCodec::H264, &avcc, &frame(&[&[0x06, 1], &[0x41, 0x9a]])), Some(false));
+        // HEVC: VPS/SEI (32, 39) passed over; IDR_W_RADL (19) and IDR_N_LP (20) closed, CRA (21) not.
+        for (header, closed) in [(19u8 << 1, true), (20 << 1, true), (21 << 1, false), (16 << 1, false)] {
+            let f = frame(&[&[32 << 1, 1], &[39 << 1, 1], &[header, 1]]);
+            assert_eq!(idr_keyframe(&VideoCodec::Hevc, &hvcc, &f), Some(closed), "type {}", header >> 1);
+        }
+        assert_eq!(idr_keyframe(&VideoCodec::Hevc, &hvcc, &frame(&[&[32 << 1, 1]])), None, "no picture");
+        assert_eq!(idr_keyframe(&VideoCodec::Av1, &hvcc, &idr), None);
+        assert_eq!(idr_keyframe(&VideoCodec::Hevc, &[], &idr), None, "no configuration record");
+    }
 
     #[test]
     fn codec_strings_follow_rfc_6381() {

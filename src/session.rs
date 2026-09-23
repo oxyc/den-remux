@@ -1987,6 +1987,8 @@ pub async fn create(
     let named: Vec<(String, String)> =
         renditions.iter().map(|r| (r.lang.clone(), crate::lang::name(&r.lang))).collect();
     let opened_key = opened_key(&source.base, c);
+    // A transcode's keyframes are its encoder's IDRs, in closed GOPs; a copy's are the release's own.
+    let closed_gops = transcode.is_some() || info.closed_gops;
     let session = Arc::new(Session {
         master: playlist::master(
             &codecs,
@@ -2008,8 +2010,9 @@ pub async fn create(
             Some(resolution),
             info.frame_rate,
             &named,
+            closed_gops,
         ),
-        media: playlist::media(&segments, start_at),
+        media: playlist::media(&segments, start_at, closed_gops),
         reports: AtomicU8::new(0),
         speed_probes: AtomicU8::new(0),
         sid: sid.clone(),
@@ -2159,6 +2162,7 @@ mod tests {
             audio: Vec::new(),
             subtitles: Vec::new(),
             keyframes: vec![0.0],
+            closed_gops: true,
         }
     }
 

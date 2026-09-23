@@ -37,14 +37,25 @@ pub fn segments(keyframes: &[f64], duration: f64, target: f64) -> Vec<Segment> {
         .collect()
 }
 
+/// `EXT-X-INDEPENDENT-SEGMENTS` where every segment decodes without the one before it (`MediaInfo::closed_gops`):
+/// a segment that opens on a CRA carries leading pictures that reference the segment before, and saying otherwise
+/// tells a player it may start decoding anywhere without it.
+fn independent(closed_gops: bool) -> &'static str {
+    match closed_gops {
+        true => "#EXT-X-INDEPENDENT-SEGMENTS\n",
+        false => "",
+    }
+}
+
 /// The media playlist. VOD, so the player knows the whole timeline up front and can seek anywhere
 /// before a single segment exists. A `start` past zero is a resume: `EXT-X-START` with `PRECISE=YES`
 /// has a native HLS player (Safari's) begin there instead of at zero and then seeking.
-pub fn media(segs: &[Segment], start: f64) -> String {
+pub fn media(segs: &[Segment], start: f64, closed_gops: bool) -> String {
     let target = segs.iter().map(|s| s.end - s.start).fold(0.0, f64::max).ceil().max(1.0) as u64;
     let mut out = format!(
         "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:{target}\n#EXT-X-MEDIA-SEQUENCE:0\n\
-         #EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-INDEPENDENT-SEGMENTS\n"
+         #EXT-X-PLAYLIST-TYPE:VOD\n{}",
+        independent(closed_gops)
     );
     if start > 0.0 {
         out.push_str(&format!("#EXT-X-START:TIME-OFFSET={start:.3},PRECISE=YES\n"));
@@ -95,10 +106,11 @@ pub fn master(
     resolution: Option<(u32, u32)>,
     frame_rate: Option<f64>,
     subs: &[(String, String)],
+    closed_gops: bool,
 ) -> String {
     let res = resolution.filter(|(w, h)| *w > 0 && *h > 0).map(|(w, h)| format!(",RESOLUTION={w}x{h}"));
     let rate = frame_rate.filter(|f| *f > 0.0 && *f < 1000.0).map(|f| format!(",FRAME-RATE={f:.3}"));
-    let mut out = String::from("#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-INDEPENDENT-SEGMENTS\n");
+    let mut out = format!("#EXTM3U\n#EXT-X-VERSION:7\n{}", independent(closed_gops));
     let (audio_codec, rendition) = match audio {
         Audio::Aac => ("mp4a.40.2", None),
         Audio::AacSurround { channels, language } => ("mp4a.40.2", Some((*channels, language))),
@@ -210,7 +222,7 @@ mod tests {
     #[test]
     fn the_media_playlist_sums_to_the_duration() {
         let segs = segments(&KF, 30.021, TARGET_SECS);
-        let m = media(&segs, 0.0);
+        let m = media(&segs, 0.0, true);
         assert!(!m.contains("EXT-X-START"), "a start from zero names no start point");
         let total: f64 = m
             .lines()
@@ -229,9 +241,20 @@ mod tests {
 
     #[test]
     fn a_resume_names_its_start_point() {
-        let m = media(&segments(&KF, 30.021, TARGET_SECS), 14.25);
+        let m = media(&segments(&KF, 30.021, TARGET_SECS), 14.25, true);
         let start = "#EXT-X-INDEPENDENT-SEGMENTS\n#EXT-X-START:TIME-OFFSET=14.250,PRECISE=YES\n#EXT-X-MAP";
         assert!(m.contains(start), "{m}");
+    }
+
+    #[test]
+    fn only_closed_gops_are_named_independent_segments() {
+        let segs = segments(&KF, 30.021, TARGET_SECS);
+        let open = media(&segs, 0.0, false);
+        assert!(!open.contains("INDEPENDENT"), "{open}");
+        assert!(open.contains("#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-MAP"), "{open}");
+        let master_open = master("hvc1.2.4.L120.90", None, &Audio::Aac, 1, 1, None, None, &[], false);
+        assert!(master_open.starts_with("#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-STREAM-INF:"), "{master_open}");
+        assert!(media(&segs, 0.0, true).contains("#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-INDEPENDENT-SEGMENTS\n"));
     }
 
     #[test]
@@ -248,24 +271,25 @@ mod tests {
             Some((320, 180)),
             Some(24000.0 / 1001.0),
             &[],
+            true,
         );
         assert!(m.contains("CODECS=\"hvc1.1.6.L93.B0,mp4a.40.2\""), "{m}");
         assert!(m.contains("RESOLUTION=320x180,FRAME-RATE=23.976\n"), "{m}");
         assert!(m.contains(&format!("BANDWIDTH={peak},AVERAGE-BANDWIDTH={avg}")));
         assert!(m.ends_with("media.m3u8\n"));
         assert!(!m.contains("SUBTITLES") && !m.contains("TYPE=AUDIO") && !m.contains("AUDIO=\""));
-        assert!(!master("avc1.64001e", None, &Audio::Aac, 1, 1, None, None, &[]).contains("RESOLUTION"));
+        assert!(!master("avc1.64001e", None, &Audio::Aac, 1, 1, None, None, &[], true).contains("RESOLUTION"));
         assert!(!m.contains("VIDEO-RANGE"), "nothing kept, nothing named");
     }
 
     #[test]
     fn kept_dolby_vision_is_named_beside_or_as_its_codec() {
         let p81 = DolbyVision { supplemental: Some("dvh1.08.06/db1p".into()), range: "PQ" };
-        let m = master("hvc1.2.4.L153.B0", Some(&p81), &Audio::Aac, 1, 1, None, None, &[]);
+        let m = master("hvc1.2.4.L153.B0", Some(&p81), &Audio::Aac, 1, 1, None, None, &[], true);
         let supplemental = ",SUPPLEMENTAL-CODECS=\"dvh1.08.06/db1p\",VIDEO-RANGE=PQ\n";
         assert!(m.contains(&format!("CODECS=\"hvc1.2.4.L153.B0,mp4a.40.2\"{supplemental}")), "{m}");
         let p5 = DolbyVision { supplemental: None, range: "PQ" };
-        let m = master("dvh1.05.06", Some(&p5), &Audio::Aac, 1, 1, None, None, &[]);
+        let m = master("dvh1.05.06", Some(&p5), &Audio::Aac, 1, 1, None, None, &[], true);
         assert!(m.contains("CODECS=\"dvh1.05.06,mp4a.40.2\",VIDEO-RANGE=PQ\n"), "{m}");
         assert!(!m.contains("SUPPLEMENTAL"), "{m}");
     }
@@ -273,7 +297,7 @@ mod tests {
     #[test]
     fn copied_dolby_audio_is_named_with_its_channels() {
         let eac3 = Audio::Copy { codec: "ec-3", channels: 6, language: Some("eng") };
-        let m = master("hvc1.2.4.L150.B0", None, &eac3, 1, 1, None, None, &[]);
+        let m = master("hvc1.2.4.L150.B0", None, &eac3, 1, 1, None, None, &[], true);
         assert!(
             m.contains(
                 "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"audio\",NAME=\"English\",LANGUAGE=\"eng\",DEFAULT=YES,AUTOSELECT=YES,CHANNELS=\"6\"\n"
@@ -283,14 +307,14 @@ mod tests {
         assert!(m.contains("CODECS=\"hvc1.2.4.L150.B0,ec-3\",AUDIO=\"audio\"\nmedia.m3u8"), "{m}");
         assert!(!m.contains("URI="), "the audio is in the variant's own segments: {m}");
         let ac3 = Audio::Copy { codec: "ac-3", channels: 2, language: None };
-        let m = master("avc1.640028", None, &ac3, 1, 1, None, None, &[]);
+        let m = master("avc1.640028", None, &ac3, 1, 1, None, None, &[], true);
         assert!(m.contains("NAME=\"Audio\",DEFAULT=YES") && m.contains(",ac-3\""), "{m}");
     }
 
     #[test]
     fn aac_5_1_is_named_with_its_channels_and_stereo_is_not() {
         let surround = Audio::AacSurround { channels: 6, language: Some("swe") };
-        let m = master("avc1.640028", None, &surround, 1, 1, None, None, &[]);
+        let m = master("avc1.640028", None, &surround, 1, 1, None, None, &[], true);
         assert!(
             m.contains(
                 "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"audio\",NAME=\"Swedish\",LANGUAGE=\"swe\",DEFAULT=YES,AUTOSELECT=YES,CHANNELS=\"6\"\n"
@@ -298,7 +322,7 @@ mod tests {
             "{m}"
         );
         assert!(m.contains("CODECS=\"avc1.640028,mp4a.40.2\",AUDIO=\"audio\"\nmedia.m3u8"), "{m}");
-        let stereo = master("avc1.640028", None, &Audio::Aac, 1, 1, None, None, &[]);
+        let stereo = master("avc1.640028", None, &Audio::Aac, 1, 1, None, None, &[], true);
         assert_eq!(
             stereo,
             "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-INDEPENDENT-SEGMENTS\n\
@@ -310,12 +334,12 @@ mod tests {
     #[test]
     fn aac_7_1_and_copied_flac_are_named_with_their_channels() {
         let aac71 = Audio::AacSurround { channels: 8, language: Some("eng") };
-        let m = master("vp09.00.41.08", None, &aac71, 1, 1, None, None, &[]);
+        let m = master("vp09.00.41.08", None, &aac71, 1, 1, None, None, &[], true);
         assert!(m.contains("LANGUAGE=\"eng\",DEFAULT=YES,AUTOSELECT=YES,CHANNELS=\"8\"\n"), "{m}");
         assert!(m.contains("CODECS=\"vp09.00.41.08,mp4a.40.2\",AUDIO=\"audio\"\nmedia.m3u8"), "{m}");
         let flac = Audio::Copy { codec: "fLaC", channels: 6, language: None };
         let hdr = DolbyVision { supplemental: None, range: "PQ" };
-        let m = master("vp09.02.51.10.01.09.16.09.00", Some(&hdr), &flac, 1, 1, None, None, &[]);
+        let m = master("vp09.02.51.10.01.09.16.09.00", Some(&hdr), &flac, 1, 1, None, None, &[], true);
         assert!(m.contains("NAME=\"Audio\",DEFAULT=YES,AUTOSELECT=YES,CHANNELS=\"6\"\n"), "{m}");
         assert!(
             m.contains(
@@ -328,7 +352,7 @@ mod tests {
     #[test]
     fn subtitles_are_renditions_of_one_group() {
         let subs = [("en".to_string(), "English".to_string()), ("fi".to_string(), "Finnish".to_string())];
-        let m = master("avc1.640028", None, &Audio::Aac, 1, 1, None, None, &subs);
+        let m = master("avc1.640028", None, &Audio::Aac, 1, 1, None, None, &subs, true);
         assert!(m.contains("TYPE=SUBTITLES,GROUP-ID=\"subs\",NAME=\"Finnish\",LANGUAGE=\"fi\""), "{m}");
         assert!(m.contains("URI=\"sub1.m3u8\""));
         assert!(m.contains("LANGUAGE=\"en\",DEFAULT=NO,AUTOSELECT=YES"), "{m}");

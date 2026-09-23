@@ -16,6 +16,8 @@ unevenly, and the B-frames are what trigger ffmpeg's seek back-off (see `src/job
 | `av1.mp4` | `av1.mkv`'s video copied into MP4: the `av01` sample entry's `av1C` and `colr` | as `av1.mkv` | 29.999 |
 | `surround.mkv` | `h264.mkv`'s video copied, with a 5.1 AAC track (eng) and a 7.1 one (swe): converted to AAC 5.1 | as `h264.mkv` | 30.021 |
 | `subs.mkv` | `h264.mkv` with three text subtitle tracks: SRT English, ASS Finnish (an italic override) and a forced SRT Swedish. Cues sit inside a segment (1, 9, 26 s), across a cut at 13 s (12–14) and after it (14.5), so the segments 0–8, 8–13, 13–19.5, 19.5–24, 24–30 each hold a known set | as `h264.mkv` | 30.021 |
+| `open-gop.mkv` | Open GOPs: x265's own keyframes every 3 s are CRAs, each with three RASL leading pictures that reference the GOP before (`closed_gops` false, no `EXT-X-INDEPENDENT-SEGMENTS`) | 0, 3, 6, 9 | 12.0 |
+| `open-gop.mp4` | `open-gop.mkv` copied into MP4: the leading pictures seen in `ctts` | as `open-gop.mkv` | 12.0 |
 | `scout-streams.json` | A den-scout stream list: uncached, AV1, VP9, XviD/AVI, 3D and cache-unknown releases to skip | — | — |
 
 ## Regenerating
@@ -64,6 +66,14 @@ ffmpeg -y -f lavfi -i testsrc2=size=320x180:rate=24:duration=30 -f lavfi -i sine
   -c:a libopus -b:a 32k -ac 2 -metadata:s:a:0 language=eng av1.mkv
 
 ffmpeg -y -i av1.mkv -map 0:v -c copy -movflags +faststart av1.mp4
+
+# Open GOPs need the encoder's own keyframes: a forced one ends the mini-GOP before it, so nothing leads it.
+ffmpeg -y -f lavfi -i testsrc2=size=320x180:rate=24:duration=12 -f lavfi -i sine=frequency=550:duration=12:sample_rate=48000 \
+  -map 0:v -map 1:a -c:v libx265 -preset fast -crf 36 \
+  -x265-params keyint=72:min-keyint=72:scenecut=0:bframes=3:open-gop=1:radl=0:log-level=error -pix_fmt yuv420p \
+  -c:a eac3 -b:a 64k -ac 2 -metadata:s:a:0 language=eng open-gop.mkv
+
+ffmpeg -y -i open-gop.mkv -map 0 -c copy -tag:v hvc1 -movflags +faststart open-gop.mp4
 
 # A tone on each channel, the LFE's low and quieter, so a listen tells the channels apart. 40 kbit/s keeps the file under
 # 1 MB; what a session does with the tracks is convert them, so their own quality doesn't matter.
