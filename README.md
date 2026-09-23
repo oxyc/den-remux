@@ -20,13 +20,13 @@ This is the MVP ("phase 2") of oxyc/den#11: movies and episodes, cached releases
 POST   /remux/login                     {key} → 204 + Set-Cookie + X-Den-Browser-Token; 401 bad_key · 429 rate_limited
 POST   /remux/session                   {imdb, season?, episode?, filename?, scout?, audio?, audioTrack?,
                                          subtitles?, subtitleLanguages?, videoCodecs?, playable?, startAt?, maxBitrate?, player?,
-                                         exclude?, transcode?: "never", fitsOnly?} (a full scout install,
+                                         exclude?, transcode?: "never", fitsOnly?, replaces?} (a full scout install,
                                          or browser cookie/bearer) → 201
                                         {sid, playlist, release:{label,filename,size}, duration, prebuffer, need,
                                          segments:[[start,bytes],…], expiresAt,
                                          video:{codec: h264|hevc|av1|vp9, transcoded}, audioTrack, audioChannels,
                                          audioTracks:[{language,name,channels,commentary}], subtitles}
-                                        401 not_logged_in · 403 scout_refused
+                                        401 not_logged_in · 403 scout_refused/not_your_session · 409 replacement_pending
                                         400 bad_request/bad_scout/bad_subtitles/bad_audio_track
                                         404 no_release/no_playable_release/no_copy/no_fitting_copy
                                         429 too_many_sessions/rate_limited · 502 scout_unavailable · 503 scout_unconfigured
@@ -178,6 +178,13 @@ itself is never logged. Brave on iOS sends Safari's User-Agent, so it reads as S
   mid-film — another audio track, another release, casting — sends `"transcode":"never"`. A player switching away from
   a release its link can't carry also names it in `exclude` and sends `"fitsOnly":true` with the rate it is getting:
   it takes a copy that link carries, or `404 no_fitting_copy` and keeps playing what it has.
+- **A replacement plays beside the session it replaces.** A browser holds one session, and past its share a new one
+  ends the oldest at once — mid-film that stopped the picture while the new one was probed, and left nothing playing
+  where none could be made. A player replacing its session sends `"replaces":"<sid>"`: the old one is kept, one past
+  the share, until the new one serves a segment, and ends then; a replacement that serves none within 60 s is ended
+  as abandoned and the old one plays on. The sid must be the caller's own (`403 not_your_session`), and one
+  replacement is under way at a time (`409 replacement_pending`). `MAX_SESSIONS` still counts the kept session: where
+  the box has no room for both, the old one gives way at once, as without `replaces`.
 - **Resume.** `startAt` is the second the player starts at. The media playlist names it (`EXT-X-START`, so
   Safari's native player starts there), and the first job starts a segment before it rather than at zero, so a
   resume runs ffmpeg once instead of twice. Negative is a 400; at or past the end starts from zero.

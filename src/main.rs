@@ -674,6 +674,8 @@ where
         /// Only a copy that fits the link (`session::Want::fits_only`).
         #[serde(default)]
         fits_only: bool,
+        /// The sid of this caller's session this one replaces mid-film (`session::Want::replaces`).
+        replaces: Option<String>,
     }
     let Some(req) = read_body(body).await.and_then(|b| serde_json::from_slice::<Create>(&b).ok()) else {
         return bad_request(
@@ -681,9 +683,12 @@ where
              \"audio\"?: [\"en\", …], \"audioTrack\"?: n, \"subtitles\"?: \"…\", \"subtitleLanguages\"?: [\"en\", …], \
              \"videoCodecs\"?: [\"h264\", \"hevc\"], \"playable\"?: {\"h264\", \"h264High10\", \"hevcMain\", \"hevcMain10\", \"hevcHighTier\", \"hdr\", \"eac3\", \"aacMultichannel\", \"dolbyVision\": {\"p5\", \"p8\"}, \"av1\", \"av1Main10\", \"av1Hdr\", \"flac\", \"aac71\", \"vp9\", \"vp9Profile2\"}, \
              \"startAt\"?: seconds, \"maxBitrate\"?: bits a second, \"player\"?: \"native\" | \"hls.js\" | \"cast\", \
-             \"exclude\"?: [\"filename\", …], \"transcode\"?: \"never\", \"fitsOnly\"?: bool}.",
+             \"exclude\"?: [\"filename\", …], \"transcode\"?: \"never\", \"fitsOnly\"?: bool, \"replaces\"?: \"sid\"}.",
         );
     };
+    if req.replaces.as_deref().is_some_and(|sid| !auth::is_id(sid)) {
+        return bad_request("replaces is the sid of a session this browser or install started.");
+    }
     let no_transcode = match req.transcode.as_deref() {
         None | Some("allow") => false,
         Some("never") => true,
@@ -744,6 +749,7 @@ where
         exclude: &req.exclude,
         no_transcode,
         fits_only: req.fits_only,
+        replaces: req.replaces.as_deref(),
     };
     let public = public_session_request(state, parts);
     let created = session::create(state, admission, &want, public).await;
@@ -905,7 +911,14 @@ where
                         s.serve_subtitle_window(state, n, w).await
                     }
                     None => match session::seg_index(f).filter(|n| *n < s.segments.len()) {
-                        Some(n) => s.serve_segment(state, n, head).await,
+                        Some(n) => {
+                            let served = s.serve_segment(state, n, head).await;
+                            // A replacement mid-film takes over once it serves media.
+                            if !head && served.status().is_success() {
+                                state.replacement_played(&s).await;
+                            }
+                            served
+                        }
                         None => httputil::not_found(),
                     },
                 },

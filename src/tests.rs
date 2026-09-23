@@ -582,6 +582,7 @@ fn test_config(origin: &str, max_sessions: usize, idle: Duration, scout_key: Opt
         max_sessions,
         max_sessions_per_install: 2,
         session_idle: idle,
+        replace_grace: Duration::from_secs(crate::config::REPLACE_GRACE_SECS),
         scratch_dir: dir,
         scratch_max_bytes: 1 << 30,
         ffmpeg: tool("FFMPEG_PATH", "ffmpeg"),
@@ -1088,6 +1089,127 @@ async fn sessions_are_capped_but_a_browser_may_switch_titles() {
     state.end_all("test").await;
 }
 
+/// A browser's session with its signed base URL.
+async fn start(state: &Arc<AppState>, cookie: &str, body: &str) -> (String, String) {
+    let r = call(state, "POST", "/remux/session", Some(cookie), body).await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let created = r.json();
+    let base = created["playlist"].as_str().unwrap().trim_end_matches("master.m3u8").to_string();
+    (created["sid"].as_str().unwrap().to_string(), base)
+}
+
+fn replacing(sid: &str) -> String {
+    format!(r#"{{"imdb":"tt0000001","audioTrack":0,"transcode":"never","replaces":"{sid}"}}"#)
+}
+
+/// A change mid-film — another track, another release — is a new session. A browser plays one, so without more the
+/// old one ended as soon as the new was asked for: the picture stopped while the new one was probed, and stayed
+/// stopped where none could be made. Named as a replacement, the old plays on until the new one serves media.
+#[tokio::test]
+#[ignore = "needs ffmpeg"]
+async fn a_replacement_plays_beside_its_session_until_it_serves_media() {
+    let origin = origin().await;
+    let state = test_state(&origin, 4, Duration::from_secs(600));
+    let phone = login(&state, "phone-key").await;
+    let (old, old_base) = start(&state, &phone, r#"{"imdb":"tt0000001"}"#).await;
+    let (new, new_base) = start(&state, &phone, &replacing(&old)).await;
+    assert!(state.session(&old).is_some(), "the session replaced ended before its replacement played");
+    assert_eq!(call(&state, "GET", &format!("{old_base}seg0.m4s"), None, "").await.status, StatusCode::OK);
+    assert_eq!(state.sessions().len(), 2, "one past the browser's share, while the replacement starts");
+
+    assert_eq!(call(&state, "GET", &format!("{new_base}seg0.m4s"), None, "").await.status, StatusCode::OK);
+    assert!(state.session(&old).is_none(), "the replacement served media and the old session played on");
+    assert!(state.session(&new).is_some());
+    assert_eq!(call(&state, "GET", &format!("{old_base}seg1.m4s"), None, "").await.status, StatusCode::GONE);
+    state.end_all("test").await;
+}
+
+/// Without naming what it replaces, a browser still never holds two sessions: its old one ends at once. Nor does a
+/// replacement get past `MAX_SESSIONS`: where the box has no room for both, the old one gives way as before.
+#[tokio::test]
+async fn only_a_named_replacement_with_room_for_both_keeps_the_old_session() {
+    let origin = origin().await;
+    let state = test_state(&origin, 2, Duration::from_secs(600));
+    let phone = login(&state, "phone-key").await;
+    let (first, _) = start(&state, &phone, r#"{"imdb":"tt0000001"}"#).await;
+    let (second, _) = start(&state, &phone, r#"{"imdb":"tt0000001","audioTrack":0}"#).await;
+    assert!(state.session(&first).is_none(), "an unnamed replacement left the browser two sessions");
+    assert_eq!(state.sessions().len(), 1);
+
+    let laptop = login(&state, "laptop-key").await;
+    start(&state, &laptop, r#"{"imdb":"tt0000001"}"#).await;
+    let (third, _) = start(&state, &phone, &replacing(&second)).await;
+    assert!(state.session(&second).is_none(), "a full box kept a session past MAX_SESSIONS");
+    assert!(state.session(&third).is_some());
+    assert_eq!(state.sessions().len(), 2);
+    state.end_all("test").await;
+}
+
+#[tokio::test]
+async fn a_replacement_names_only_the_callers_own_session() {
+    let origin = origin().await;
+    let state = test_state(&origin, 4, Duration::from_secs(600));
+    let phone = login(&state, "phone-key").await;
+    let laptop = login(&state, "laptop-key").await;
+    let (theirs, _) = start(&state, &phone, r#"{"imdb":"tt0000001"}"#).await;
+    let r = call(&state, "POST", "/remux/session", Some(&laptop), &replacing(&theirs)).await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN, "{}", r.text());
+    assert_eq!(r.json()["error"], "not_your_session");
+    assert!(state.session(&theirs).is_some());
+    assert_eq!(state.sessions().len(), 1);
+    let r = call(&state, "POST", "/remux/session", Some(&phone), &replacing("not an id")).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+    state.end_all("test").await;
+}
+
+/// One replacement under way at a time, and none of a replacement still starting: a browser holds at most one
+/// session past its share. Ending the one under way frees the next.
+#[tokio::test]
+async fn one_replacement_is_under_way_at_a_time() {
+    let origin = origin().await;
+    let state = test_state(&origin, 4, Duration::from_secs(600));
+    let phone = login(&state, "phone-key").await;
+    let (old, _) = start(&state, &phone, r#"{"imdb":"tt0000001"}"#).await;
+    let (new, new_base) = start(&state, &phone, &replacing(&old)).await;
+    for named in [&old, &new] {
+        let r = call(&state, "POST", "/remux/session", Some(&phone), &replacing(named)).await;
+        assert_eq!(r.status, StatusCode::CONFLICT, "{}", r.text());
+        assert_eq!(r.json()["error"], "replacement_pending");
+    }
+    assert_eq!(state.sessions().len(), 2);
+    assert_eq!(call(&state, "DELETE", &new_base, None, "").await.status, StatusCode::NO_CONTENT);
+    let (_, _) = start(&state, &phone, &replacing(&old)).await;
+    assert!(state.session(&old).is_some());
+    assert_eq!(state.sessions().len(), 2);
+    state.end_all("test").await;
+}
+
+/// A replacement that serves nothing within the grace window was given up on: it ends, and the session it was to
+/// replace plays on, free to be replaced again.
+#[tokio::test]
+async fn an_abandoned_replacement_is_ended_after_the_grace_window() {
+    let origin = origin().await;
+    let state = state_from(Config {
+        replace_grace: Duration::from_millis(300),
+        ..test_config(&origin, 4, Duration::from_secs(600), Some(SCOUT_KEY))
+    });
+    let phone = login(&state, "phone-key").await;
+    let (old, _) = start(&state, &phone, r#"{"imdb":"tt0000001"}"#).await;
+    let (new, _) = start(&state, &phone, &replacing(&old)).await;
+    let mut ended = false;
+    for _ in 0..30 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if state.session(&new).is_none() {
+            ended = true;
+            break;
+        }
+    }
+    assert!(ended, "a replacement that never played outlived the grace window");
+    assert!(state.session(&old).is_some(), "the session still playing was ended");
+    start(&state, &phone, &replacing(&old)).await;
+    state.end_all("test").await;
+}
+
 /// A player that loses its connection for five minutes comes back to its session, which still serves the next segment;
 /// only past the idle window does it end. Pinned so a shorter window can't creep in by accident.
 #[tokio::test]
@@ -1567,14 +1689,14 @@ async fn kill_without_the_secret_looks_like_an_unknown_route() {
 #[tokio::test]
 async fn cancelling_a_reservation_gives_back_both_limits() {
     let state = test_state("http://127.0.0.1:9", 2, Duration::from_secs(600));
-    let first = state.reserve("phone", 1).await.unwrap();
-    assert!(state.reserve("phone", 1).await.is_none());
-    let second = state.reserve("laptop", 1).await.unwrap();
-    assert!(state.reserve("other", 1).await.is_none());
+    let first = state.reserve("phone", 1, None).await.unwrap();
+    assert!(state.reserve("phone", 1, None).await.is_err());
+    let second = state.reserve("laptop", 1, None).await.unwrap();
+    assert!(state.reserve("other", 1, None).await.is_err());
     drop(first);
-    let replacement = state.reserve("phone", 1).await.unwrap();
+    let replacement = state.reserve("phone", 1, None).await.unwrap();
     drop((second, replacement));
-    assert!(state.reserve("other", 1).await.is_some());
+    assert!(state.reserve("other", 1, None).await.is_ok());
 }
 
 #[tokio::test]

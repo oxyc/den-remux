@@ -188,6 +188,9 @@ pub struct AppState {
     tombstones: Mutex<HashMap<String, u64>>,
     /// Sessions being set up: they hold a slot against `MAX_SESSIONS` while their release is probed.
     creating: Mutex<HashMap<String, usize>>,
+    /// The replacement each owner has under way, if any (`reserve`): at most one, so an owner holds at most one
+    /// session past its share.
+    replacements: Mutex<HashMap<String, Replacement>>,
     /// Starts per visitor in the current minute: `(minute, count)`.
     starts: Mutex<HashMap<IpAddr, (u64, u32)>>,
     /// Releases opened lately: their debrid links and probes.
@@ -208,10 +211,32 @@ pub struct AppState {
     pub transcodes: Arc<AtomicUsize>,
 }
 
+/// A session replacing another of the same owner mid-film, which plays on until this one has started.
+struct Replacement {
+    /// The session being replaced.
+    old: String,
+    /// The replacing session, once it is set up.
+    new: Option<String>,
+}
+
+/// Why `reserve` gave no slot.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Refused {
+    /// The owner's share or the server is full.
+    Full,
+    /// The session named to be replaced is another owner's.
+    NotYours,
+    /// The owner already has a replacement under way.
+    Pending,
+}
+
 /// A held slot against `MAX_SESSIONS`; released when dropped.
 pub struct Slot<'a> {
     creating: &'a Mutex<HashMap<String, usize>>,
+    replacements: &'a Mutex<HashMap<String, Replacement>>,
     owner: String,
+    /// The session the one set up in this slot replaces, where it is a replacement.
+    pub replaces: Option<String>,
 }
 
 impl Drop for Slot<'_> {
@@ -221,6 +246,14 @@ impl Drop for Slot<'_> {
             *count -= 1;
             if *count == 0 {
                 creating.remove(&self.owner);
+            }
+        }
+        drop(creating);
+        // A replacement that was never set up is no longer under way.
+        if let Some(old) = &self.replaces {
+            let mut replacements = self.replacements.lock().unwrap_or_else(|e| e.into_inner());
+            if replacements.get(&self.owner).is_some_and(|r| &r.old == old && r.new.is_none()) {
+                replacements.remove(&self.owner);
             }
         }
     }
@@ -254,6 +287,7 @@ impl AppState {
             sessions: Mutex::new(HashMap::new()),
             tombstones: Mutex::new(HashMap::new()),
             creating: Mutex::new(HashMap::new()),
+            replacements: Mutex::new(HashMap::new()),
             starts: Mutex::new(HashMap::new()),
             opened: Mutex::new(OpenedCache::default()),
             known: Mutex::new(KnownReleases::default()),
@@ -348,25 +382,60 @@ impl AppState {
     /// Reserve both the owner's share and the global cap before any upstream work. Published sessions
     /// may be replaced; another request's reservation cannot. Detaching replacements and counting the
     /// reservation happen under the same locks, so concurrent starts cannot spend the same free slot.
-    pub async fn reserve(self: &Arc<Self>, owner: &str, share: usize) -> Option<Slot<'_>> {
+    ///
+    /// `replaces` names the owner's session a player is replacing mid-film (another track, another release). Past
+    /// the share that one would be ended here, before its replacement is even probed — a gap in the picture, and
+    /// nothing left to play on when no replacement can be made. So it is kept, one session past the share, until the
+    /// replacement has served a segment (`replacement_played`) or `REPLACE_GRACE_SECS` pass without it. One replacement
+    /// under way per owner; `MAX_SESSIONS` still counts the kept session, and where it leaves no room for both, the
+    /// replaced one gives way at once, as it did before.
+    pub async fn reserve(
+        self: &Arc<Self>,
+        owner: &str,
+        share: usize,
+        replaces: Option<&str>,
+    ) -> Result<Slot<'_>, Refused> {
         let (slot, replaced) = {
             let mut map = self.sessions();
             let mut creating = self.creating.lock().unwrap_or_else(|e| e.into_inner());
+            let mut replacements = self.replacements.lock().unwrap_or_else(|e| e.into_inner());
             let pending = creating.get(owner).copied().unwrap_or(0);
             if pending >= share {
-                return None;
+                return Err(Refused::Full);
             }
+            // A session already gone leaves nothing to keep: an ordinary start.
+            let replaces = match replaces.and_then(|sid| map.get(sid)) {
+                None => None,
+                Some(s) if s.owner != owner => return Err(Refused::NotYours),
+                Some(_) if replacements.contains_key(owner) => return Err(Refused::Pending),
+                Some(s) => Some(s.sid.clone()),
+            };
             let mut mine: Vec<_> =
                 map.values().filter(|s| s.owner == owner).map(|s| (s.started, s.sid.clone())).collect();
             mine.sort();
-            let excess = (mine.len() + pending + 1).saturating_sub(share);
-            if map.len() - excess + creating.values().sum::<usize>() >= self.cfg.max_sessions {
-                return None;
+            let others = creating.values().sum::<usize>();
+            let excess_at = |share: usize| (mine.len() + pending + 1).saturating_sub(share);
+            let fits = |excess: usize| map.len() - excess + others < self.cfg.max_sessions;
+            let (excess, replaces) = match replaces {
+                Some(old) if fits(excess_at(share + 1)) => (excess_at(share + 1), Some(old)),
+                _ => (excess_at(share), None),
+            };
+            if !fits(excess) {
+                return Err(Refused::Full);
             }
             let replaced: Vec<_> =
                 mine.into_iter().take(excess).filter_map(|(_, sid)| map.remove(&sid)).collect();
             *creating.entry(owner.to_string()).or_default() += 1;
-            (Slot { creating: &self.creating, owner: owner.to_string() }, replaced)
+            if let Some(old) = &replaces {
+                replacements.insert(owner.to_string(), Replacement { old: old.clone(), new: None });
+            }
+            let slot = Slot {
+                creating: &self.creating,
+                replacements: &self.replacements,
+                owner: owner.to_string(),
+                replaces,
+            };
+            (slot, replaced)
         };
         if !replaced.is_empty() {
             let state = self.clone();
@@ -378,7 +447,49 @@ impl AppState {
             });
             let _ = cleanup.await;
         }
-        Some(slot)
+        Ok(slot)
+    }
+
+    /// The replacement set up in `slot` is `new`: it takes over once it serves a segment, and is ended as abandoned if
+    /// it has not within `replace_grace`, leaving the session it would have replaced playing.
+    pub fn replacement_started(self: &Arc<Self>, slot: &Slot<'_>, new: &str) {
+        let Some(old) = &slot.replaces else { return };
+        {
+            let mut replacements = self.replacements.lock().unwrap_or_else(|e| e.into_inner());
+            match replacements.get_mut(&slot.owner) {
+                Some(r) if &r.old == old => r.new = Some(new.to_string()),
+                // The replaced session ended while this one was set up: nothing is left to take over from.
+                _ => return,
+            }
+        }
+        let (st, owner, new) = (self.clone(), slot.owner.clone(), new.to_string());
+        tokio::spawn(async move {
+            tokio::time::sleep(st.cfg.replace_grace).await;
+            let abandoned = {
+                let mut replacements = st.replacements.lock().unwrap_or_else(|e| e.into_inner());
+                let mine = replacements.get(&owner).is_some_and(|r| r.new.as_deref() == Some(new.as_str()));
+                mine && replacements.remove(&owner).is_some()
+            };
+            if abandoned {
+                st.end_session(&new, "replacement never played").await;
+            }
+        });
+    }
+
+    /// `s` served a segment: where it is a replacement under way, the session it replaces ends now.
+    pub async fn replacement_played(&self, s: &Session) {
+        let old = {
+            let mut replacements = self.replacements.lock().unwrap_or_else(|e| e.into_inner());
+            match replacements.get(&s.owner) {
+                Some(r) if r.new.as_deref() == Some(s.sid.as_str()) => {
+                    replacements.remove(&s.owner).map(|r| r.old)
+                }
+                _ => None,
+            }
+        };
+        if let Some(old) = old {
+            self.end_session(&old, "replaced").await;
+        }
     }
 
     /// Count a login or a new session for `visitor`: false once it has had `STARTS_PER_MINUTE` this
@@ -409,6 +520,11 @@ impl AppState {
 
     async fn end_removed(&self, s: Arc<Session>, why: &str) {
         let sid = &s.sid;
+        // Either end of a replacement going means it is no longer under way.
+        self.replacements
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|_, r| r.old != *sid && r.new.as_deref() != Some(sid.as_str()));
         {
             let mut t = self.tombstones.lock().unwrap_or_else(|e| e.into_inner());
             let now = unix_now();

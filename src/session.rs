@@ -23,7 +23,7 @@ use crate::job::{self, Job, Spec};
 use crate::playlist::{self, Segment};
 use crate::probe::{MediaInfo, Source, VideoCodec};
 use crate::scout;
-use crate::state::{unix_now, AppState};
+use crate::state::{unix_now, AppState, Refused};
 
 /// How far ahead of the newest request a job may produce before it is paused, in segments.
 const AHEAD_SEGMENTS: usize = 4;
@@ -1101,6 +1101,9 @@ pub struct Want<'a> {
     /// Only a copy that fits the link will do: no copy that would starve on it, and no transcode. A player switching
     /// away from a release its link can't carry asks this, and keeps playing what it has when nothing fits.
     pub fits_only: bool,
+    /// The session this one replaces mid-film, which plays on until this one has served a segment
+    /// (`AppState::reserve`).
+    pub replaces: Option<&'a str>,
 }
 
 /// What the player decodes, as its own tests found (`playable` in `POST /remux/session`): the highest level it
@@ -1811,14 +1814,25 @@ pub async fn create(
     };
     // A browser starting another title is done with the one it was watching; making it wait out the
     // idle timer for its own old session would turn every change of mind into a 429. An install plays
-    // `MAX_SESSIONS_PER_INSTALL` at once — a household's people — and past that its oldest gives way.
-    let Some(_slot) = st.reserve(&owner, share).await else {
-        return Err(api(
+    // `MAX_SESSIONS_PER_INSTALL` at once — a household's people — and past that its oldest gives way. A replacement
+    // mid-film keeps the one it replaces until it plays.
+    let slot = st.reserve(&owner, share, want.replaces).await.map_err(|refused| match refused {
+        Refused::Full => api(
             StatusCode::TOO_MANY_REQUESTS,
             "too_many_sessions",
             "This browser or install, or the server, has no free session slot.",
-        ));
-    };
+        ),
+        Refused::NotYours => api(
+            StatusCode::FORBIDDEN,
+            "not_your_session",
+            "The session to replace is not this browser's or install's.",
+        ),
+        Refused::Pending => api(
+            StatusCode::CONFLICT,
+            "replacement_pending",
+            "A replacement is already starting for this browser or install.",
+        ),
+    })?;
     let secrets = [source.base.as_str()];
     let list = scout_list(st, &source, imdb, by_install, want.playable).await?;
     let candidates = scout::candidates(
@@ -2287,6 +2301,7 @@ pub async fn create(
         wake: Notify::new(),
     });
     st.insert_session(session.clone());
+    st.replacement_started(&slot, &session.sid);
     st.sessions_started.fetch_add(1, Relaxed);
     let dv = session.info.dolby_vision.map(|dv| match session.dovi {
         job::Dovi::Keep => format!(", {dv} kept"),
@@ -2593,6 +2608,7 @@ mod tests {
             exclude: &[],
             no_transcode: false,
             fits_only: false,
+            replaces: None,
         };
         assert!(!no_picture(want.playable, true, &release), "the BT.2020 base layer has a picture");
     }
@@ -2894,6 +2910,7 @@ mod tests {
             exclude: &[],
             no_transcode: false,
             fits_only: false,
+            replaces: None,
         }
     }
 
