@@ -2273,13 +2273,13 @@ async fn a_job_starts_sooner_through_the_door() {
     let Ok(url) = std::env::var("DOOR_BENCH_URL") else { return };
     let seek: f64 = std::env::var("DOOR_BENCH_SEEK").ok().and_then(|s| s.parse().ok()).unwrap_or(0.0);
     let state = test_state("http://127.0.0.1:9", 2, Duration::from_secs(600));
-    let get = |range: String| state.http.get(&url).header("range", range).send();
+    let get = |range: String| state.source_http.get(&url).header("range", range).send();
     let head = get(format!("bytes=0-{}", crate::scout::HEAD_BYTES - 1)).await.unwrap();
     let size: u64 =
         head.headers()["content-range"].to_str().unwrap().rsplit('/').next().unwrap().parse().unwrap();
     let head = head.bytes().await.unwrap();
     get(format!("bytes={}-", size - 64 * 1024)).await.unwrap().bytes().await.unwrap();
-    let door = state.doors.open(state.http.clone(), &url, &head, size);
+    let door = state.doors.open(state.source_http.clone(), &url, &head, size);
     let through = state.doors.url(&door).unwrap();
     for (label, input) in [("direct", url.clone()), ("door", through)] {
         let dir = temp_dir();

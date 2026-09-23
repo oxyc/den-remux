@@ -226,14 +226,10 @@ fn fetch(entry: Arc<Entry>, start: u64, end: u64) -> tokio::sync::mpsc::Receiver
             let mut resp = match sent {
                 Ok(r) if r.status() == reqwest::StatusCode::PARTIAL_CONTENT => r,
                 Ok(r) => {
-                    let why = format!("upstream answered {} for a range", r.status().as_u16());
-                    let _ = tx.send(Err(std::io::Error::other(why))).await;
-                    return;
+                    let why = format!("upstream answered {} for bytes {at}-{to}", r.status().as_u16());
+                    return failed(&tx, why).await;
                 }
-                Err(e) => {
-                    let _ = tx.send(Err(std::io::Error::other(e.without_url().to_string()))).await;
-                    return;
-                }
+                Err(e) => return failed(&tx, format!("upstream bytes {at}-{to}: {}", e.without_url())).await,
             };
             let mut left = to - at + 1;
             loop {
@@ -253,10 +249,12 @@ fn fetch(entry: Arc<Entry>, start: u64, end: u64) -> tokio::sync::mpsc::Receiver
                             break;
                         }
                     }
-                    Ok(None) | Err(_) => {
-                        let why = format!("upstream ended {left} bytes short");
-                        let _ = tx.send(Err(std::io::Error::other(why))).await;
-                        return;
+                    Ok(None) => {
+                        return failed(&tx, format!("upstream ended {left} bytes short of {to}")).await
+                    }
+                    Err(e) => {
+                        let why = format!("upstream ended {left} bytes short of {to}: {}", e.without_url());
+                        return failed(&tx, why).await;
                     }
                 }
             }
@@ -264,6 +262,13 @@ fn fetch(entry: Arc<Entry>, start: u64, end: u64) -> tokio::sync::mpsc::Receiver
         }
     });
     rx
+}
+
+/// A read from upstream that failed: logged — the service's only record of it, ffmpeg seeing just a cut body — and
+/// handed to the reader. The reason names bytes and a status, never the link.
+async fn failed(tx: &tokio::sync::mpsc::Sender<std::io::Result<Bytes>>, why: String) {
+    crate::log_limited("source_upstream", || format!("source: {why}"));
+    let _ = tx.send(Err(std::io::Error::other(why))).await;
 }
 
 #[cfg(test)]
@@ -339,6 +344,41 @@ mod tests {
         assert_eq!(counts[1].load(Relaxed), 1, "a fresh link is read from then on");
         drop(door);
         assert_eq!(client.get(&url).send().await.unwrap().status().as_u16(), 404, "closed with its session");
+    }
+
+    /// ffmpeg paused while the player is far ahead reads nothing for minutes, mid-request. A client with a total timeout
+    /// cuts that request off once the pause outlasts it; the source client times only reads being made, and carries on.
+    #[tokio::test]
+    async fn a_read_paused_longer_than_any_total_timeout_carries_on() {
+        let (base, data, _) = upstream(8 * 1024 * 1024).await;
+        let read_through = |upstream_client: reqwest::Client| {
+            let (base, data) = (base.clone(), data.clone());
+            async move {
+                let doors = Doors::default();
+                let door =
+                    doors.open(upstream_client, &format!("{base}/a"), &data[..1024], data.len() as u64);
+                let url = doors.url(&door).unwrap();
+                let mut resp = reqwest::get(&url).await.unwrap();
+                let mut got = resp.chunk().await.unwrap().unwrap().to_vec();
+                // Paused: nothing read for a second, the door's queue full and its upstream request left waiting.
+                tokio::time::sleep(Duration::from_millis(1_000)).await;
+                loop {
+                    match resp.chunk().await {
+                        Ok(Some(c)) => got.extend_from_slice(&c),
+                        Ok(None) => break,
+                        Err(_) => break,
+                    }
+                }
+                got.len()
+            }
+        };
+        let total = reqwest::Client::builder().timeout(Duration::from_millis(300)).build().unwrap();
+        assert!(
+            read_through(total).await < data.len(),
+            "the premise: a total timeout cuts the paused read off"
+        );
+        let source = crate::state::source_client(Duration::from_secs(5), Duration::from_millis(300));
+        assert_eq!(read_through(source).await, data.len(), "read-idle only: the pause doesn't count");
     }
 
     #[test]

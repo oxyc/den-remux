@@ -836,7 +836,7 @@ impl Session {
         let hash = match (size, sb.head_sum) {
             (Some(size), Some(head)) if size >= subs::HASH_CHUNK => {
                 let input = self.lock().input.clone();
-                crate::probe::read_range(&st.http, &input, size - subs::HASH_CHUNK, subs::HASH_CHUNK)
+                crate::probe::read_range(&st.source_http, &input, size - subs::HASH_CHUNK, subs::HASH_CHUNK)
                     .await
                     .ok()
                     .filter(|t| t.len() as u64 == subs::HASH_CHUNK)
@@ -1042,14 +1042,15 @@ async fn open(
     let r = scout::resolve(&st.scout_http, &crate::config::local(&s.url, &st.cfg.origin_aliases), src)
         .await
         .map_err(OpenFailure::passing)?;
-    let info = match crate::probe::probe(&Source::Http { client: &st.http, url: &r.url }, &r.head).await {
-        Ok(info) => info,
-        Err(e) => {
-            let neither =
-                matches!(&e, crate::probe::ProbeError::Unsupported(w) if w == crate::probe::NEITHER);
-            return Err(OpenFailure { why: e.to_string(), lasting: neither && the_files_own_head(&r) });
-        }
-    };
+    let info =
+        match crate::probe::probe(&Source::Http { client: &st.source_http, url: &r.url }, &r.head).await {
+            Ok(info) => info,
+            Err(e) => {
+                let neither =
+                    matches!(&e, crate::probe::ProbeError::Unsupported(w) if w == crate::probe::NEITHER);
+                return Err(OpenFailure { why: e.to_string(), lasting: neither && the_files_own_head(&r) });
+            }
+        };
     st.known().put(known_key(title, s), &info);
     if let VideoCodec::Other(c) = &info.video {
         return Err(OpenFailure { why: format!("video is {c}, which needs a re-encode"), lasting: true });
@@ -2048,7 +2049,9 @@ pub async fn create(
         segments,
         play_url: c.url.clone(),
         // Only where the file named its own size (`Content-Range`): the door answers ranges of it.
-        door: resolved.size.map(|size| st.doors.open(st.http.clone(), &resolved.url, &resolved.head, size)),
+        door: resolved
+            .size
+            .map(|size| st.doors.open(st.source_http.clone(), &resolved.url, &resolved.head, size)),
         source,
         opened_key,
         info,
