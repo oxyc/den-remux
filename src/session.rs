@@ -288,6 +288,13 @@ impl Session {
         self.lock().last_seen = Instant::now();
     }
 
+    /// Make the last request `ago` old and let the supervisor look again: a silence, in a test's time.
+    #[cfg(test)]
+    pub fn silent_for(&self, ago: Duration) {
+        self.lock().last_seen = Instant::now() - ago;
+        self.wake.notify_one();
+    }
+
     /// A player's diagnostic is useful once and bounded to three attempts. The signed URL is a bearer
     /// credential; it must not also be an unbounded log-writing endpoint.
     pub fn take_report_slot(&self) -> bool {

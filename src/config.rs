@@ -174,6 +174,10 @@ pub fn local(url: &str, aliases: &[(String, String)]) -> String {
 
 /// Below this the cap cannot hold one window of a 4K session, and every job would sit paused.
 const MIN_SCRATCH_BYTES: u64 = 64 * 1024 * 1024;
+/// How long a session stands with no request (`SESSION_IDLE_SECS` unset): long past a connection that drops for a few
+/// minutes and comes back, so a player picks up where it was rather than starting over. The public gate's grant for
+/// it is refreshed every 30 s while the session exists, so the two don't part.
+pub const SESSION_IDLE_SECS: u64 = 600;
 
 impl Config {
     pub fn from_env() -> Config {
@@ -208,7 +212,10 @@ impl Config {
             // Floored: an idle window shorter than a player's pause-and-resume would kill sessions
             // that are merely paused.
             session_idle: Duration::from_secs(
-                env_opt("SESSION_IDLE_SECS").and_then(|v| v.parse().ok()).filter(|s| *s >= 30).unwrap_or(600),
+                env_opt("SESSION_IDLE_SECS")
+                    .and_then(|v| v.parse().ok())
+                    .filter(|s| *s >= 30)
+                    .unwrap_or(SESSION_IDLE_SECS),
             ),
             scratch_dir: env_opt("SCRATCH_DIR").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/cache")),
             scratch_max_bytes: env_opt("SCRATCH_MAX_BYTES")

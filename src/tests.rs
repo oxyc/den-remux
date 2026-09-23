@@ -1070,6 +1070,39 @@ async fn sessions_are_capped_but_a_browser_may_switch_titles() {
     state.end_all("test").await;
 }
 
+/// A player that loses its connection for five minutes comes back to its session, which still serves the next segment;
+/// only past the idle window does it end. Pinned so a shorter window can't creep in by accident.
+#[tokio::test]
+#[ignore = "needs ffmpeg"]
+async fn a_session_outlives_five_minutes_of_silence() {
+    const { assert!(crate::config::SESSION_IDLE_SECS >= 5 * 60 + 60, "room past a five-minute silence") };
+    let origin = origin().await;
+    let state = test_state(&origin, 2, Duration::from_secs(crate::config::SESSION_IDLE_SECS));
+    let cookie = login(&state, "phone-key").await;
+    let created =
+        call(&state, "POST", "/remux/session", Some(&cookie), r#"{"imdb":"tt0000001"}"#).await.json();
+    let sid = created["sid"].as_str().unwrap().to_string();
+    let base = created["playlist"].as_str().unwrap().trim_end_matches("master.m3u8").to_string();
+    assert_eq!(call(&state, "GET", &format!("{base}seg0.m4s"), None, "").await.status, StatusCode::OK);
+
+    state.session(&sid).unwrap().silent_for(Duration::from_secs(5 * 60));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(state.session(&sid).is_some(), "five minutes of silence ended the session");
+    assert_eq!(call(&state, "GET", &format!("{base}seg1.m4s"), None, "").await.status, StatusCode::OK);
+
+    state.session(&sid).unwrap().silent_for(Duration::from_secs(crate::config::SESSION_IDLE_SECS + 1));
+    let mut ended = false;
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if state.session(&sid).is_none() {
+            ended = true;
+            break;
+        }
+    }
+    assert!(ended, "past the idle window it ends");
+    assert_eq!(call(&state, "GET", &format!("{base}seg2.m4s"), None, "").await.status, StatusCode::GONE);
+}
+
 #[tokio::test]
 #[ignore]
 async fn an_idle_session_is_ended_and_its_ffmpeg_does_not_outlive_it() {
