@@ -47,6 +47,54 @@ fn independent(closed_gops: bool) -> &'static str {
     }
 }
 
+/// Each segment's bytes, from the file's byte index (`MediaInfo::byte_index`): the bytes between the indexed keyframes
+/// its bounds fall on, and past the last one the index's average rate. Scaled to add up to `size` where that is known,
+/// so the headers, the index itself and (in an MP4, whose index counts the video alone) the audio are spread over the
+/// film in proportion. `None` from an index of fewer than two keyframes.
+pub fn segment_bytes(segs: &[Segment], index: &[(f64, u64)], size: Option<u64>) -> Option<Vec<f64>> {
+    let (first, last) = (*index.first()?, *index.last()?);
+    if last.0 <= first.0 || last.1 <= first.1 {
+        return None;
+    }
+    let rate = (last.1 - first.1) as f64 / (last.0 - first.0);
+    let at = |t: f64| match index.partition_point(|(k, _)| *k <= t + 1e-6) {
+        0 => first.1 as f64,
+        i if i == index.len() => last.1 as f64 + (t - last.0) * rate,
+        i => index[i - 1].1 as f64,
+    };
+    let bytes: Vec<f64> = segs.iter().map(|s| (at(s.end) - at(s.start)).max(0.0)).collect();
+    let total: f64 = bytes.iter().sum();
+    match size {
+        Some(size) if total > 0.0 => Some(bytes.iter().map(|b| b * size as f64 / total).collect()),
+        _ => Some(bytes),
+    }
+}
+
+/// The bits a second a link must carry for a player that starts at segment `from` to wait at most `prebuffer`
+/// seconds and then never run dry: a leaky bucket over the segments. Segment k is fetched by the time the bytes up
+/// to its end, C(k+1), have come at rate R, and plays from T(k), so the wait is the largest C(k+1)/R − T(k); it is
+/// within `prebuffer` exactly when R ≥ C(k+1) / (prebuffer + T(k)) for every k. A player whose buffer is full stops
+/// fetching, which this does not model: it is the least the link must do, not a promise.
+pub fn needed_rate(segs: &[Segment], bytes: &[f64], from: usize, prebuffer: f64) -> f64 {
+    let (mut fetched, mut need) = (0.0, 0.0f64);
+    for k in from..segs.len().min(bytes.len()) {
+        fetched += bytes[k] * 8.0;
+        need = need.max(fetched / (prebuffer + segs[k].start - segs[from].start));
+    }
+    need
+}
+
+/// How long a player at `rate` bits a second must wait before it starts at segment `from` so that it never runs dry
+/// after (`needed_rate`'s bucket, the other way round).
+pub fn startup_delay(segs: &[Segment], bytes: &[f64], from: usize, rate: f64) -> f64 {
+    let (mut fetched, mut wait) = (0.0, 0.0f64);
+    for k in from..segs.len().min(bytes.len()) {
+        fetched += bytes[k] * 8.0;
+        wait = wait.max(fetched / rate - (segs[k].start - segs[from].start));
+    }
+    wait
+}
+
 /// The media playlist. VOD, so the player knows the whole timeline up front and can seek anywhere
 /// before a single segment exists. A `start` past zero is a resume: `EXT-X-START` with `PRECISE=YES`
 /// has a native HLS player (Safari's) begin there instead of at zero and then seeking.
@@ -173,8 +221,11 @@ pub fn subtitle_segments(segs: &[Segment], n: usize) -> String {
 }
 
 /// BANDWIDTH and AVERAGE-BANDWIDTH from the file's size and duration. The average is honest; the peak
-/// is a guess (a quarter over, plus the AAC we add), because nothing short of reading the whole file
-/// says what the busiest segment carries. `None` size assumes a 1080p WEB-DL.
+/// is a guess (a quarter over, plus the AAC we add). It is left below what a busy stretch really carries on purpose:
+/// hls.js buffers ahead `8 × maxBufferSize / BANDWIDTH` seconds (at least `maxBufferLength`), so naming a CRF encode's
+/// real peak, three or four times its average, would shrink the very buffer that carries it through that stretch.
+/// Whether a link can carry the release is `needed_rate`'s question, asked before a release is chosen. `None` size
+/// assumes a 1080p WEB-DL.
 pub fn bandwidth(size: Option<u64>, duration: f64) -> (u64, u64) {
     let avg = match size {
         Some(s) if duration > 0.0 => (s as f64 * 8.0 / duration) as u64,
@@ -217,6 +268,29 @@ mod tests {
         let segs = segments(&[0.5, 7.0], 10.0, 6.0);
         assert_eq!(segs[0].start, 0.0);
         assert_eq!(segs[1].start, 7.0);
+    }
+
+    #[test]
+    fn segment_sizes_come_from_the_index_and_add_up_to_the_file() {
+        let segs = segments(&[0.0, 6.0, 12.0], 15.0, 6.0);
+        let index = [(0.0, 100), (6.0, 700), (12.0, 1300)];
+        // Past the last keyframe, the index's own 100 bytes a second.
+        assert_eq!(segment_bytes(&segs, &index, None), Some(vec![600.0, 600.0, 300.0]));
+        assert_eq!(segment_bytes(&segs, &index, Some(3000)), Some(vec![1200.0, 1200.0, 600.0]));
+        assert_eq!(segment_bytes(&segs, &index[..1], Some(3000)), None, "one keyframe is no index");
+        assert_eq!(segment_bytes(&segs, &[], None), None);
+    }
+
+    #[test]
+    fn the_rate_needed_and_the_wait_at_a_rate_are_one_bucket() {
+        let segs = segments(&[0.0, 6.0, 12.0], 15.0, 6.0);
+        let bytes = [600.0, 600.0, 300.0];
+        // 4800 bits in by 10 s, 9600 by 16 s, 12000 by 22 s: the second is the tightest.
+        assert_eq!(needed_rate(&segs, &bytes, 0, 10.0), 600.0);
+        assert!((startup_delay(&segs, &bytes, 0, 600.0) - 10.0).abs() < 1e-9);
+        assert!(startup_delay(&segs, &bytes, 0, 1200.0) <= 4.0 + 1e-9);
+        // From the second segment only its own bytes count, and they have its whole time.
+        assert_eq!(needed_rate(&segs, &bytes, 1, 10.0), 4800.0 / 10.0);
     }
 
     #[test]

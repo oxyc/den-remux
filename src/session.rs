@@ -185,6 +185,9 @@ pub struct Session {
     /// The size and rate a transcode comes down to: 720p for a player whose link can't carry 1080p.
     pub preset: job::Preset,
     pub segments: Vec<Segment>,
+    /// How long a player on the link it named waits before a copy plays through without running dry (`prebuffer`):
+    /// its pre-buffer target. `None` for a transcode, or without a link or a byte index.
+    pub prebuffer: Option<f64>,
     pub master: String,
     pub media: String,
     reports: AtomicU8,
@@ -1422,10 +1425,70 @@ fn average_bitrate(size: Option<u64>, duration: f64) -> Option<u64> {
     size.filter(|_| duration > 0.0).map(|s| (s as f64 * 8.0 / duration) as u64)
 }
 
+/// The longest a player is asked to wait before a copy plays through: a link that needs more of a wait than this
+/// for a release is too slow for it. Ten seconds is under the thirty that hls.js and Safari hold ahead, so a player
+/// can build that lead at all, and about what a person waits for a start before giving up on it.
+const MAX_PREBUFFER: f64 = 10.0;
+/// What a release with no byte index is taken to need over its average. An encode at a constant quality peaks at
+/// three or four times its average for seconds at a time, but over the stretches a buffer has to carry, half again is
+/// what the indexed releases measured.
+const NO_INDEX_HEADROOM: f64 = 1.5;
+
+/// What a copy needs of the link, in bits a second: from where the player starts, the rate at which it waits at most
+/// `MAX_PREBUFFER` and then never runs dry (`playlist::needed_rate`) — or, from a file with no byte index, its average
+/// with `NO_INDEX_HEADROOM`, which `indexed` says it is.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Need {
+    pub bitrate: u64,
+    pub indexed: bool,
+}
+
+impl std::fmt::Display for Need {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.indexed {
+            true => write!(f, "{} kbit/s to start within {MAX_PREBUFFER:.0}s", self.bitrate / 1000),
+            false => write!(
+                f,
+                "{} kbit/s, its average with {:.0}% headroom: the file has no byte index",
+                self.bitrate / 1000,
+                (NO_INDEX_HEADROOM - 1.0) * 100.0
+            ),
+        }
+    }
+}
+
+/// `Need` for a release of `size` bytes played from `start_at`; `None` when neither its index nor its size and
+/// duration say.
+pub(crate) fn need(info: &MediaInfo, size: Option<u64>, start_at: f64) -> Option<Need> {
+    let segs = playlist::segments(&info.keyframes, info.duration, playlist::TARGET_SECS);
+    match playlist::segment_bytes(&segs, &info.byte_index, size) {
+        Some(bytes) => {
+            let rate = playlist::needed_rate(&segs, &bytes, start_segment(&segs, start_at), MAX_PREBUFFER);
+            Some(Need { bitrate: rate as u64, indexed: true })
+        }
+        None => average_bitrate(size, info.duration)
+            .map(|a| Need { bitrate: (a as f64 * NO_INDEX_HEADROOM) as u64, indexed: false }),
+    }
+}
+
+/// How long a player on a `max_bitrate` link waits before a copy started at `start_at` plays through
+/// (`playlist::startup_delay`): what it can take as its pre-buffer target. `None` without a link or a byte index.
+pub(crate) fn prebuffer(
+    info: &MediaInfo,
+    size: Option<u64>,
+    start_at: f64,
+    max_bitrate: Option<u64>,
+) -> Option<f64> {
+    let rate = max_bitrate.filter(|r| *r > 0)? as f64;
+    let segs = playlist::segments(&info.keyframes, info.duration, playlist::TARGET_SECS);
+    let bytes = playlist::segment_bytes(&segs, &info.byte_index, size)?;
+    Some(playlist::startup_delay(&segs, &bytes, start_segment(&segs, start_at), rate))
+}
+
 /// Whether a copy of the release needs more than the player's `maxBitrate`. Without one every release fits, and so does
-/// one whose size or duration isn't known: nothing says it doesn't.
-pub(crate) fn over(max_bitrate: Option<u64>, size: Option<u64>, duration: f64) -> bool {
-    max_bitrate.zip(average_bitrate(size, duration)).is_some_and(|(max, average)| average > max)
+/// one whose need isn't known: nothing says it doesn't.
+pub(crate) fn over(max_bitrate: Option<u64>, need: Option<Need>) -> bool {
+    max_bitrate.zip(need).is_some_and(|(max, need)| need.bitrate > max)
 }
 
 /// A transcode's output size: the source's, fitted inside the preset's with its aspect kept (a 2.4:1 4K film becomes
@@ -1827,11 +1890,16 @@ pub async fn create(
                 // A copy needing more than the player's link carries is kept aside while one that fits is looked for —
                 // unless the player named it, which is then decided on below as the only one.
                 Ok((r, info))
-                    if over(want.max_bitrate, r.size.or(c.attributes.size_bytes), info.duration) =>
+                    if over(
+                        want.max_bitrate,
+                        need(&info, r.size.or(c.attributes.size_bytes), want.start_at),
+                    ) =>
                 {
                     eprintln!(
-                        "session: {imdb} \"{}\" needs more than the player's {} kbit/s",
+                        "session: {imdb} \"{}\" needs {} — more than the player's {} kbit/s",
                         c.attributes.label,
+                        need(&info, r.size.or(c.attributes.size_bytes), want.start_at)
+                            .map_or_else(String::new, |n| n.to_string()),
                         want.max_bitrate.unwrap_or(0) / 1000
                     );
                     let named = want.filename == Some(c.filename());
@@ -1860,7 +1928,7 @@ pub async fn create(
     };
     let preset = job::preset_for(want.max_bitrate);
     let bitrate = |t: &(&scout::Stream, (scout::Resolved, MediaInfo))| {
-        average_bitrate(t.1 .0.size.or(t.0.attributes.size_bytes), t.1 .1.duration)
+        need(&t.1 .1, t.1 .0.size.or(t.0.attributes.size_bytes), want.start_at).map(|n| n.bitrate)
     };
     if chosen.is_none() {
         // Nothing plays as it is and fits: a conversion at the preset the link takes — of the first release that plays
@@ -1996,7 +2064,12 @@ pub async fn create(
     let opened_key = opened_key(&source.base, c);
     // A transcode's keyframes are its encoder's IDRs, in closed GOPs; a copy's are the release's own.
     let closed_gops = transcode.is_some() || info.closed_gops;
+    let prebuffer = match transcode {
+        Some(_) => None,
+        None => prebuffer(&info, size, start_at, want.max_bitrate),
+    };
     let session = Arc::new(Session {
+        prebuffer,
         master: playlist::master(
             &codecs,
             dv_signal.as_ref(),
@@ -2170,6 +2243,7 @@ mod tests {
             subtitles: Vec::new(),
             keyframes: vec![0.0],
             closed_gops: true,
+            byte_index: Vec::new(),
         }
     }
 
@@ -2544,14 +2618,63 @@ mod tests {
         assert_eq!(transcode_size(3840, 1600, job::HD720), (1280, 532));
     }
 
+    /// Twelve minutes with a keyframe every 2 s: two cheap minutes at 1 Mbit/s, two heavy ones at 10, then eight cheap
+    /// ones again — the shape of a film that opens on titles and then cuts to its first real scene.
+    fn front_loaded() -> (crate::probe::MediaInfo, u64) {
+        let keyframes: Vec<f64> = (0..360).map(|i| i as f64 * 2.0).collect();
+        let mut at = 0u64;
+        let byte_index: Vec<(f64, u64)> = keyframes
+            .iter()
+            .map(|&t| {
+                let here = at;
+                at += if (120.0..240.0).contains(&t) { 2_500_000 } else { 250_000 };
+                (t, here)
+            })
+            .collect();
+        let info = crate::probe::MediaInfo {
+            duration: 720.0,
+            keyframes,
+            byte_index,
+            ..info(VideoCodec::H264, "avc1.640028", false)
+        };
+        (info, at)
+    }
+
     #[test]
-    fn a_copy_is_over_the_link_by_its_average_bitrate() {
+    fn a_link_that_covers_the_average_but_not_the_heavy_stretch_is_refused() {
+        let (info, size) = front_loaded();
+        assert_eq!(average_bitrate(Some(size), info.duration), Some(2_500_000));
+        let from_start = need(&info, Some(size), 0.0).unwrap();
+        assert!(from_start.indexed);
+        // Everything to the end of the heavy minutes, 1320 Mbit, must be in by the time their last 6 s segment plays
+        // (234 s) plus the 10 s allowed: 1320 / 244.
+        assert!((5_400_000..5_420_000).contains(&from_start.bitrate), "{from_start:?}");
+        assert!(over(Some(4_000_000), Some(from_start)), "4 Mbit/s carries the average, not the film");
+        assert!(!over(Some(6_000_000), Some(from_start)));
+        let wait = prebuffer(&info, Some(size), 0.0, Some(6_000_000)).unwrap();
+        assert!((0.0..=MAX_PREBUFFER).contains(&wait), "{wait}");
+        assert!(prebuffer(&info, Some(size), 0.0, Some(4_000_000)).unwrap() > MAX_PREBUFFER);
+        // Resumed at the heavy stretch, the cheap opening no longer builds a lead: 6 Mbit/s isn't enough there.
+        let resumed = need(&info, Some(size), 121.0).unwrap();
+        assert!(resumed.bitrate > 9_000_000, "{resumed:?}");
+        assert!(over(Some(6_000_000), Some(resumed)));
+    }
+
+    #[test]
+    fn with_no_byte_index_a_copy_needs_its_average_and_half_again() {
+        let plain = info(VideoCodec::H264, "avc1.640028", false);
+        let plain = crate::probe::MediaInfo { duration: 30.0, ..plain };
         // 3.75 MB over 30 s is 1 Mbit/s.
-        assert!(!over(None, Some(3_750_000), 30.0), "no maxBitrate: every release fits");
-        assert!(!over(Some(1_000_000), Some(3_750_000), 30.0), "at the limit fits");
-        assert!(over(Some(999_999), Some(3_750_000), 30.0));
-        assert!(!over(Some(1), None, 30.0), "an unknown size fits");
-        assert!(!over(Some(1), Some(3_750_000), 0.0), "and so does an unknown duration");
+        let n = need(&plain, Some(3_750_000), 0.0).unwrap();
+        assert_eq!(n, Need { bitrate: 1_500_000, indexed: false });
+        assert!(n.to_string().contains("no byte index"), "the log says it is a guess: {n}");
+        assert!(!over(None, Some(n)), "no maxBitrate: every release fits");
+        assert!(!over(Some(1_500_000), Some(n)), "at the limit fits");
+        assert!(over(Some(1_499_999), Some(n)));
+        assert_eq!(need(&plain, None, 0.0), None, "an unknown size says nothing");
+        assert!(!over(Some(1), None), "and nothing said fits");
+        assert_eq!(need(&crate::probe::MediaInfo { duration: 0.0, ..plain.clone() }, Some(1), 0.0), None);
+        assert_eq!(prebuffer(&plain, Some(3_750_000), 0.0, Some(1)), None, "no index, no pre-buffer");
     }
 
     #[test]

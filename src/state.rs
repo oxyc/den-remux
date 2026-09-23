@@ -89,10 +89,16 @@ impl KnownReleases {
         if self.entries.len() >= KNOWN_MAX {
             self.entries.pop_front();
         }
-        // Only what a verdict reads: the keyframe index, the audio and the subtitles are the bulk.
+        // Only what a verdict reads: the keyframe and byte indexes, the audio and the subtitles are the bulk.
         self.entries.push_back((
             key,
-            MediaInfo { keyframes: Vec::new(), audio: Vec::new(), subtitles: Vec::new(), ..info.clone() },
+            MediaInfo {
+                keyframes: Vec::new(),
+                byte_index: Vec::new(),
+                audio: Vec::new(),
+                subtitles: Vec::new(),
+                ..info.clone()
+            },
         ));
     }
 
@@ -536,6 +542,7 @@ mod tests {
             subtitles: Vec::new(),
             keyframes: vec![0.0],
             closed_gops: true,
+            byte_index: Vec::new(),
         };
         (Resolved { url: url.into(), head: vec![7; 200_000], size: Some(1) }, info)
     }

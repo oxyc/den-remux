@@ -478,6 +478,12 @@ pub async fn probe(src: &Source<'_>, head: &[u8]) -> Result<MediaInfo, ProbeErro
     if keyframes.is_empty() {
         return Err(ProbeError::Unsupported("the Cues index no video keyframes".into()));
     }
+    let mut byte_index: Vec<(f64, u64)> = parsed_cues
+        .iter()
+        .filter_map(|c| Some((secs(c.time as f64), seg_start.checked_add(c.cluster)?)))
+        .collect();
+    byte_index.sort_by(|a, b| a.0.total_cmp(&b.0));
+    byte_index.dedup_by(|b, a| a.0 == b.0);
     let mut hdr = super::is_hdr(video.transfer, video.primaries, video.matrix);
     let mut hlg = video.transfer == 18;
     let mut hevc_colour = None;
@@ -618,6 +624,7 @@ pub async fn probe(src: &Source<'_>, head: &[u8]) -> Result<MediaInfo, ProbeErro
         subtitles,
         keyframes,
         closed_gops,
+        byte_index,
     })
 }
 

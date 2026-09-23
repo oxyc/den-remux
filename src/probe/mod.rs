@@ -91,6 +91,11 @@ pub struct MediaInfo {
     /// (no picture after it presented before it) — and AV1 and VP9 key frames reset every reference. False for an open
     /// GOP, whose leading pictures reach into the segment before, and wherever the probe could not tell.
     pub closed_gops: bool,
+    /// How far into the file each indexed keyframe is, as `(seconds, bytes)` ascending in time: Matroska's Cues give
+    /// the byte position of the cluster holding it (every track's bytes, interleaved), an MP4's sample sizes the video
+    /// bytes before it. Only the differences mean anything — what a stretch of the film costs to fetch — and
+    /// `playlist::segment_bytes` scales them to the file's size. Empty when the file gives none.
+    pub byte_index: Vec<(f64, u64)>,
 }
 
 #[derive(Debug)]

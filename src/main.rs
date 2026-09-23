@@ -762,6 +762,9 @@ where
                     })),
                 },
                 "duration": s.info.duration,
+                // Seconds to buffer before playing, on the link the player named, so a copy then plays through
+                // without running dry; null where that isn't known.
+                "prebuffer": s.prebuffer.map(|p| (p * 10.0).ceil() / 10.0),
                 "expiresAt": s.exp,
                 "audioTrack": s.audio,
                 // The channels the session's audio carries, beside the track's own in `audioTracks`: fewer is a
