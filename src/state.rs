@@ -101,6 +101,76 @@ impl KnownReleases {
     }
 }
 
+/// Releases remembered as playing nowhere.
+const UNPLAYABLE_MAX: usize = 10_000;
+/// How long such a verdict holds. The file does not change; this only lets a wrong verdict — a probe fixed since, a
+/// debrid that served something else under a release's name — heal on its own.
+pub const UNPLAYABLE_TTL_SECS: u64 = 7 * 24 * 60 * 60;
+/// Where the verdicts are kept across restarts, in `SCRATCH_DIR`.
+pub const UNPLAYABLE_FILE: &str = "unplayable.json";
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct UnplayableEntry {
+    key: String,
+    /// Unix seconds when it was found.
+    at: u64,
+    why: String,
+}
+
+/// Releases whose opening showed they play in no browser — their container isn't Matroska or MP4, their video is
+/// something nothing here copies or converts, they have no audio — so a session skips them without opening them
+/// again. Only what the file itself decides: whatever depends on the moment or the player is never kept. Keyed by
+/// `session::unplayable_key`: the title, the release's size and its name.
+#[derive(Default)]
+pub struct Unplayable {
+    entries: HashMap<String, (u64, String)>,
+    /// Counts changes, so a write of an older state never replaces a newer one on disk.
+    generation: u64,
+}
+
+impl Unplayable {
+    /// Why the release under `key` plays nowhere, when that was found within `UNPLAYABLE_TTL_SECS` of `now`.
+    pub fn get(&self, key: &str, now: u64) -> Option<String> {
+        self.entries
+            .get(key)
+            .filter(|(at, _)| now.saturating_sub(*at) < UNPLAYABLE_TTL_SECS)
+            .map(|(_, why)| why.clone())
+    }
+
+    /// Remember a release that plays nowhere; past `UNPLAYABLE_MAX` the oldest verdict gives way.
+    pub fn put(&mut self, key: String, why: String, now: u64) {
+        if !self.entries.contains_key(&key) && self.entries.len() >= UNPLAYABLE_MAX {
+            self.entries.retain(|_, (at, _)| now.saturating_sub(*at) < UNPLAYABLE_TTL_SECS);
+        }
+        if !self.entries.contains_key(&key) && self.entries.len() >= UNPLAYABLE_MAX {
+            let oldest = self.entries.iter().min_by_key(|(_, (at, _))| *at).map(|(k, _)| k.clone());
+            if let Some(k) = oldest {
+                self.entries.remove(&k);
+            }
+        }
+        self.entries.insert(key, (now, why));
+        self.generation += 1;
+    }
+
+    fn to_json(&self) -> Vec<u8> {
+        let list: Vec<UnplayableEntry> = self
+            .entries
+            .iter()
+            .map(|(key, (at, why))| UnplayableEntry { key: key.clone(), at: *at, why: why.clone() })
+            .collect();
+        serde_json::to_vec(&list).unwrap_or_default()
+    }
+
+    /// What `to_json` wrote, less what has expired by `now`, the newest `UNPLAYABLE_MAX` of it.
+    fn from_json(bytes: &[u8], now: u64) -> Result<Unplayable, String> {
+        let mut list: Vec<UnplayableEntry> = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
+        list.retain(|e| now.saturating_sub(e.at) < UNPLAYABLE_TTL_SECS);
+        list.sort_by_key(|e| std::cmp::Reverse(e.at));
+        list.truncate(UNPLAYABLE_MAX);
+        Ok(Unplayable { entries: list.into_iter().map(|e| (e.key, (e.at, e.why))).collect(), generation: 0 })
+    }
+}
+
 pub struct AppState {
     pub cfg: Config,
     pub http: reqwest::Client,
@@ -118,6 +188,9 @@ pub struct AppState {
     opened: Mutex<OpenedCache>,
     /// What opened releases showed of their video, for `POST /remux/releases`.
     known: Mutex<KnownReleases>,
+    /// Releases that play in no browser, and the generation of them last written to disk.
+    unplayable: Mutex<Unplayable>,
+    unplayable_written: Mutex<u64>,
     pub scratch_bytes: AtomicU64,
     pub sessions_started: AtomicU64,
     pub jobs_started: AtomicU64,
@@ -178,6 +251,8 @@ impl AppState {
             starts: Mutex::new(HashMap::new()),
             opened: Mutex::new(OpenedCache::default()),
             known: Mutex::new(KnownReleases::default()),
+            unplayable: Mutex::new(Unplayable::default()),
+            unplayable_written: Mutex::new(0),
             scratch_bytes: AtomicU64::new(0),
             sessions_started: AtomicU64::new(0),
             jobs_started: AtomicU64::new(0),
@@ -205,6 +280,55 @@ impl AppState {
 
     pub fn opened(&self) -> MutexGuard<'_, OpenedCache> {
         self.opened.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub fn unplayable(&self) -> MutexGuard<'_, Unplayable> {
+        self.unplayable.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Take up the verdicts an earlier process kept in scratch. A missing file is a first start; an unreadable one
+    /// is said, and replaced by the next verdict.
+    pub fn load_unplayable(&self) {
+        let path = self.cfg.scratch_dir.join(UNPLAYABLE_FILE);
+        let loaded = match std::fs::read(&path) {
+            Ok(bytes) => Unplayable::from_json(&bytes, unix_now()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(e) => Err(e.to_string()),
+        };
+        match loaded {
+            Ok(u) => {
+                eprintln!("unplayable: {} release(s) remembered from the previous process", u.entries.len());
+                *self.unplayable() = u;
+            }
+            Err(e) => eprintln!("unplayable: {} could not be read: {e}", path.display()),
+        }
+    }
+
+    /// Remember that the release under `key` plays nowhere, and keep that in scratch, off the runtime's threads.
+    pub fn remember_unplayable(self: &Arc<Self>, key: String, why: String) {
+        self.unplayable().put(key, why, unix_now());
+        let st = self.clone();
+        tokio::task::spawn_blocking(move || st.write_unplayable());
+    }
+
+    /// Write the verdicts to scratch, whole, through a rename — unless a newer state is already there.
+    fn write_unplayable(&self) {
+        let mut written = self.unplayable_written.lock().unwrap_or_else(|e| e.into_inner());
+        let (generation, json) = {
+            let u = self.unplayable();
+            (u.generation, u.to_json())
+        };
+        if generation <= *written {
+            return;
+        }
+        let path = self.cfg.scratch_dir.join(UNPLAYABLE_FILE);
+        let tmp = path.with_extension("json.tmp");
+        match std::fs::write(&tmp, json).and_then(|()| std::fs::rename(&tmp, &path)) {
+            Ok(()) => *written = generation,
+            Err(e) => crate::log_limited("unplayable_write", || {
+                format!("unplayable: {} could not be written: {e}", path.display())
+            }),
+        }
     }
 
     pub fn sessions(&self) -> MutexGuard<'_, HashMap<String, Arc<Session>>> {
@@ -435,5 +559,33 @@ mod tests {
         assert!(cache.get(&format!("r{OPENED_MAX}"), t0).is_some());
         cache.forget("r1");
         assert!(cache.get("r1", t0).is_none(), "a dead link is forgotten");
+    }
+
+    #[test]
+    fn an_unplayable_release_is_remembered_for_a_week_and_boundedly() {
+        let mut u = Unplayable::default();
+        let t0 = 1_000_000;
+        u.put("tt1/11/a.mkv".into(), "video is ap4h".into(), t0);
+        assert_eq!(u.get("tt1/11/a.mkv", t0 + UNPLAYABLE_TTL_SECS - 1).as_deref(), Some("video is ap4h"));
+        assert!(u.get("tt1/11/a.mkv", t0 + UNPLAYABLE_TTL_SECS).is_none(), "a week on it is tried again");
+        assert!(u.get("tt1/12/a.mkv", t0).is_none(), "another size is another release");
+
+        for i in 0..UNPLAYABLE_MAX as u64 {
+            u.put(format!("r{i}"), "x".into(), t0 + 1 + i);
+        }
+        assert_eq!(u.entries.len(), UNPLAYABLE_MAX);
+        assert!(u.get("tt1/11/a.mkv", t0 + 2).is_none(), "the oldest gave way");
+        assert!(u.get("r0", t0 + 2).is_some());
+    }
+
+    #[test]
+    fn unplayable_verdicts_survive_a_restart_less_what_expired() {
+        let mut u = Unplayable::default();
+        u.put("old".into(), "neither".into(), 100);
+        u.put("new".into(), "video is ap4h".into(), 100 + UNPLAYABLE_TTL_SECS / 2);
+        let back = Unplayable::from_json(&u.to_json(), 100 + UNPLAYABLE_TTL_SECS).expect("reads back");
+        assert!(back.get("old", 100 + UNPLAYABLE_TTL_SECS).is_none());
+        assert_eq!(back.get("new", 100 + UNPLAYABLE_TTL_SECS).as_deref(), Some("video is ap4h"));
+        assert!(Unplayable::from_json(b"not json", 0).is_err());
     }
 }

@@ -97,21 +97,29 @@ pub fn parse(body: &[u8]) -> Result<Vec<Stream>, String> {
         .map_err(|e| format!("not a stream list: {e}"))
 }
 
+/// The extension of a release whose name says it is in a container left out by name: one the probe can't open
+/// (it reads Matroska and MP4 only), or WebM. `None` for any other name, which the probe decides.
+pub fn left_out_by_name(s: &Stream) -> Option<&'static str> {
+    let name = s.filename().to_ascii_lowercase();
+    [
+        ".avi", ".ts", ".m2ts", ".mts", ".m2t", ".iso", ".img", ".wmv", ".asf", ".mpg", ".mpeg", ".vob",
+        ".flv", ".rm", ".rmvb", ".divx", ".ogm", ".ogv", ".webm",
+    ]
+    .into_iter()
+    .find(|ext| name.ends_with(ext))
+}
+
 /// Could the browser take this release with only the audio re-encoded? Cached — an uncached one would
 /// start a debrid download and play nothing — and H.264 or HEVC, AV1 or VP9 for a player that decodes it
 /// (`av1`, `vp9`), or a codec the title does not name (the probe decides those). AV1 or VP9 for any other
 /// player, MPEG-4 Part 2 and VC-1 need the video re-encoded, which this service does not do. Containers
-/// other than Matroska and MP4 are left out by name.
+/// other than Matroska and MP4 are left out by name (`left_out_by_name`).
 fn remuxable(s: &Stream, av1: bool, vp9: bool) -> bool {
     let codec_ok = match s.attributes.codec.as_deref().map(str::to_ascii_lowercase) {
         None => true,
         Some(c) => c == "h264" || c == "hevc" || (av1 && c == "av1") || (vp9 && c == "vp9"),
     };
-    let name = s.filename().to_ascii_lowercase();
-    let container_ok = ![".avi", ".ts", ".m2ts", ".iso", ".wmv", ".mpg", ".mpeg", ".vob", ".webm"]
-        .iter()
-        .any(|ext| name.ends_with(ext));
-    s.attributes.cached == Some(true) && codec_ok && container_ok && !s.attributes.three_d
+    s.attributes.cached == Some(true) && codec_ok && left_out_by_name(s).is_none() && !s.attributes.three_d
 }
 
 /// The releases worth trying, in the order to try them: the one the browser named first when it is
