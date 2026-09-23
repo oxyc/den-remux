@@ -29,7 +29,7 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 # HMAC-SHA256 for the browser cookie and the per-session URL signature; SHA-256 for the browser keys;
 # a constant-time compare for all three.
 hmac = "0.12"
-sha2 = "0.10"
+sha2 = "0.11"
 subtle = "2"
 base64 = "0.23"
 getrandom = "0.4"
