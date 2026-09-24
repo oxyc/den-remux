@@ -619,7 +619,13 @@ impl Session {
         }
     }
 
-    pub async fn serve_segment(&self, st: &AppState, n: usize, head: bool) -> Response<Body> {
+    pub async fn serve_segment(
+        &self,
+        st: &AppState,
+        n: usize,
+        head: bool,
+        headers: &hyper::HeaderMap,
+    ) -> Response<Body> {
         let deadline = Instant::now() + SEGMENT_WAIT;
         loop {
             self.reresolve_if_needed(st).await;
@@ -641,13 +647,13 @@ impl Session {
             self.wake.notify_one();
             if let Some(paths) = paths {
                 // Opened before pruning, so a GOP deleted from the window keeps serving this body.
-                if let Ok(Ok(parts)) = tokio::task::spawn_blocking(move || open_parts(&paths)).await {
+                if let Ok(Ok(media)) = tokio::task::spawn_blocking(move || open_parts(&paths)).await {
                     {
                         let mut i = self.lock();
                         self.prune(&mut i, n, st);
                         self.gate(&mut i, st);
                     }
-                    return media_response(parts, head, self.exp);
+                    return media_response(media, head, self.exp, headers);
                 }
             }
             if Instant::now() >= deadline {
@@ -657,7 +663,7 @@ impl Session {
         }
     }
 
-    pub async fn serve_init(&self, st: &AppState, head: bool) -> Response<Body> {
+    pub async fn serve_init(&self, st: &AppState, head: bool, headers: &hyper::HeaderMap) -> Response<Body> {
         let deadline = Instant::now() + SEGMENT_WAIT;
         loop {
             self.reresolve_if_needed(st).await;
@@ -679,8 +685,8 @@ impl Session {
             };
             self.wake.notify_one();
             if let Some(path) = init {
-                if let Ok(Ok(parts)) = tokio::task::spawn_blocking(move || open_parts(&[path])).await {
-                    return media_response(parts, head, self.exp);
+                if let Ok(Ok(media)) = tokio::task::spawn_blocking(move || open_parts(&[path])).await {
+                    return media_response(media, head, self.exp, headers);
                 }
             }
             if Instant::now() >= deadline {
@@ -931,14 +937,31 @@ impl Session {
     }
 }
 
+/// A segment's GOP files opened for one response, and the validator that names these bytes.
+struct Media {
+    parts: Vec<(std::fs::File, u64)>,
+    etag: String,
+}
+
 /// Open each GOP file, positioned past the `styp` box of every file but the first: the joined segment
 /// is one segment, and a segment type box belongs only at its start.
-fn open_parts(paths: &[PathBuf]) -> std::io::Result<Vec<(std::fs::File, u64)>> {
+///
+/// The ETag hashes each file's path, length and modification time. A segment made again by a later job (after the
+/// window pruned it) is a different run's files, so its bytes — which need not match the first run's — never answer
+/// an `If-Range` that names the first.
+fn open_parts(paths: &[PathBuf]) -> std::io::Result<Media> {
+    use sha2::{Digest, Sha256};
     use std::io::{Read, Seek, SeekFrom};
-    let mut out = Vec::with_capacity(paths.len());
+    let mut parts = Vec::with_capacity(paths.len());
+    let mut id = Sha256::new();
     for (k, p) in paths.iter().enumerate() {
         let mut f = std::fs::File::open(p)?;
-        let mut len = f.metadata()?.len();
+        let meta = f.metadata()?;
+        let mut len = meta.len();
+        let mtime = meta.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok());
+        id.update(p.as_os_str().as_encoded_bytes());
+        id.update(len.to_be_bytes());
+        id.update(mtime.map_or(0, |d| d.as_nanos()).to_be_bytes());
         if k > 0 {
             let mut hdr = [0u8; 8];
             f.read_exact(&mut hdr)?;
@@ -950,25 +973,114 @@ fn open_parts(paths: &[PathBuf]) -> std::io::Result<Vec<(std::fs::File, u64)>> {
                 f.seek(SeekFrom::Start(0))?;
             }
         }
-        out.push((f, len));
+        parts.push((f, len));
+    }
+    let digest = id.finalize();
+    let etag = format!("\"{}\"", digest[..12].iter().map(|b| format!("{b:02x}")).collect::<String>());
+    Ok(Media { parts, etag })
+}
+
+/// The one byte range a request asks for, inclusive, within a body of `len` bytes: `Ok(None)` for the whole body
+/// (no `Range`, one not in bytes, several ranges, or an `If-Range` that doesn't name these bytes), `Err(())` for a
+/// range that starts past the end.
+fn wanted_range(headers: &hyper::HeaderMap, etag: &str, len: u64) -> Result<Option<(u64, u64)>, ()> {
+    let Some(spec) = headers.get(hyper::header::RANGE).and_then(|v| v.to_str().ok()) else {
+        return Ok(None);
+    };
+    // A validator that isn't this body's ETag (a date, or another run's) asks for the whole of what is here now.
+    if let Some(v) = headers.get(hyper::header::IF_RANGE) {
+        if v.to_str().ok().map(str::trim) != Some(etag) {
+            return Ok(None);
+        }
+    }
+    let Some(spec) = spec.trim().strip_prefix("bytes=") else {
+        return Ok(None);
+    };
+    if spec.contains(',') {
+        return Ok(None);
+    }
+    let Some((a, b)) = spec.trim().split_once('-') else {
+        return Ok(None);
+    };
+    let (a, b) = (a.trim(), b.trim());
+    let range = match (a.parse::<u64>(), b.parse::<u64>()) {
+        (Ok(start), Ok(end)) if start <= end => (start, end.min(len.saturating_sub(1))),
+        (Ok(start), Err(_)) if b.is_empty() => (start, len.saturating_sub(1)),
+        (Err(_), Ok(suffix)) if a.is_empty() && suffix > 0 => {
+            (len.saturating_sub(suffix), len.saturating_sub(1))
+        }
+        _ => return Ok(None),
+    };
+    if range.0 >= len {
+        return Err(());
+    }
+    Ok(Some(range))
+}
+
+/// The parts cut to bytes `start..=end` of their joined body: the files before `start` dropped, the first one kept
+/// sought forward to it, and the lengths capped at `end`.
+fn slice_parts(
+    parts: Vec<(std::fs::File, u64)>,
+    start: u64,
+    end: u64,
+) -> std::io::Result<Vec<(std::fs::File, u64)>> {
+    use std::io::{Seek, SeekFrom};
+    let mut out = Vec::new();
+    let (mut skip, mut left) = (start, end - start + 1);
+    for (mut f, len) in parts {
+        if left == 0 {
+            break;
+        }
+        if skip >= len {
+            skip -= len;
+            continue;
+        }
+        f.seek(SeekFrom::Current(skip as i64))?;
+        let take = (len - skip).min(left);
+        out.push((f, take));
+        left -= take;
+        skip = 0;
     }
     Ok(out)
 }
 
 /// `init.mp4` or a segment. Kept until the session expires at `exp`: its URL is signed for this session alone, and
 /// a player that seeks back to a segment already pruned from scratch takes it from its cache rather than restarting
-/// ffmpeg for it. Whole bodies only — a `Range` is not honoured, and `Accept-Ranges: none` says so.
-fn media_response(parts: Vec<(std::fs::File, u64)>, head: bool, exp: u64) -> Response<Body> {
-    let len: u64 = parts.iter().map(|(_, l)| l).sum();
-    let body = if head { httputil::full("") } else { httputil::files_body(parts) };
-    Response::builder()
-        .status(StatusCode::OK)
+/// ffmpeg for it.
+///
+/// Only a finished segment is ever served (`ready` waits for the last of its GOPs), so a `Range` of it is honoured:
+/// a player whose connection broke partway asks for the rest (`bytes=N-`) rather than the whole again, with
+/// `If-Range` naming the ETag of what it already holds.
+fn media_response(media: Media, head: bool, exp: u64, headers: &hyper::HeaderMap) -> Response<Body> {
+    let len: u64 = media.parts.iter().map(|(_, l)| l).sum();
+    let cache_control = format!("private, max-age={}, immutable", exp.saturating_sub(unix_now()));
+    let b = Response::builder()
         .header("content-type", "video/mp4")
-        .header("content-length", len)
-        .header("cache-control", format!("private, max-age={}, immutable", exp.saturating_sub(unix_now())))
-        .header("accept-ranges", "none")
-        .body(body)
-        .unwrap()
+        .header("cache-control", cache_control)
+        .header("accept-ranges", "bytes")
+        .header("etag", &media.etag);
+    let (status, range, parts) = match wanted_range(headers, &media.etag, len) {
+        Err(()) => {
+            return b
+                .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                .header("content-range", format!("bytes */{len}"))
+                .header("content-length", 0)
+                .body(httputil::full(""))
+                .unwrap();
+        }
+        Ok(None) => (StatusCode::OK, None, media.parts),
+        Ok(Some((start, end))) => match slice_parts(media.parts, start, end) {
+            Ok(parts) => (StatusCode::PARTIAL_CONTENT, Some((start, end)), parts),
+            Err(_) => return busy(),
+        },
+    };
+    let sent: u64 = parts.iter().map(|(_, l)| l).sum();
+    let body = if head { httputil::full("") } else { httputil::files_body(parts) };
+    let mut b = b.status(status).header("content-length", sent);
+    if let Some((start, end)) = range {
+        b = b.header("content-range", format!("bytes {start}-{end}/{len}"));
+    }
+    b.body(body).unwrap()
 }
 
 pub fn gone() -> Response<Body> {
@@ -2961,17 +3073,25 @@ mod tests {
         assert_eq!(snap(&kf, 3.7), 3.7, "a keyframe the index does not list keeps its own time");
     }
 
+    fn body_of(r: Response<Body>) -> Vec<u8> {
+        use http_body_util::BodyExt;
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        rt.block_on(r.into_body().collect()).unwrap().to_bytes().to_vec()
+    }
+
     #[test]
-    fn media_is_kept_until_the_session_expires_and_never_ranged() {
+    fn media_is_kept_until_the_session_expires() {
         let path = std::env::temp_dir().join(format!("den-remux-media-{}", std::process::id()));
         std::fs::write(&path, b"12345").unwrap();
         let exp = unix_now() + 3600;
-        let r = media_response(open_parts(std::slice::from_ref(&path)).unwrap(), false, exp);
+        let r =
+            media_response(open_parts(std::slice::from_ref(&path)).unwrap(), false, exp, &Default::default());
         let _ = std::fs::remove_file(&path);
         assert_eq!(r.status(), StatusCode::OK);
         assert_eq!(r.headers()["content-type"], "video/mp4");
         assert_eq!(r.headers()["content-length"], "5");
-        assert_eq!(r.headers()["accept-ranges"], "none");
+        assert_eq!(r.headers()["accept-ranges"], "bytes");
+        assert!(r.headers().contains_key("etag"));
         let cc = r.headers()["cache-control"].to_str().unwrap();
         let age: u64 = cc
             .strip_prefix("private, max-age=")
@@ -2981,6 +3101,65 @@ mod tests {
         assert!((3598..=3600).contains(&age), "the session's remaining life: {cc}");
         assert_eq!(busy().headers()["cache-control"], "no-store", "not ready is never kept");
         assert_eq!(gone().headers()["cache-control"], "no-store");
+    }
+
+    /// A finished segment, joined from GOP files with the later ones' `styp` skipped, answers a range of the joined
+    /// bytes: open-ended, bounded, suffix, across a file boundary, and past its end.
+    #[test]
+    fn a_finished_segment_answers_a_range_of_its_joined_bytes() {
+        let dir = std::env::temp_dir().join(format!("den-remux-range-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (a, b) = (dir.join("g0.m4s"), dir.join("g1.m4s"));
+        std::fs::write(&a, b"\0\0\0\x08stypAAAAAAAA").unwrap();
+        std::fs::write(&b, b"\0\0\0\x08stypBBBBBBBB").unwrap();
+        let paths = [a, b];
+        let whole: &[u8] = b"\0\0\0\x08stypAAAAAAAABBBBBBBB";
+        let etag = open_parts(&paths).unwrap().etag;
+        let ask = |pairs: &[(&str, &str)]| {
+            let mut h = hyper::HeaderMap::new();
+            for (k, v) in pairs {
+                h.insert(hyper::header::HeaderName::from_bytes(k.as_bytes()).unwrap(), v.parse().unwrap());
+            }
+            media_response(open_parts(&paths).unwrap(), false, unix_now() + 60, &h)
+        };
+        let full = ask(&[]);
+        assert_eq!(full.headers()["etag"], etag.as_str(), "the same files, the same validator");
+        assert_eq!(body_of(full), whole);
+
+        let r = ask(&[("range", "bytes=10-"), ("if-range", &etag)]);
+        assert_eq!(r.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(r.headers()["content-range"], "bytes 10-23/24");
+        assert_eq!(r.headers()["content-length"], "14");
+        assert_eq!(body_of(r), &whole[10..], "open-ended, across the join");
+
+        let r = ask(&[("range", "bytes=14-17")]);
+        assert_eq!(r.headers()["content-range"], "bytes 14-17/24");
+        assert_eq!(body_of(r), b"AABB");
+        let r = ask(&[("range", "bytes=-3")]);
+        assert_eq!(body_of(r), b"BBB", "the last bytes");
+        let r = ask(&[("range", "bytes=20-99")]);
+        assert_eq!(r.headers()["content-range"], "bytes 20-23/24", "an end past the body is cut to it");
+
+        let r = ask(&[("range", "bytes=24-")]);
+        assert_eq!(r.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(r.headers()["content-range"], "bytes */24");
+
+        for whole_again in [
+            vec![("range", "bytes=10-"), ("if-range", "\"another run\"")],
+            vec![("range", "bytes=0-1,4-5")],
+            vec![("range", "items=0-1")],
+            vec![("range", "bytes=5-2")],
+        ] {
+            let r = ask(&whole_again);
+            assert_eq!(r.status(), StatusCode::OK, "{whole_again:?}");
+            assert_eq!(body_of(r), whole, "{whole_again:?}");
+        }
+
+        // A later run's files are another body, whatever their bytes.
+        std::fs::write(dir.join("g2.m4s"), b"\0\0\0\x08stypAAAAAAAA").unwrap();
+        let other = open_parts(&[dir.join("g2.m4s"), paths[1].clone()]).unwrap().etag;
+        assert_ne!(other, etag);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

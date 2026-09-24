@@ -212,8 +212,11 @@ fn add_cors(resp: &mut Response<Body>) {
     let h = resp.headers_mut();
     h.insert("access-control-allow-origin", HeaderValue::from_static("*"));
     h.insert("access-control-allow-methods", HeaderValue::from_static("GET, HEAD, POST, DELETE, OPTIONS"));
-    h.insert("access-control-allow-headers", HeaderValue::from_static("Range, X-Request-Id"));
-    h.insert("access-control-expose-headers", HeaderValue::from_static("Content-Range, Content-Length"));
+    h.insert("access-control-allow-headers", HeaderValue::from_static("Range, If-Range, X-Request-Id"));
+    h.insert(
+        "access-control-expose-headers",
+        HeaderValue::from_static("Content-Range, Content-Length, ETag"),
+    );
     h.insert("timing-allow-origin", HeaderValue::from_static("*"));
     h.insert("access-control-max-age", HeaderValue::from_static("86400"));
 }
@@ -883,7 +886,7 @@ where
                     let text = if f == "master.m3u8" { s.master.clone() } else { s.media.clone() };
                     httputil::text("application/vnd.apple.mpegurl", &s.cache_control(), text)
                 }
-                "init.mp4" => s.serve_init(state, head).await,
+                "init.mp4" => s.serve_init(state, head, &parts.headers).await,
                 _ => match session::sub_file(f).filter(|file| {
                     let n = match file {
                         SubFile::Playlist(n) | SubFile::Document(n) | SubFile::Window(n, _) => *n,
@@ -913,7 +916,7 @@ where
                     }
                     None => match session::seg_index(f).filter(|n| *n < s.segments.len()) {
                         Some(n) => {
-                            let served = s.serve_segment(state, n, head).await;
+                            let served = s.serve_segment(state, n, head, &parts.headers).await;
                             // A replacement mid-film takes over once it serves media.
                             if !head && served.status().is_success() {
                                 state.replacement_played(&s).await;

@@ -203,10 +203,14 @@ itself is never logged. Brave on iOS sends Safari's User-Agent, so it reads as S
   audio track of the release playing) goes first and is kept, converted if need be.
 
 Only a valid `/remux/s/…` bearer URL gets public CORS. Those responses carry
-`Access-Control-Allow-Origin: *`, allow `Range` and expose
-`Content-Range`/`Content-Length` — a Cast receiver's page is on Google's origin. Playlists are
-`application/vnd.apple.mpegurl`; `init.mp4` and segments are `video/mp4`, always whole (`Accept-Ranges: none`; a
-`Range` is ignored). What a session's URL serves is fixed for its life and signed for it alone, so playlists, found
+`Access-Control-Allow-Origin: *`, allow `Range` and `If-Range` and expose
+`Content-Range`/`Content-Length`/`ETag` — a Cast receiver's page is on Google's origin. Playlists are
+`application/vnd.apple.mpegurl`; `init.mp4` and segments are `video/mp4`. A segment is only ever served once all of it
+is on disk, so it honours one byte `Range` (`Accept-Ranges: bytes`, 206 with `Content-Range`, 416 past its end): a
+player whose connection broke partway asks for the rest (`bytes=N-`) instead of the whole segment again. Each carries
+a strong `ETag` naming the run that made it; a range with an `If-Range` that doesn't match (the segment was pruned
+and made again by a later run, whose bytes may differ) is answered whole with 200. Several ranges are answered
+whole. What a session's URL serves is fixed for its life and signed for it alone, so playlists, found
 subtitles, `init.mp4` and segments are `private, max-age=<seconds until the session expires>` (`immutable` on the
 media): a seek back to a segment already pruned from scratch comes from the player's cache instead of restarting
 ffmpeg. Errors, a 503 not-ready and an empty subtitle are `no-store`. A retry is a new session with its own URLs, so

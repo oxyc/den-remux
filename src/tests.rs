@@ -754,9 +754,40 @@ async fn end_to_end(
         assert_eq!(r.status, StatusCode::OK, "seg{i}: {}", r.text());
         assert_eq!(r.headers["content-type"], "video/mp4");
         assert!(r.headers["cache-control"].to_str().unwrap().ends_with(", immutable"), "seg{i}");
-        assert_eq!(r.headers["accept-ranges"], "none");
+        assert_eq!(r.headers["accept-ranges"], "bytes");
         segs[i] = r.body;
     }
+    // A connection that broke partway through a finished segment asks for the rest: exactly those bytes, as a 206,
+    // open-ended or bounded, and only while the ETag it holds still names what is on disk.
+    let last = n - 1;
+    let seg = format!("{base}seg{last}.m4s");
+    let whole_seg = call(&state, "GET", &seg, None, "").await;
+    let (len, etag) = (whole_seg.body.len(), whole_seg.headers["etag"].to_str().unwrap().to_string());
+    assert_eq!(whole_seg.body, segs[last], "a segment still in the window is served from the same run");
+    let half = len / 2;
+    let rest = call_with(
+        &state,
+        "GET",
+        &seg,
+        None,
+        &[("range", &format!("bytes={half}-")), ("if-range", &etag)],
+        "",
+    )
+    .await;
+    assert_eq!(rest.status, StatusCode::PARTIAL_CONTENT);
+    assert_eq!(rest.headers["content-range"], format!("bytes {half}-{}/{len}", len - 1).as_str());
+    assert_eq!(rest.headers["content-length"], (len - half).to_string().as_str());
+    assert_eq!(rest.body, whole_seg.body.slice(half..), "the open-ended range is the segment's tail");
+    let mid = call_with(&state, "GET", &seg, None, &[("range", "bytes=10-19")], "").await;
+    assert_eq!(mid.status, StatusCode::PARTIAL_CONTENT);
+    assert_eq!(mid.body, whole_seg.body.slice(10..20));
+    let stale =
+        call_with(&state, "GET", &seg, None, &[("range", "bytes=10-"), ("if-range", "\"0\"")], "").await;
+    assert_eq!(stale.status, StatusCode::OK, "another run's validator gets the whole segment");
+    assert_eq!(stale.body.len(), len);
+    let past = call_with(&state, "GET", &seg, None, &[("range", &format!("bytes={len}-"))], "").await;
+    assert_eq!(past.status, StatusCode::RANGE_NOT_SATISFIABLE);
+    assert_eq!(past.headers["content-range"], format!("bytes */{len}").as_str());
     assert!(state.jobs_started.load(Relaxed) >= 3, "the out-of-order fetch should have restarted the job");
 
     let frame = 1.0 / 24.0 + 0.002;
