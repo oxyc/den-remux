@@ -370,10 +370,10 @@ Every variable is unprefixed; `.env.example` lists them with their defaults.
 | `ORIGIN_ALIASES` | — | `<public origin>=<LAN origin>` pairs (`https://d-scout.oxy.fi=http://192.168.86.193:8080,…`). An install, play or subtitle URL on a public name is fetched at the LAN address: scout and den-subtitles are on this box, so the WAN and the tunnel never sit between them, and this service never needs the Access token the public names ask for. The public name must still be in `SCOUT_ORIGINS`/`SUBTITLE_ORIGINS`. |
 | `BROWSER_KEY_HASHES` | — | Optional. Comma-separated hex SHA-256 of each browser key, for an availability-only scout install or `SCOUT_INSTALL_URL`. Removing one logs that browser out. |
 | `REMUX_URL_KEY` | random | **Secret.** Signs cookies and session URLs. **Set it**: unset, every restart logs the browsers out (`/health` says `url_key_ephemeral`). Rotating it kills every cookie and session URL. |
-| `MAX_SESSIONS` | `8` | Logical sessions kept at once; the next gets 429 `too_many_sessions`. |
+| `MAX_SESSIONS` | `2` | Logical sessions kept at once; the next gets 429 `too_many_sessions`. Raise only after the bounded-producer image is verified in production. |
 | `MAX_SESSIONS_PER_INSTALL` | `2` | Sessions one scout install plays at once without a login; past it, its oldest ends. |
 | `MAX_ACTIVE_REMUXES` | `2` | ffmpeg producers active at once. Extra sessions wait fairly when media is requested. |
-| `PRODUCER_IDLE_SECS` | `10` | Reap a producer paused on a full ahead window after this long; keep its logical session and finished GOPs. |
+| `PRODUCER_IDLE_SECS` | `10` | Reap a producer paused on a full ahead window after this long, or promptly under producer contention; keep its logical session and finished GOPs. |
 | `SESSION_IDLE_SECS` | `600` | A session with no request for this long is ended (min 30). |
 | `SCRATCH_DIR` | `/cache` | Where GOP files go. den-remux's alone: every `s-*` directory in it is deleted at start. Stable probe metadata and unplayable verdicts persist here without credentials. |
 | `SCRATCH_MAX_BYTES` | `1073741824` | Cap across sessions; past it a job pauses once the requested segment is done (min 64 MiB). |

@@ -2,6 +2,7 @@
 //! counters `/health` and `/metrics` read.
 
 use std::collections::HashMap;
+use std::io::Read;
 use std::net::IpAddr;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed};
@@ -112,8 +113,14 @@ impl KnownReleases {
 const PROBE_SCHEMA: u32 = 1;
 const PROBE_FILE: &str = "probe-metadata.json";
 const PROBE_MAX: usize = 256;
+/// A corrupt persistent file cannot make restart allocate in proportion to arbitrary disk contents.
+const PROBE_FILE_MAX_BYTES: usize = 4 * 1024 * 1024;
+const PROBE_ENTRY_MAX_BYTES: usize = 1024 * 1024;
+const PROBE_KEYFRAMES_MAX: usize = 65_536;
+const PROBE_TRACKS_MAX: usize = 128;
+const PROBE_STRING_MAX: usize = 256;
 
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct StoredMediaInfo {
     container: String,
     duration: f64,
@@ -161,6 +168,46 @@ impl From<&MediaInfo> for StoredMediaInfo {
 }
 
 impl StoredMediaInfo {
+    fn valid(&self) -> bool {
+        let short = |s: &str| s.len() <= PROBE_STRING_MAX;
+        let finite_time = |n: f64| n.is_finite() && n >= 0.0 && n <= self.duration + 1.0;
+        let ordered_times =
+            |times: &[f64]| times.iter().copied().all(finite_time) && times.windows(2).all(|w| w[0] <= w[1]);
+        let video = match &self.video {
+            crate::probe::VideoCodec::Other(codec) => short(codec),
+            _ => true,
+        };
+        let dolby_vision = self
+            .dolby_vision
+            .is_none_or(|dv| dv.profile <= 10 && dv.compat <= 7 && dv.level <= 13);
+        let audio = self.audio.len() <= PROBE_TRACKS_MAX
+            && self.audio.iter().all(|t| {
+                short(&t.codec)
+                    && t.language.as_deref().is_none_or(short)
+                    && t.name.as_deref().is_none_or(short)
+                    && t.channels <= 64
+            });
+        let subtitles = self.subtitles.len() <= PROBE_TRACKS_MAX
+            && self.subtitles.iter().all(|t| short(&t.codec) && t.language.as_deref().is_none_or(short));
+        let byte_index = self.byte_index.len() <= PROBE_KEYFRAMES_MAX
+            && self.byte_index.iter().all(|(time, _)| finite_time(*time))
+            && self.byte_index.windows(2).all(|w| w[0].0 <= w[1].0 && w[0].1 <= w[1].1);
+        matches!(self.container.as_str(), "matroska" | "mp4")
+            && self.duration.is_finite()
+            && (0.0..=7.0 * 24.0 * 60.0 * 60.0).contains(&self.duration)
+            && self.width <= 65_535
+            && self.height <= 65_535
+            && self.codecs.as_deref().is_none_or(short)
+            && self.frame_rate.is_none_or(|n| n.is_finite() && (0.0..=1000.0).contains(&n))
+            && video
+            && dolby_vision
+            && audio
+            && subtitles
+            && self.keyframes.len() <= PROBE_KEYFRAMES_MAX
+            && ordered_times(&self.keyframes)
+            && byte_index
+    }
+
     fn into_media(self) -> Option<MediaInfo> {
         let container = match self.container.as_str() {
             "matroska" => "matroska",
@@ -213,10 +260,21 @@ impl ProbeCache {
 
     pub fn put(&mut self, key: String, info: &MediaInfo) {
         self.entries.retain(|(k, _)| *k != key);
+        let stored = StoredMediaInfo::from(info);
+        if !valid_probe_key(&key)
+            || !stored.valid()
+            || serde_json::to_vec(&(key.as_str(), &stored))
+                .map_or(true, |json| json.len() > PROBE_ENTRY_MAX_BYTES)
+        {
+            return;
+        }
         if self.entries.len() >= PROBE_MAX {
             self.entries.pop_front();
         }
         self.entries.push_back((key, info.clone()));
+        while self.entries.len() > 1 && self.to_json().len() > PROBE_FILE_MAX_BYTES {
+            self.entries.pop_front();
+        }
         self.generation += 1;
     }
 
@@ -229,20 +287,51 @@ impl ProbeCache {
     }
 
     fn from_json(bytes: &[u8]) -> Result<Self, String> {
+        if bytes.len() > PROBE_FILE_MAX_BYTES {
+            return Err(format!("{} bytes exceeds {PROBE_FILE_MAX_BYTES}", bytes.len()));
+        }
         let file: StoredProbeFile = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
         if file.schema != PROBE_SCHEMA {
             return Err(format!("schema {} is not {PROBE_SCHEMA}", file.schema));
         }
+        if file.entries.len() > PROBE_MAX {
+            return Err(format!("{} entries exceeds {PROBE_MAX}", file.entries.len()));
+        }
         let mut entries = std::collections::VecDeque::new();
-        for (key, stored) in
-            file.entries.into_iter().rev().take(PROBE_MAX).collect::<Vec<_>>().into_iter().rev()
-        {
-            if let Some(info) = stored.into_media() {
-                entries.push_back((key, info));
+        let mut keys = std::collections::HashSet::new();
+        for (key, stored) in file.entries {
+            let encoded = serde_json::to_vec(&(key.as_str(), &stored)).map_err(|e| e.to_string())?;
+            if !valid_probe_key(&key)
+                || !keys.insert(key.clone())
+                || encoded.len() > PROBE_ENTRY_MAX_BYTES
+                || !stored.valid()
+            {
+                return Err("invalid or oversized probe entry".into());
             }
+            entries.push_back((key, stored.into_media().ok_or("invalid probe container")?));
         }
         Ok(Self { entries, generation: 0 })
     }
+}
+
+fn valid_probe_key(key: &str) -> bool {
+    let Some((size, digest)) = key.split_once(':') else { return false };
+    size.parse::<u64>().is_ok_and(|n| n > 0)
+        && digest.len() == 64
+        && digest.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+}
+
+fn read_bounded(path: &Path, max: usize) -> std::io::Result<Vec<u8>> {
+    let file = std::fs::File::open(path)?;
+    if file.metadata()?.len() > max as u64 {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "file exceeds size limit"));
+    }
+    let mut bytes = Vec::new();
+    file.take(max as u64 + 1).read_to_end(&mut bytes)?;
+    if bytes.len() > max {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "file grew past size limit"));
+    }
+    Ok(bytes)
 }
 
 /// A stable file identity with no URL, ticket or install secret: exact size and SHA-256 of the head already fetched
@@ -555,7 +644,7 @@ impl AppState {
 
     pub fn load_probe_cache(&self) {
         let path = self.cfg.scratch_dir.join(PROBE_FILE);
-        let loaded = match std::fs::read(&path) {
+        let loaded = match read_bounded(&path, PROBE_FILE_MAX_BYTES) {
             Ok(bytes) => ProbeCache::from_json(&bytes),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
             Err(e) => Err(e.to_string()),
@@ -955,6 +1044,7 @@ mod tests {
     #[test]
     fn probe_metadata_round_trips_without_a_url_or_credential() {
         let (resolved, mut info) = opened("https://secret.example/file?token=private");
+        info.duration = 6.0;
         info.keyframes = vec![0.0, 2.5, 5.0];
         info.audio.push(crate::probe::AudioTrack {
             codec: "A_AAC".into(),
@@ -986,6 +1076,53 @@ mod tests {
         assert!(probe_key(None, b"head").is_none());
         assert_ne!(probe_key(Some(4), b"head"), probe_key(Some(5), b"head"));
         assert_ne!(probe_key(Some(4), b"head"), probe_key(Some(4), b"changed"));
+    }
+
+    #[test]
+    fn probe_metadata_accepts_a_long_legitimate_index_inside_its_bounds() {
+        let (_, mut info) = opened("https://debrid/large");
+        info.duration = 40_000.0;
+        info.keyframes = (0..20_000).map(|n| n as f64 * 2.0).collect();
+        info.byte_index = info.keyframes.iter().map(|time| (*time, (*time * 1_000_000.0) as u64)).collect();
+        let key = probe_key(Some(40_000_000_000), b"large-head").unwrap();
+        let mut cache = ProbeCache::default();
+        cache.put(key.clone(), &info);
+        let json = cache.to_json();
+        assert!(json.len() <= PROBE_FILE_MAX_BYTES);
+        assert_eq!(ProbeCache::from_json(&json).unwrap().get(&key).unwrap().keyframes.len(), 20_000);
+    }
+
+    #[test]
+    fn hostile_probe_metadata_is_rejected_at_every_persistent_bound() {
+        let (resolved, info) = opened("https://debrid/file");
+        let key = probe_key(resolved.size, &resolved.head).unwrap();
+        let stored = StoredMediaInfo::from(&info);
+
+        assert!(ProbeCache::from_json(&vec![b' '; PROBE_FILE_MAX_BYTES + 1]).is_err());
+        let too_many = StoredProbeFile {
+            schema: PROBE_SCHEMA,
+            entries: vec![(key.clone(), stored.clone()); PROBE_MAX + 1],
+        };
+        assert!(ProbeCache::from_json(&serde_json::to_vec(&too_many).unwrap()).is_err());
+
+        let mut oversized_shape = stored.clone();
+        oversized_shape.keyframes = vec![0.0; PROBE_KEYFRAMES_MAX + 1];
+        let hostile = StoredProbeFile { schema: PROBE_SCHEMA, entries: vec![(key.clone(), oversized_shape)] };
+        assert!(ProbeCache::from_json(&serde_json::to_vec(&hostile).unwrap()).is_err());
+
+        let mut oversized_string = stored;
+        oversized_string.codecs = Some("x".repeat(PROBE_STRING_MAX + 1));
+        let hostile = StoredProbeFile { schema: PROBE_SCHEMA, entries: vec![(key, oversized_string)] };
+        assert!(ProbeCache::from_json(&serde_json::to_vec(&hostile).unwrap()).is_err());
+    }
+
+    #[test]
+    fn an_oversized_probe_file_is_refused_before_it_is_read() {
+        let path = std::env::temp_dir().join(format!("den-remux-probe-bound-{}", std::process::id()));
+        std::fs::write(&path, vec![0; PROBE_FILE_MAX_BYTES + 1]).unwrap();
+        let result = read_bounded(&path, PROBE_FILE_MAX_BYTES);
+        let _ = std::fs::remove_file(path);
+        assert!(result.is_err());
     }
 
     #[test]
