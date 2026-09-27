@@ -581,8 +581,8 @@ fn test_config(origin: &str, max_sessions: usize, idle: Duration, scout_key: Opt
         url_key_ephemeral: false,
         max_sessions,
         max_sessions_per_install: 2,
-        max_active_remuxes: 2,
-        producer_idle: Duration::from_secs(1),
+        max_active_remuxes: crate::config::DEFAULT_MAX_ACTIVE_REMUXES,
+        producer_idle: Duration::from_secs(crate::config::DEFAULT_PRODUCER_IDLE_SECS),
         session_idle: idle,
         replace_grace: Duration::from_secs(crate::config::REPLACE_GRACE_SECS),
         scratch_dir: dir,
@@ -1313,6 +1313,7 @@ async fn a_paused_session_releases_its_producer_and_resumes_on_demand() {
 #[tokio::test]
 #[ignore = "needs ffmpeg"]
 async fn one_two_four_and_eight_sessions_stay_inside_the_active_cap() {
+    const { assert!(crate::config::DEFAULT_MAX_SESSIONS == 2, "raise logical sessions only after rollout") };
     for count in [1usize, 2, 4, 8] {
         let origin = origin().await;
         let state = test_state(&origin, 8, Duration::from_secs(600));
@@ -1348,8 +1349,12 @@ async fn one_two_four_and_eight_sessions_stay_inside_the_active_cap() {
             }
         };
         peak = peak.max(state.active_producers.load(Relaxed));
-        assert!(responses.iter().all(|(response, _)| response.status == StatusCode::OK));
-        assert!(peak <= 2, "{count} sessions ran {peak} producers");
+        assert!(
+            responses.iter().all(|(response, _)| response.status == StatusCode::OK),
+            "{count} sessions did not all start: {:?}",
+            responses.iter().map(|(r, elapsed)| (r.status, elapsed)).collect::<Vec<_>>()
+        );
+        assert!(peak <= crate::config::DEFAULT_MAX_ACTIVE_REMUXES, "{count} sessions ran {peak} producers");
         assert!(began.elapsed() < Duration::from_secs(20), "{count} sessions missed the bounded wait");
         let mut starts: Vec<_> = responses.iter().map(|(_, elapsed)| *elapsed).collect();
         starts.sort();

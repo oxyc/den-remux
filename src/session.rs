@@ -2564,13 +2564,16 @@ async fn supervise(st: Arc<AppState>, s: Arc<Session>) {
                     .map(|paused| st.cfg.producer_idle.saturating_sub(paused)),
             )
         };
-        if park_in.is_some_and(|remaining| remaining.is_zero()) {
+        // A parked producer is reusable while capacity is free. Under contention it yields immediately instead of
+        // making the FIFO queue wait one idle timeout for every wave of logical sessions.
+        let under_pressure = park_in.is_some() && st.producer_waiters.load(Relaxed) > 0;
+        if park_in.is_some_and(|remaining| remaining.is_zero()) || under_pressure {
             let parked = {
                 let mut i = s.lock();
                 i.job
                     .as_ref()
                     .and_then(Job::parked_for)
-                    .filter(|paused| *paused >= st.cfg.producer_idle)
+                    .filter(|paused| under_pressure || *paused >= st.cfg.producer_idle)
                     .and_then(|_| i.job.take())
             };
             if let Some(job) = parked {
@@ -2590,7 +2593,12 @@ async fn supervise(st: Arc<AppState>, s: Arc<Session>) {
         }
         let exp_at = Instant::now() + Duration::from_secs(s.exp - now);
         let until_end = idle_at.min(exp_at).saturating_duration_since(Instant::now());
-        let wait = if running { TICK } else { park_in.unwrap_or(until_end).min(until_end) };
+        // Producer waiters belong to other sessions and cannot notify this one directly, so parked jobs poll cheaply.
+        let wait = if running || park_in.is_some() {
+            TICK.min(park_in.unwrap_or(TICK)).min(until_end)
+        } else {
+            until_end
+        };
         tokio::select! {
             _ = tokio::time::sleep(wait) => {}
             _ = s.wake.notified() => {}

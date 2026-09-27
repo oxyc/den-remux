@@ -187,6 +187,9 @@ const MIN_SCRATCH_BYTES: u64 = 64 * 1024 * 1024;
 /// minutes and comes back, so a player picks up where it was rather than starting over. The public gate's grant for
 /// it is refreshed every 30 s while the session exists, so the two don't part.
 pub const SESSION_IDLE_SECS: u64 = 600;
+pub const DEFAULT_MAX_SESSIONS: usize = 2;
+pub const DEFAULT_MAX_ACTIVE_REMUXES: usize = 2;
+pub const DEFAULT_PRODUCER_IDLE_SECS: u64 = 10;
 
 /// How long a mid-film replacement has to serve its first segment before it is ended as abandoned: a start is
 /// admitted at most 30 s of pre-buffer (`LONG_PREBUFFER`), and the first segment is asked for long before that.
@@ -217,7 +220,7 @@ impl Config {
             max_sessions: env_opt("MAX_SESSIONS")
                 .and_then(|v| v.parse().ok())
                 .filter(|n| *n >= 1)
-                .unwrap_or(8),
+                .unwrap_or(DEFAULT_MAX_SESSIONS),
             max_sessions_per_install: env_opt("MAX_SESSIONS_PER_INSTALL")
                 .and_then(|v| v.parse().ok())
                 .filter(|n| *n >= 1)
@@ -225,9 +228,12 @@ impl Config {
             max_active_remuxes: env_opt("MAX_ACTIVE_REMUXES")
                 .and_then(|v| v.parse().ok())
                 .filter(|n| *n >= 1)
-                .unwrap_or(2),
+                .unwrap_or(DEFAULT_MAX_ACTIVE_REMUXES),
             producer_idle: Duration::from_secs(
-                env_opt("PRODUCER_IDLE_SECS").and_then(|v| v.parse().ok()).filter(|s| *s >= 1).unwrap_or(10),
+                env_opt("PRODUCER_IDLE_SECS")
+                    .and_then(|v| v.parse().ok())
+                    .filter(|s| *s >= 1)
+                    .unwrap_or(DEFAULT_PRODUCER_IDLE_SECS),
             ),
             // Floored: an idle window shorter than a player's pause-and-resume would kill sessions
             // that are merely paused.
