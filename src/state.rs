@@ -177,9 +177,8 @@ impl StoredMediaInfo {
             crate::probe::VideoCodec::Other(codec) => short(codec),
             _ => true,
         };
-        let dolby_vision = self
-            .dolby_vision
-            .is_none_or(|dv| dv.profile <= 10 && dv.compat <= 7 && dv.level <= 13);
+        let dolby_vision =
+            self.dolby_vision.is_none_or(|dv| dv.profile <= 10 && dv.compat <= 7 && dv.level <= 13);
         let audio = self.audio.len() <= PROBE_TRACKS_MAX
             && self.audio.iter().all(|t| {
                 short(&t.codec)
