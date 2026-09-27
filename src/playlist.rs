@@ -50,12 +50,17 @@ pub fn segments_for_start(keyframes: &[f64], duration: f64, target: f64, start: 
     let mut cuts: Vec<f64> = ordinary.iter().map(|s| s.start).collect();
     // Include every GOP boundary from the one at/before the backed-up start through the first one after the actual
     // start. Ordinarily this is one extra cut; including the preceding boundary keeps a resume near a normal cut safe.
-    let before = keyframes.iter().copied().take_while(|k| *k <= point + 1e-9).last().unwrap_or(window.start);
+    let before = keyframes.iter().copied().take_while(|k| *k <= point + 1e-9).last().unwrap_or_else(|| {
+        // Segment zero names the media timeline from zero even when the first encoded frame is a few milliseconds
+        // later. That first keyframe is its beginning, not a useful 0-to-first-frame bootstrap segment.
+        keyframes.first().copied().unwrap_or(window.start)
+    });
     for k in keyframes.iter().copied().filter(|k| *k > window.start && *k < window.end) {
-        if k + 1e-9 >= before {
+        let first_frame_of_zero = window.start == 0.0 && (k - before).abs() < 1e-9;
+        if k + 1e-9 >= before && !first_frame_of_zero {
             cuts.push(k);
         }
-        if k > start + 1e-9 {
+        if k > start + 1e-9 && !first_frame_of_zero {
             break;
         }
     }
@@ -331,6 +336,13 @@ mod tests {
         assert_eq!(segs[0].end, 2.5, "first playable bytes need one GOP rather than eight seconds");
         assert_eq!(segs[1].end, 8.0, "the rest of the opening window is one ordinary segment");
         assert_eq!(segs.last().unwrap().end, 30.021);
+    }
+
+    #[test]
+    fn a_nonzero_first_timestamp_does_not_make_an_empty_bootstrap_segment() {
+        let segs = segments_for_start(&[0.021, 2.521, 8.021, 13.021], 19.0, TARGET_SECS, 0.0);
+        let starts: Vec<f64> = segs.iter().map(|s| s.start).collect();
+        assert_eq!(starts, [0.0, 2.521, 8.021, 13.021]);
     }
 
     #[test]

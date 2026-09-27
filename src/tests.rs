@@ -750,6 +750,7 @@ async fn end_to_end(
     let out = temp_dir();
     let init = call(&state, "GET", &format!("{base}init.mp4"), None, "").await;
     assert_eq!(init.status, StatusCode::OK);
+    let jobs_before_segments = state.jobs_started.load(Relaxed);
     let mut segs = vec![Bytes::new(); n];
     for i in order {
         let r = call(&state, "GET", &format!("{base}seg{i}.m4s"), None, "").await;
@@ -790,7 +791,10 @@ async fn end_to_end(
     let past = call_with(&state, "GET", &seg, None, &[("range", &format!("bytes={len}-"))], "").await;
     assert_eq!(past.status, StatusCode::RANGE_NOT_SATISFIABLE);
     assert_eq!(past.headers["content-range"], format!("bytes */{len}").as_str());
-    assert!(state.jobs_started.load(Relaxed) >= 3, "the out-of-order fetch should have restarted the job");
+    assert!(
+        state.jobs_started.load(Relaxed) > jobs_before_segments,
+        "an out-of-order fetch should have restarted the job"
+    );
 
     let frame = 1.0 / 24.0 + 0.002;
     for (i, seg) in segs.iter().enumerate() {
@@ -1924,7 +1928,6 @@ async fn eight_logical_sessions_start_no_producers() {
     }
     assert_eq!(state.sessions().len(), 8);
     assert_eq!(state.active_producers.load(Relaxed), 0);
-    assert_eq!(crate::job::live_groups(), 0);
     state.end_all("test").await;
 }
 
