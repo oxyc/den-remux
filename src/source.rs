@@ -11,6 +11,7 @@
 
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -26,12 +27,54 @@ use crate::httputil::Body;
 /// The first upstream request of a read: small, because ffmpeg often reads a few kilobytes and seeks away — the Cues,
 /// the first cluster — and a request it abandons is a connection lost unless what is left of it is read out.
 const FIRST_CHUNK: u64 = 1024 * 1024;
-/// Every later request of the same read: long enough that a request's round trip costs nothing against its transfer.
-const CHUNK: u64 = 16 * 1024 * 1024;
+/// Later requests of one uninterrupted read grow as it proves sequential. This keeps speculative seeks cheap, while a
+/// long pull amortises a remote round trip over enough bytes for a high-bandwidth, high-latency path.
+const CHUNKS: [u64; 3] = [16 * 1024 * 1024, 64 * 1024 * 1024, 128 * 1024 * 1024];
 /// How much of an abandoned request is still read out, to hand its connection back to the pool rather than close it.
 const DRAIN_MAX: u64 = 2 * 1024 * 1024;
 /// Frames held between the upstream reader and ffmpeg: ffmpeg paused is backpressure on the upstream, not memory.
 const QUEUE: usize = 8;
+
+#[derive(Default)]
+pub struct Stats {
+    pub requested: AtomicU64,
+    pub consumed: AtomicU64,
+    pub abandoned: AtomicU64,
+}
+
+struct Pull {
+    rx: tokio::sync::mpsc::Receiver<std::io::Result<Bytes>>,
+    requested: Arc<AtomicU64>,
+    consumed: Arc<AtomicU64>,
+    failed: Arc<AtomicU64>,
+    accounted: Arc<AtomicU64>,
+    stats: Arc<Stats>,
+}
+
+impl Pull {
+    fn account_abandoned(&self) {
+        account_abandoned(&self.requested, &self.consumed, &self.failed, &self.accounted, &self.stats);
+    }
+}
+
+impl Drop for Pull {
+    fn drop(&mut self) {
+        self.account_abandoned();
+    }
+}
+
+fn account_abandoned(
+    requested: &AtomicU64,
+    consumed: &AtomicU64,
+    failed: &AtomicU64,
+    accounted: &AtomicU64,
+    stats: &Stats,
+) {
+    let outstanding =
+        requested.load(Relaxed).saturating_sub(consumed.load(Relaxed)).saturating_sub(failed.load(Relaxed));
+    let before = accounted.fetch_max(outstanding, Relaxed);
+    stats.abandoned.fetch_add(outstanding.saturating_sub(before), Relaxed);
+}
 
 /// What a session's door opens on.
 struct Entry {
@@ -40,6 +83,7 @@ struct Entry {
     upstream: Mutex<String>,
     head: Bytes,
     size: u64,
+    stats: Arc<Stats>,
 }
 
 /// Every open door, and the loopback port they are served on (bound on first use; `None` where it couldn't be).
@@ -47,6 +91,7 @@ struct Entry {
 pub struct Doors {
     entries: Arc<Mutex<HashMap<String, Arc<Entry>>>>,
     port: OnceLock<Option<u16>>,
+    stats: Arc<Stats>,
 }
 
 /// One session's door; closed when dropped.
@@ -65,9 +110,14 @@ impl Doors {
             upstream: Mutex::new(upstream.to_string()),
             head: Bytes::copy_from_slice(&head[..head.len().min(size as usize)]),
             size,
+            stats: self.stats.clone(),
         });
         self.entries.lock().unwrap_or_else(|e| e.into_inner()).insert(token.clone(), entry.clone());
         Door { token, entry, entries: self.entries.clone() }
+    }
+
+    pub fn stats(&self) -> &Stats {
+        &self.stats
     }
 
     /// The door's URL for ffmpeg, or `None` where no loopback listener could be had, and ffmpeg reads the link itself.
@@ -181,13 +231,13 @@ fn answer(entry: Option<Arc<Entry>>, req: &Request<hyper::body::Incoming>) -> Re
 fn bytes(entry: Arc<Entry>, start: u64, end: u64) -> Body {
     enum State {
         Head(Arc<Entry>, u64, u64),
-        Upstream(tokio::sync::mpsc::Receiver<std::io::Result<Bytes>>),
+        Upstream(Pull),
         Done,
     }
     let held = entry.head.len() as u64;
     let first = match start < held {
         true => State::Head(entry, start, end),
-        false => State::Upstream(fetch(entry, start, end)),
+        false => State::Upstream(fetch(entry, start, end, &CHUNKS)),
     };
     let stream = futures_util::stream::unfold(first, |state| async move {
         match state {
@@ -196,14 +246,19 @@ fn bytes(entry: Arc<Entry>, start: u64, end: u64) -> Body {
                 let upto = end.min(held - 1);
                 let part = entry.head.slice(start as usize..=upto as usize);
                 let next = match upto < end {
-                    true => State::Upstream(fetch(entry, upto + 1, end)),
+                    true => State::Upstream(fetch(entry, upto + 1, end, &CHUNKS)),
                     false => State::Done,
                 };
                 Some((Ok(Frame::data(part)), next))
             }
-            State::Upstream(mut rx) => {
-                let item = rx.recv().await?;
-                Some((item.map(Frame::data), State::Upstream(rx)))
+            State::Upstream(mut pull) => {
+                let item = pull.rx.recv().await?;
+                if let Ok(bytes) = &item {
+                    let n = bytes.len() as u64;
+                    pull.consumed.fetch_add(n, Relaxed);
+                    pull.stats.consumed.fetch_add(n, Relaxed);
+                }
+                Some((item.map(Frame::data), State::Upstream(pull)))
             }
             State::Done => None,
         }
@@ -214,12 +269,26 @@ fn bytes(entry: Arc<Entry>, start: u64, end: u64) -> Body {
 /// Read `start..=end` from upstream on its own task, a bounded request at a time, into a short queue. One request after
 /// another on the same connection: a request sent ahead needs a second connection, and on a long path a connection's
 /// handshake costs more than the round trip it would save (measured: the first GOP came 0.3 s later).
-fn fetch(entry: Arc<Entry>, start: u64, end: u64) -> tokio::sync::mpsc::Receiver<std::io::Result<Bytes>> {
+fn fetch(entry: Arc<Entry>, start: u64, end: u64, chunks: &'static [u64]) -> Pull {
     let (tx, rx) = tokio::sync::mpsc::channel(QUEUE);
+    let requested = Arc::new(AtomicU64::new(0));
+    let consumed = Arc::new(AtomicU64::new(0));
+    let failed_bytes = Arc::new(AtomicU64::new(0));
+    let accounted = Arc::new(AtomicU64::new(0));
+    let requested_by_task = requested.clone();
+    let read = consumed.clone();
+    let failed_by_task = failed_bytes.clone();
+    let accounted_by_task = accounted.clone();
+    let stats = entry.stats.clone();
+    let task_stats = stats.clone();
     tokio::spawn(async move {
         let mut at = start;
+        let mut chunk = 0usize;
         let mut to = end.min(at + FIRST_CHUNK - 1);
         while at <= end {
+            let span = to - at + 1;
+            requested_by_task.fetch_add(span, Relaxed);
+            entry.stats.requested.fetch_add(span, Relaxed);
             let url = entry.upstream.lock().unwrap_or_else(|e| e.into_inner()).clone();
             let sent =
                 entry.client.get(url).header(reqwest::header::RANGE, format!("bytes={at}-{to}")).send().await;
@@ -227,9 +296,15 @@ fn fetch(entry: Arc<Entry>, start: u64, end: u64) -> tokio::sync::mpsc::Receiver
                 Ok(r) if r.status() == reqwest::StatusCode::PARTIAL_CONTENT => r,
                 Ok(r) => {
                     let why = format!("upstream answered {} for bytes {at}-{to}", r.status().as_u16());
-                    return failed(&tx, why).await;
+                    failed_by_task.fetch_add(span, Relaxed);
+                    failed(&tx, why).await;
+                    return;
                 }
-                Err(e) => return failed(&tx, format!("upstream bytes {at}-{to}: {}", e.without_url())).await,
+                Err(e) => {
+                    failed_by_task.fetch_add(span, Relaxed);
+                    failed(&tx, format!("upstream bytes {at}-{to}: {}", e.without_url())).await;
+                    return;
+                }
             };
             let mut left = to - at + 1;
             loop {
@@ -239,6 +314,13 @@ fn fetch(entry: Arc<Entry>, start: u64, end: u64) -> tokio::sync::mpsc::Receiver
                         left -= n;
                         at += n;
                         if tx.send(Ok(chunk.slice(..n as usize))).await.is_err() {
+                            account_abandoned(
+                                &requested_by_task,
+                                &read,
+                                &failed_by_task,
+                                &accounted_by_task,
+                                &task_stats,
+                            );
                             // ffmpeg went elsewhere. Read out a short remainder so the connection goes back warm.
                             if left <= DRAIN_MAX {
                                 while let Ok(Some(_)) = resp.chunk().await {}
@@ -250,18 +332,24 @@ fn fetch(entry: Arc<Entry>, start: u64, end: u64) -> tokio::sync::mpsc::Receiver
                         }
                     }
                     Ok(None) => {
-                        return failed(&tx, format!("upstream ended {left} bytes short of {to}")).await
+                        failed_by_task.fetch_add(left, Relaxed);
+                        failed(&tx, format!("upstream ended {left} bytes short of {to}")).await;
+                        return;
                     }
                     Err(e) => {
                         let why = format!("upstream ended {left} bytes short of {to}: {}", e.without_url());
-                        return failed(&tx, why).await;
+                        failed_by_task.fetch_add(left, Relaxed);
+                        failed(&tx, why).await;
+                        return;
                     }
                 }
             }
-            to = end.min(to + CHUNK);
+            let span = chunks[chunk.min(chunks.len() - 1)];
+            chunk += 1;
+            to = end.min(at.saturating_add(span).saturating_sub(1));
         }
     });
-    rx
+    Pull { rx, requested, consumed, failed: failed_bytes, accounted, stats }
 }
 
 /// A read from upstream that failed: logged — the service's only record of it, ffmpeg seeing just a cut body — and
@@ -312,6 +400,51 @@ mod tests {
         (base, data, counts)
     }
 
+    /// A zero-filled ranged file with one controlled RTT before each response and bounded 64 KiB frames.
+    async fn delayed_upstream(size: u64, delay: Duration) -> (String, Arc<AtomicUsize>) {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let counted = requests.clone();
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let counted = counted.clone();
+                let service = service_fn(move |req: Request<hyper::body::Incoming>| {
+                    let counted = counted.clone();
+                    async move {
+                        counted.fetch_add(1, Relaxed);
+                        let (start, end) =
+                            range(req.headers().get(hyper::header::RANGE), size).unwrap().unwrap();
+                        tokio::time::sleep(delay).await;
+                        let stream = futures_util::stream::unfold(end - start + 1, |left| async move {
+                            if left == 0 {
+                                return None;
+                            }
+                            let n = left.min(64 * 1024);
+                            let frame = Frame::data(Bytes::from(vec![0; n as usize]));
+                            Some((Ok::<_, std::io::Error>(frame), left - n))
+                        });
+                        let body = BodyExt::boxed(StreamBody::new(stream));
+                        Ok::<_, Infallible>(
+                            Response::builder()
+                                .status(StatusCode::PARTIAL_CONTENT)
+                                .header("content-range", format!("bytes {start}-{end}/{size}"))
+                                .header("content-length", end - start + 1)
+                                .body(body)
+                                .unwrap(),
+                        )
+                    }
+                });
+                tokio::spawn(
+                    hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service),
+                );
+            }
+        });
+        (base, requests)
+    }
+
     #[tokio::test]
     async fn the_door_answers_ranges_byte_for_byte_and_the_head_from_memory() {
         let (base, data, counts) = upstream(3 * 1024 * 1024 + 17).await;
@@ -342,6 +475,8 @@ mod tests {
         door.set_upstream(&format!("{base}/b"));
         assert_eq!(get(Some("bytes=2000000-2000010")).await, (206, data[2_000_000..=2_000_010].to_vec()));
         assert_eq!(counts[1].load(Relaxed), 1, "a fresh link is read from then on");
+        assert_eq!(doors.stats().requested.load(Relaxed), doors.stats().consumed.load(Relaxed));
+        assert_eq!(doors.stats().abandoned.load(Relaxed), 0);
         drop(door);
         assert_eq!(client.get(&url).send().await.unwrap().status().as_u16(), 404, "closed with its session");
     }
@@ -391,5 +526,96 @@ mod tests {
         for bad in ["bytes=100-", "bytes=20-10", "bytes=-5", "items=0-1", "bytes=a-"] {
             assert_eq!(range(h(bad).as_ref(), 100), Err(()), "{bad}");
         }
+    }
+
+    #[test]
+    fn growing_ranges_remove_the_high_bdp_round_trip_ceiling() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let requests = |bytes: u64, growing: bool| {
+            let mut left = bytes;
+            let mut request = 0usize;
+            while left > 0 {
+                let span = match (request, growing) {
+                    (0, _) => FIRST_CHUNK,
+                    (_, false) => CHUNKS[0],
+                    (n, true) => CHUNKS[(n - 1).min(CHUNKS.len() - 1)],
+                };
+                left = left.saturating_sub(span);
+                request += 1;
+            }
+            request as f64
+        };
+        // Controlled model: a 2 GiB sequential pull on a 10 Gbit/s, 100 ms path. Requests are serial by design, so
+        // elapsed time is wire time plus one RTT per range. This isolates the range policy from TLS and server noise.
+        let bytes = 2 * GIB;
+        let wire = bytes as f64 * 8.0 / 10e9;
+        let fixed = wire + requests(bytes, false) * 0.1;
+        let adaptive = wire + requests(bytes, true) * 0.1;
+        assert!(fixed / adaptive > 4.0, "fixed={fixed:.2}s adaptive={adaptive:.2}s");
+        assert!(requests(bytes, true) < requests(bytes, false) / 4.0);
+    }
+
+    #[tokio::test]
+    async fn growing_ranges_are_over_twice_as_fast_on_a_controlled_high_bdp_path() {
+        const SIZE: u64 = 512 * 1024 * 1024;
+        const FIXED: [u64; 1] = [16 * 1024 * 1024];
+        let (url, requests) = delayed_upstream(SIZE, Duration::from_millis(50)).await;
+        let run = |chunks: &'static [u64]| {
+            let entry = Arc::new(Entry {
+                client: reqwest::Client::new(),
+                upstream: Mutex::new(url.clone()),
+                head: Bytes::new(),
+                size: SIZE,
+                stats: Arc::new(Stats::default()),
+            });
+            async move {
+                let began = std::time::Instant::now();
+                let mut pull = fetch(entry, 0, SIZE - 1, chunks);
+                let mut bytes = 0u64;
+                while let Some(part) = pull.rx.recv().await {
+                    let part = part.unwrap();
+                    bytes += part.len() as u64;
+                    pull.consumed.fetch_add(part.len() as u64, Relaxed);
+                }
+                assert_eq!(bytes, SIZE);
+                began.elapsed()
+            }
+        };
+        let fixed = run(&FIXED).await;
+        let fixed_requests = requests.swap(0, Relaxed);
+        let adaptive = run(&CHUNKS).await;
+        let adaptive_requests = requests.load(Relaxed);
+        eprintln!(
+            "controlled range pull: fixed={fixed:?}/{fixed_requests} requests adaptive={adaptive:?}/{adaptive_requests} requests"
+        );
+        assert!(fixed > adaptive * 2, "fixed={fixed:?} adaptive={adaptive:?}");
+        assert!(
+            fixed_requests > adaptive_requests * 4,
+            "fixed={fixed_requests} adaptive={adaptive_requests}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_abandoned_range_is_counted_without_buffering_the_rest() {
+        let (base, data, _) = upstream(20 * 1024 * 1024).await;
+        let doors = Doors::default();
+        let client = reqwest::Client::new();
+        let door = doors.open(client.clone(), &format!("{base}/a"), &[], data.len() as u64);
+        let url = doors.url(&door).unwrap();
+        let mut response = client.get(url).send().await.unwrap();
+        assert!(response.chunk().await.unwrap().is_some());
+        drop(response);
+        for _ in 0..100 {
+            if doors.stats().abandoned.load(Relaxed) > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let requested = doors.stats().requested.load(Relaxed);
+        let consumed = doors.stats().consumed.load(Relaxed);
+        let abandoned = doors.stats().abandoned.load(Relaxed);
+        assert!(requested >= FIRST_CHUNK);
+        assert!(consumed < requested, "the entire request was buffered after its reader left");
+        assert!(abandoned > 0 && abandoned <= requested - consumed);
     }
 }

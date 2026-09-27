@@ -167,6 +167,21 @@ fn metrics_body(state: &AppState) -> String {
         job::live_groups() as u64,
     );
     metric(
+        "remux_producers_active",
+        "gauge",
+        "FFmpeg producers holding an active-remux slot.",
+        "",
+        state.active_producers.load(Relaxed) as u64,
+    );
+    metric(
+        "remux_producers_waiting",
+        "gauge",
+        "Segment requests queued fairly for a producer slot.",
+        "",
+        state.producer_waiters.load(Relaxed) as u64,
+    );
+    metric("remux_producers_max", "gauge", "MAX_ACTIVE_REMUXES.", "", state.cfg.max_active_remuxes as u64);
+    metric(
         "remux_scratch_bytes",
         "gauge",
         "Bytes of GOP files on the scratch volume.",
@@ -177,7 +192,7 @@ fn metrics_body(state: &AppState) -> String {
     metric(
         "remux_transcodes",
         "gauge",
-        "Sessions transcoding on the GPU now.",
+        "FFmpeg producers transcoding on the GPU now.",
         "",
         state.transcodes.load(Relaxed) as u64,
     );
@@ -201,6 +216,28 @@ fn metrics_body(state: &AppState) -> String {
         "ffmpeg runs started since start, restarts included.",
         "",
         state.jobs_started.load(Relaxed),
+    );
+    let source = state.doors.stats();
+    metric(
+        "remux_source_bytes_requested_total",
+        "counter",
+        "Bytes named by upstream Range requests through session doors.",
+        "",
+        source.requested.load(Relaxed),
+    );
+    metric(
+        "remux_source_bytes_consumed_total",
+        "counter",
+        "Upstream bytes delivered from session doors to ffmpeg.",
+        "",
+        source.consumed.load(Relaxed),
+    );
+    metric(
+        "remux_source_bytes_abandoned_total",
+        "counter",
+        "Requested upstream bytes left when ffmpeg abandoned a read or sought elsewhere.",
+        "",
+        source.abandoned.load(Relaxed),
     );
     b
 }
@@ -954,6 +991,7 @@ async fn run(cfg: Config) -> std::io::Result<()> {
     state::sweep_scratch(&state.cfg.scratch_dir);
     state.scratch_ok.store(state::check_scratch(&state.cfg.scratch_dir), Relaxed);
     state.load_unplayable();
+    state.load_probe_cache();
     state.ffmpeg_ok.store(state::check_ffmpeg(&state.cfg.ffmpeg).await, Relaxed);
     let transcode = state.cfg.max_transcodes > 0
         && state::check_transcode(&state.cfg.ffmpeg, &state.cfg.vaapi_device).await;
@@ -970,7 +1008,8 @@ async fn run(cfg: Config) -> std::io::Result<()> {
     eprintln!(
         "den-remux {} listening on :{} — metrics={} log_requests={} scout_origins={} scout_key={} scout_install={} \
          browser_keys={} url_key={} trusted_proxies={} public_session_proxy={} \
-         max_sessions={} per_install={} idle={}s scratch={} scratch_max={} ffmpeg={} transcode={}",
+         max_sessions={} per_install={} active_remuxes={} producer_idle={}s session_idle={}s scratch={} \
+         scratch_max={} ffmpeg={} transcode={}",
         env!("CARGO_PKG_VERSION"),
         state.cfg.port,
         on(state.cfg.metrics_token.is_some()),
@@ -984,6 +1023,8 @@ async fn run(cfg: Config) -> std::io::Result<()> {
         on(state.cfg.public_session_proxy.is_some()),
         state.cfg.max_sessions,
         state.cfg.max_sessions_per_install,
+        state.cfg.max_active_remuxes,
+        state.cfg.producer_idle.as_secs(),
         state.cfg.session_idle.as_secs(),
         state.cfg.scratch_dir.display(),
         state.cfg.scratch_max_bytes,

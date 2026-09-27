@@ -2,8 +2,9 @@
 //!
 //! Env: PORT, SCOUT_ORIGINS, REMUX_SCOUT_KEY, SCOUT_INSTALL_URL, SUBTITLE_ORIGINS, ORIGIN_ALIASES, BROWSER_KEY_HASHES,
 //!      REMUX_URL_KEY,
-//!      MAX_SESSIONS, MAX_SESSIONS_PER_INSTALL, SESSION_IDLE_SECS, SCRATCH_DIR, SCRATCH_MAX_BYTES, FFMPEG_PATH,
-//!      MAX_TRANSCODES, VAAPI_DEVICE, TRUSTED_PROXIES, WEB_ORIGINS, METRICS_TOKEN, LOG_REQUESTS,
+//!      MAX_SESSIONS, MAX_SESSIONS_PER_INSTALL, MAX_ACTIVE_REMUXES, PRODUCER_IDLE_SECS, SESSION_IDLE_SECS,
+//!      SCRATCH_DIR, SCRATCH_MAX_BYTES, FFMPEG_PATH, MAX_TRANSCODES, VAAPI_DEVICE, TRUSTED_PROXIES, WEB_ORIGINS,
+//!      METRICS_TOKEN, LOG_REQUESTS,
 //!      EDGE_SECRET, GUEST_MAX_SESSIONS.
 
 use std::env;
@@ -43,6 +44,11 @@ pub struct Config {
     /// `MAX_SESSIONS_PER_INSTALL` — sessions one scout install may play at once without a login (default
     /// 2), under `MAX_SESSIONS`: one household, or one leaked install URL, cannot take every slot.
     pub max_sessions_per_install: usize,
+    /// `MAX_ACTIVE_REMUXES` — ffmpeg producers allowed to run or hold an ahead window. Logical sessions beyond this
+    /// wait fairly without owning a process.
+    pub max_active_remuxes: usize,
+    /// A producer stopped on a full ahead window is reaped after this long. Its session and finished GOPs remain.
+    pub producer_idle: Duration,
     pub session_idle: Duration,
     /// How long a session replacing another mid-film may go without serving a segment before it is taken as
     /// abandoned (`AppState::reserve`): `REPLACE_GRACE_SECS`, not set from the environment.
@@ -50,8 +56,8 @@ pub struct Config {
     pub scratch_dir: PathBuf,
     pub scratch_max_bytes: u64,
     pub ffmpeg: String,
-    /// `MAX_TRANSCODES` — sessions transcoding on the GPU at once (default 1; 0 turns transcoding off).
-    /// Separate from `MAX_SESSIONS`: a copy costs no GPU.
+    /// `MAX_TRANSCODES` — active producers transcoding on the GPU at once (default 1; 0 turns transcoding off).
+    /// Logical transcode sessions queue without owning the GPU.
     pub max_transcodes: usize,
     /// `VAAPI_DEVICE` — the GPU's render node.
     pub vaapi_device: PathBuf,
@@ -211,11 +217,18 @@ impl Config {
             max_sessions: env_opt("MAX_SESSIONS")
                 .and_then(|v| v.parse().ok())
                 .filter(|n| *n >= 1)
-                .unwrap_or(2),
+                .unwrap_or(8),
             max_sessions_per_install: env_opt("MAX_SESSIONS_PER_INSTALL")
                 .and_then(|v| v.parse().ok())
                 .filter(|n| *n >= 1)
                 .unwrap_or(2),
+            max_active_remuxes: env_opt("MAX_ACTIVE_REMUXES")
+                .and_then(|v| v.parse().ok())
+                .filter(|n| *n >= 1)
+                .unwrap_or(2),
+            producer_idle: Duration::from_secs(
+                env_opt("PRODUCER_IDLE_SECS").and_then(|v| v.parse().ok()).filter(|s| *s >= 1).unwrap_or(10),
+            ),
             // Floored: an idle window shorter than a player's pause-and-resume would kill sessions
             // that are merely paused.
             session_idle: Duration::from_secs(

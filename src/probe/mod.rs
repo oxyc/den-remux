@@ -15,7 +15,7 @@ pub mod mp4;
 
 use std::fmt;
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum VideoCodec {
     H264,
     Hevc,
@@ -26,7 +26,7 @@ pub enum VideoCodec {
     Other(String),
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AudioTrack {
     /// The container's own name for it: a Matroska `A_…` codec id, or an MP4 sample-entry fourcc.
     pub codec: String,
@@ -45,7 +45,7 @@ pub struct AudioTrack {
 
 /// A subtitle track of the release. Every one is listed, bitmap or not, because ffmpeg numbers its subtitle streams
 /// (`-map 0:s:N`) across all of them.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SubtitleTrack {
     /// The container's own name for it: a Matroska `S_…` codec id, or an MP4 sample-entry fourcc.
     pub codec: String,
@@ -731,7 +731,7 @@ fn short_term_ref_pic_set(
 }
 
 /// A Dolby Vision stream's profile, and what its base layer is without it — written `8.1`, `7.6`, as Dolby does.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct DolbyVision {
     pub profile: u8,
     /// The base layer's compatibility id: 0 none (profile 5, whose picture needs the RPU), 1 HDR10, 2 SDR, 4 HLG,

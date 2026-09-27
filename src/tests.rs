@@ -8,7 +8,7 @@ use std::convert::Infallible;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
@@ -581,6 +581,8 @@ fn test_config(origin: &str, max_sessions: usize, idle: Duration, scout_key: Opt
         url_key_ephemeral: false,
         max_sessions,
         max_sessions_per_install: 2,
+        max_active_remuxes: 2,
+        producer_idle: Duration::from_secs(1),
         session_idle: idle,
         replace_grace: Duration::from_secs(crate::config::REPLACE_GRACE_SECS),
         scratch_dir: dir,
@@ -1275,6 +1277,88 @@ async fn a_session_outlives_five_minutes_of_silence() {
 }
 
 #[tokio::test]
+#[ignore = "needs ffmpeg"]
+async fn a_paused_session_releases_its_producer_and_resumes_on_demand() {
+    let origin = origin().await;
+    let state = test_state(&origin, 4, Duration::from_secs(600));
+    let cookie = login(&state, "phone-key").await;
+    let created =
+        call(&state, "POST", "/remux/session", Some(&cookie), r#"{"imdb":"tt0000009"}"#).await.json();
+    let sid = created["sid"].as_str().unwrap().to_string();
+    let base = created["playlist"].as_str().unwrap().trim_end_matches("master.m3u8").to_string();
+    assert_eq!(call(&state, "GET", &format!("{base}seg0.m4s"), None, "").await.status, StatusCode::OK);
+
+    for _ in 0..200 {
+        if state.active_producers.load(Relaxed) == 0
+            && state.session(&sid).is_some_and(|s| s.job_pid().is_none())
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(state.active_producers.load(Relaxed), 0, "a paused producer kept its slot");
+    assert!(state.session(&sid).is_some(), "parking the producer ended the logical session");
+
+    let began = Instant::now();
+    assert_eq!(call(&state, "GET", &format!("{base}seg5.m4s"), None, "").await.status, StatusCode::OK);
+    assert!(began.elapsed() < Duration::from_secs(20), "resume exceeded the segment deadline");
+    assert!(state.jobs_started.load(Relaxed) >= 2, "resume did not start a fresh bounded producer");
+    state.end_all("test").await;
+}
+
+#[tokio::test]
+#[ignore = "needs ffmpeg"]
+async fn one_two_four_and_eight_sessions_stay_inside_the_active_cap() {
+    for count in [1usize, 2, 4, 8] {
+        let origin = origin().await;
+        let state = test_state(&origin, 8, Duration::from_secs(600));
+        let mut segments = Vec::new();
+        for n in 0..count {
+            let owner = format!("grant:{n:08x}");
+            let created = call_with(
+                &state,
+                "POST",
+                "/remux/session",
+                None,
+                &edge(&owner),
+                &format!(r#"{{"imdb":"tt0000009","scout":"{origin}/cfg"}}"#),
+            )
+            .await;
+            assert_eq!(created.status, StatusCode::CREATED, "{}", created.text());
+            segments.push(created.json()["playlist"].as_str().unwrap().replace("master.m3u8", "seg0.m4s"));
+        }
+        let began = Instant::now();
+        let requests = segments.iter().map(|url| async {
+            let response = call(&state, "GET", url, None, "").await;
+            (response, began.elapsed())
+        });
+        let batch = futures_util::future::join_all(requests);
+        tokio::pin!(batch);
+        let mut peak = 0;
+        let responses = loop {
+            tokio::select! {
+                responses = &mut batch => break responses,
+                _ = tokio::time::sleep(Duration::from_millis(5)) => {
+                    peak = peak.max(state.active_producers.load(Relaxed));
+                }
+            }
+        };
+        peak = peak.max(state.active_producers.load(Relaxed));
+        assert!(responses.iter().all(|(response, _)| response.status == StatusCode::OK));
+        assert!(peak <= 2, "{count} sessions ran {peak} producers");
+        assert!(began.elapsed() < Duration::from_secs(20), "{count} sessions missed the bounded wait");
+        let mut starts: Vec<_> = responses.iter().map(|(_, elapsed)| *elapsed).collect();
+        starts.sort();
+        let p95 = starts[((starts.len() as f64 * 0.95).ceil() as usize).saturating_sub(1)];
+        eprintln!(
+            "producer load: sessions={count} peak_processes={peak} startup_p95={p95:?} batch={:?}",
+            began.elapsed()
+        );
+        state.end_all("test").await;
+    }
+}
+
+#[tokio::test]
 #[ignore]
 async fn an_idle_session_is_ended_and_its_ffmpeg_does_not_outlive_it() {
     let origin = origin().await;
@@ -1495,6 +1579,43 @@ async fn reopening_a_release_takes_its_link_and_probe_from_the_first_open() {
     state.end_all("test").await;
 }
 
+#[tokio::test]
+async fn stable_probe_metadata_survives_a_state_restart() {
+    let origin = origin().await;
+    let state = test_state(&origin, 2, Duration::from_secs(600));
+    let response = call(
+        &state,
+        "POST",
+        "/remux/session",
+        None,
+        &format!(r#"{{"imdb":"tt0000001","scout":"{origin}/cfg"}}"#),
+    )
+    .await;
+    assert_eq!(response.status, StatusCode::CREATED, "{}", response.text());
+    let bytes = fixture("h264.mkv");
+    let head = &bytes[..bytes.len().min(crate::scout::HEAD_BYTES as usize)];
+    let key = crate::state::probe_key(Some(bytes.len() as u64), head).unwrap();
+    let path = state.cfg.scratch_dir.join("probe-metadata.json");
+    for _ in 0..100 {
+        if path.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(path.exists(), "probe metadata was not persisted");
+
+    let mut cfg = test_config(&origin, 2, Duration::from_secs(600), None);
+    cfg.scratch_dir = state.cfg.scratch_dir.clone();
+    let restarted = state_from(cfg);
+    restarted.load_probe_cache();
+    let restored = restarted.probe(&key).expect("stable probe restored");
+    assert_eq!(
+        restored.keyframes,
+        state.session(response.json()["sid"].as_str().unwrap()).unwrap().info.keyframes
+    );
+    state.end_all("test").await;
+}
+
 fn edge(owner: &str) -> [(&str, &str); 2] {
     [("x-den-edge-secret", EDGE_SECRET), ("x-den-owner", owner)]
 }
@@ -1606,9 +1727,8 @@ async fn a_guest_has_its_own_cap_and_never_evicts_a_host() {
     state.end_all("test").await;
 }
 
-/// A guest is converted for as a host is, first come first served on the one slot: a guest whose only playable option
-/// is a conversion gets one while the slot is free, and a clear refusal up front while it isn't — for a host just the
-/// same. The guest's session is served on the same signed routes as any other.
+/// A guest is converted for as a host is. Logical sessions do not reserve the GPU: the active producers queue only
+/// when media is requested, so idle guest and host sessions can coexist without consuming a process slot.
 #[tokio::test]
 async fn a_guest_is_converted_for_when_the_slot_is_free() {
     let origin = origin().await;
@@ -1619,24 +1739,19 @@ async fn a_guest_is_converted_for_when_the_slot_is_free() {
     assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
     let guest = r.json();
     assert_eq!(guest["video"]["transcoded"], true);
-    assert_eq!(state.transcodes.load(Relaxed), 1);
+    assert_eq!(state.transcodes.load(Relaxed), 0, "creating a session starts no producer");
     let master = call(&state, "GET", guest["playlist"].as_str().unwrap(), None, "").await;
     assert_eq!(master.status, StatusCode::OK);
     assert!(master.text().contains("CODECS=\"avc1.640029,"), "{}", master.text());
 
-    // The slot is the guest's now: the host is refused up front, as the next guest would be.
+    // Another logical transcode is admitted; the GPU limit is enforced only while its producer runs.
     let r = call(&state, "POST", "/remux/session", None, &body).await;
-    assert_eq!(
-        (r.status, r.json()["error"].as_str()),
-        (StatusCode::NOT_FOUND, Some("no_copy")),
-        "{}",
-        r.text()
-    );
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    assert_eq!(r.json()["video"]["transcoded"], true);
+    assert_eq!(state.transcodes.load(Relaxed), 0);
     state.end_session(guest["sid"].as_str().unwrap(), "test").await;
     let r = call_with(&state, "POST", "/remux/session", None, &edge("grant:deadbeef"), &body).await;
-    assert_eq!(r.status, StatusCode::CREATED, "the slot came back: {}", r.text());
-    let r2 = call_with(&state, "POST", "/remux/session", None, &edge("grant:0a1b2c3d"), &body).await;
-    assert_eq!((r2.status, r2.json()["error"].as_str()), (StatusCode::NOT_FOUND, Some("no_copy")));
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
     state.end_all("test").await;
 }
 
@@ -1731,10 +1846,125 @@ async fn cancelling_a_reservation_gives_back_both_limits() {
 }
 
 #[tokio::test]
+async fn producer_slots_queue_fifo_and_cancel_cleanly() {
+    let state = test_state("http://127.0.0.1:9", 2, Duration::from_secs(600));
+    let first = state.acquire_producer(false).await.unwrap();
+    let second = state.acquire_producer(false).await.unwrap();
+    assert_eq!(state.active_producers.load(Relaxed), 2);
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let queue = |number, state: Arc<AppState>, tx: tokio::sync::mpsc::UnboundedSender<_>| {
+        tokio::spawn(async move {
+            let permit = state.acquire_producer(false).await.unwrap();
+            tx.send((number, permit)).unwrap();
+        })
+    };
+    let third = queue(3, state.clone(), tx.clone());
+    while state.producer_waiters.load(Relaxed) != 1 {
+        tokio::task::yield_now().await;
+    }
+    let fourth = queue(4, state.clone(), tx);
+    while state.producer_waiters.load(Relaxed) != 2 {
+        tokio::task::yield_now().await;
+    }
+    drop(first);
+    let (number, third_permit) = rx.recv().await.unwrap();
+    assert_eq!(number, 3, "the oldest waiter resumed first");
+    drop(third_permit);
+    let (number, fourth_permit) = rx.recv().await.unwrap();
+    assert_eq!(number, 4);
+    drop((second, fourth_permit));
+    third.await.unwrap();
+    fourth.await.unwrap();
+    assert_eq!(state.active_producers.load(Relaxed), 0);
+    assert_eq!(state.producer_waiters.load(Relaxed), 0);
+
+    state.transcode_ok.store(true, Relaxed);
+    let gpu = state.acquire_producer(true).await.unwrap();
+    let waiting_state = state.clone();
+    let waiting = tokio::spawn(async move { waiting_state.acquire_producer(true).await });
+    while state.producer_waiters.load(Relaxed) != 1 {
+        tokio::task::yield_now().await;
+    }
+    let copy = tokio::time::timeout(Duration::from_millis(100), state.acquire_producer(false))
+        .await
+        .expect("a GPU waiter must not leave a copy slot idle")
+        .unwrap();
+    assert_eq!(state.active_producers.load(Relaxed), 2);
+    drop(copy);
+    waiting.abort();
+    match waiting.await {
+        Err(error) => assert!(error.is_cancelled()),
+        Ok(_) => panic!("cancelled producer waiter completed"),
+    }
+    while state.producer_waiters.load(Relaxed) != 0 {
+        tokio::task::yield_now().await;
+    }
+    drop(gpu);
+    assert_eq!(state.active_producers.load(Relaxed), 0);
+    assert_eq!(state.transcodes.load(Relaxed), 0);
+}
+
+#[tokio::test]
+async fn eight_logical_sessions_start_no_producers() {
+    let origin = origin().await;
+    let state = test_state(&origin, 8, Duration::from_secs(600));
+    for n in 0..8 {
+        let owner = format!("grant:{n:08x}");
+        let response = call_with(
+            &state,
+            "POST",
+            "/remux/session",
+            None,
+            &edge(&owner),
+            &format!(r#"{{"imdb":"tt0000001","scout":"{origin}/cfg"}}"#),
+        )
+        .await;
+        assert_eq!(response.status, StatusCode::CREATED, "{}", response.text());
+    }
+    assert_eq!(state.sessions().len(), 8);
+    assert_eq!(state.active_producers.load(Relaxed), 0);
+    assert_eq!(crate::job::live_groups(), 0);
+    state.end_all("test").await;
+}
+
+#[tokio::test]
+async fn ending_a_session_while_it_waits_cannot_start_a_producer() {
+    let origin = origin().await;
+    let state = test_state(&origin, 2, Duration::from_secs(600));
+    let held_a = state.acquire_producer(false).await.unwrap();
+    let held_b = state.acquire_producer(false).await.unwrap();
+    let created = call(
+        &state,
+        "POST",
+        "/remux/session",
+        None,
+        &format!(r#"{{"imdb":"tt0000001","scout":"{origin}/cfg"}}"#),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::CREATED, "{}", created.text());
+    let sid = created.json()["sid"].as_str().unwrap().to_string();
+    let segment = created.json()["playlist"].as_str().unwrap().replace("master.m3u8", "seg0.m4s");
+    let requesting = {
+        let state = state.clone();
+        tokio::spawn(async move { call(&state, "GET", &segment, None, "").await })
+    };
+    while state.producer_waiters.load(Relaxed) != 1 {
+        tokio::task::yield_now().await;
+    }
+    state.end_session(&sid, "test").await;
+    drop(held_a);
+    assert_eq!(requesting.await.unwrap().status, StatusCode::GONE);
+    assert_eq!(state.jobs_started.load(Relaxed), 0);
+    drop(held_b);
+    assert_eq!(state.active_producers.load(Relaxed), 0);
+}
+
+#[tokio::test]
 async fn an_explicit_release_survives_the_players_codec_preference() {
     let origin = origin().await;
     let state = test_state(&origin, 2, Duration::from_secs(600));
-    state.transcode_ok.store(true, Relaxed); // creation reserves the GPU; it does not start ffmpeg
+    state.transcode_ok.store(true, Relaxed); // creation records the decision; it does not reserve the GPU
     let body = format!(
         r#"{{"imdb":"tt0000005","scout":"{origin}/cfg","filename":"hevc.mkv","audioTrack":0,"videoCodecs":["h264"]}}"#
     );
@@ -2188,8 +2418,17 @@ async fn a_releases_own_subtitles_arrive_with_its_video() {
     );
     let base = j["playlist"].as_str().unwrap().trim_end_matches("master.m3u8").to_string();
     let media = call(&state, "GET", &format!("{base}media.m3u8"), None, "").await.text();
-    let n = extinfs(&media).len();
+    let durs = extinfs(&media);
+    let n = durs.len();
     assert!(n >= 5, "{media}");
+    let starts: Vec<f64> = durs
+        .iter()
+        .scan(0.0, |at, duration| {
+            let start = *at;
+            *at += duration;
+            Some(start)
+        })
+        .collect();
     let get = |file: String| {
         let (state, base) = (state.clone(), base.clone());
         async move { call(&state, "GET", &format!("{base}{file}"), None, "").await }
@@ -2206,11 +2445,16 @@ async fn a_releases_own_subtitles_arrive_with_its_video() {
         r.text()
     };
 
-    // A seek: the run starts at segment 3's keyframe (19.5 s), and its Finnish cue at 20 s arrives.
+    // A seek: the run starts at the segment covering 20 s, and its Finnish cue there arrives.
+    let seek = starts
+        .iter()
+        .zip(&durs)
+        .position(|(start, duration)| *start <= 20.0 && 20.0 < start + duration)
+        .unwrap();
     assert_eq!(get("init.mp4".into()).await.status, StatusCode::OK);
-    assert_eq!(get("seg3.m4s".into()).await.status, StatusCode::OK);
-    let w3 = window(get("sub0_3.vtt".into()).await);
-    assert!(w3.contains("Hyvää yötä") && !w3.contains("Moi"), "{w3}");
+    assert_eq!(get(format!("seg{seek}.m4s")).await.status, StatusCode::OK);
+    let sought = window(get(format!("sub0_{seek}.vtt")).await);
+    assert!(sought.contains("Hyvää yötä") && !sought.contains("Moi"), "{sought}");
     // Behind it: another run, from zero, brings the start of the film.
     assert_eq!(get("seg0.m4s".into()).await.status, StatusCode::OK);
     let (fi0, en0) = (window(get("sub0_0.vtt".into()).await), window(get("sub1_0.vtt".into()).await));
@@ -2225,14 +2469,14 @@ async fn a_releases_own_subtitles_arrive_with_its_video() {
         all.push(window(get(format!("sub1_{i}.vtt")).await));
         window(get(format!("sub0_{i}.vtt")).await);
     }
-    // Segments run 0–8, 8–13, 13–19.5, 19.5–24, 24–30.
+    // The bootstrap split adds 0–2.5 before the ordinary 2.5–8, 8–13, 13–19.5, 19.5–24, 24–30 windows.
     assert!(
-        all[1].contains("Inside the second segment") && all[1].contains("Over the cut at thirteen"),
+        all[2].contains("Inside the second segment") && all[2].contains("Over the cut at thirteen"),
         "{}",
-        all[1]
+        all[2]
     );
-    assert!(all[2].contains("Over the cut at thirteen") && all[2].contains("After the seek"), "{}", all[2]);
-    assert!(all[4].contains("The end") && !all[4].contains("After the seek"), "{}", all[4]);
+    assert!(all[3].contains("Over the cut at thirteen") && all[3].contains("After the seek"), "{}", all[3]);
+    assert!(all[5].contains("The end") && !all[5].contains("After the seek"), "{}", all[5]);
     assert!(!all.concat().contains("främmande"), "a forced track is not offered");
     let kept = get("sub1_2.vtt".into()).await;
     assert_kept_for_session(&kept, j["expiresAt"].as_u64().unwrap(), "sub1_2.vtt");
@@ -2240,8 +2484,8 @@ async fn a_releases_own_subtitles_arrive_with_its_video() {
 }
 
 /// A player without HEVC gets an HEVC-only title through the GPU alone: refused up front while transcoding is off —
-/// "can't be played here right now", not a wait a player would retry — then one transcode at a time, given back when
-/// its session ends. Creating a session starts no ffmpeg, so no GPU is needed here.
+/// "can't be played here right now", not a wait a player would retry. Once available, several logical transcode
+/// sessions may coexist; `MAX_TRANSCODES` limits their active producers rather than their session records.
 #[tokio::test]
 async fn hevc_for_a_player_without_it_takes_the_one_transcode() {
     let origin = origin().await;
@@ -2267,12 +2511,9 @@ async fn hevc_for_a_player_without_it_takes_the_one_transcode() {
 
     let laptop = login(&state, "laptop-key").await;
     let r = call(&state, "POST", "/remux/session", Some(&laptop), h264_only).await;
-    assert_eq!(r.json()["error"], "no_copy", "MAX_TRANSCODES is 1");
-    let r = call(&state, "POST", "/remux/session", Some(&laptop), r#"{"imdb":"tt0000002"}"#).await;
-    let copied = serde_json::json!({
-        "codec": "hevc", "transcoded": false, "width": 320, "height": 180, "tonemapped": false
-    });
-    assert_eq!(r.json()["video"], copied, "copied");
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    assert_eq!(r.json()["video"]["transcoded"], true);
+    assert_eq!(state.transcodes.load(Relaxed), 0, "neither idle session owns the GPU");
 
     state.end_session(j["sid"].as_str().unwrap(), "test").await;
     // A tombstone does not keep its report endpoint alive.
@@ -2282,8 +2523,6 @@ async fn hevc_for_a_player_without_it_takes_the_one_transcode() {
             .await;
     assert_eq!(late.status, StatusCode::GONE, "a report after the end is refused");
     assert_eq!(call(&state, "GET", ended, None, "").await.status, StatusCode::GONE);
-    let r = call(&state, "POST", "/remux/session", Some(&laptop), h264_only).await;
-    assert_eq!(r.status, StatusCode::CREATED, "the ended session gave its transcode back: {}", r.text());
     state.end_all("test").await;
 }
 
