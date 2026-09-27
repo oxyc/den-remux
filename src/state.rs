@@ -2,6 +2,7 @@
 //! counters `/health` and `/metrics` read.
 
 use std::collections::HashMap;
+use std::io::Read;
 use std::net::IpAddr;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed};
@@ -105,6 +106,240 @@ impl KnownReleases {
     pub fn get(&self, key: &str) -> Option<MediaInfo> {
         self.entries.iter().find(|(k, _)| k == key).map(|(_, i)| i.clone())
     }
+}
+
+/// Full, credential-free probe results survive restarts. The schema number is deliberately part of the file rather
+/// than inferred from serde: a parser fix must never silently reuse facts produced under older rules.
+const PROBE_SCHEMA: u32 = 1;
+const PROBE_FILE: &str = "probe-metadata.json";
+const PROBE_MAX: usize = 256;
+/// A corrupt persistent file cannot make restart allocate in proportion to arbitrary disk contents.
+const PROBE_FILE_MAX_BYTES: usize = 4 * 1024 * 1024;
+const PROBE_ENTRY_MAX_BYTES: usize = 1024 * 1024;
+const PROBE_KEYFRAMES_MAX: usize = 65_536;
+const PROBE_TRACKS_MAX: usize = 128;
+const PROBE_STRING_MAX: usize = 256;
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct StoredMediaInfo {
+    container: String,
+    duration: f64,
+    video: crate::probe::VideoCodec,
+    codecs: Option<String>,
+    width: u32,
+    height: u32,
+    hdr: bool,
+    hlg: bool,
+    frame_rate: Option<f64>,
+    dolby_vision: Option<crate::probe::DolbyVision>,
+    dolby_vision_record_mismatch: bool,
+    dolby_vision_recordless: bool,
+    audio: Vec<crate::probe::AudioTrack>,
+    subtitles: Vec<crate::probe::SubtitleTrack>,
+    keyframes: Vec<f64>,
+    closed_gops: bool,
+    byte_index: Vec<(f64, u64)>,
+    video_bytes: Option<u64>,
+}
+
+impl From<&MediaInfo> for StoredMediaInfo {
+    fn from(i: &MediaInfo) -> Self {
+        Self {
+            container: i.container.to_string(),
+            duration: i.duration,
+            video: i.video.clone(),
+            codecs: i.codecs.clone(),
+            width: i.width,
+            height: i.height,
+            hdr: i.hdr,
+            hlg: i.hlg,
+            frame_rate: i.frame_rate,
+            dolby_vision: i.dolby_vision,
+            dolby_vision_record_mismatch: i.dolby_vision_record_mismatch,
+            dolby_vision_recordless: i.dolby_vision_recordless,
+            audio: i.audio.clone(),
+            subtitles: i.subtitles.clone(),
+            keyframes: i.keyframes.clone(),
+            closed_gops: i.closed_gops,
+            byte_index: i.byte_index.clone(),
+            video_bytes: i.video_bytes,
+        }
+    }
+}
+
+impl StoredMediaInfo {
+    fn valid(&self) -> bool {
+        let short = |s: &str| s.len() <= PROBE_STRING_MAX;
+        let finite_time = |n: f64| n.is_finite() && n >= 0.0 && n <= self.duration + 1.0;
+        let ordered_times =
+            |times: &[f64]| times.iter().copied().all(finite_time) && times.windows(2).all(|w| w[0] <= w[1]);
+        let video = match &self.video {
+            crate::probe::VideoCodec::Other(codec) => short(codec),
+            _ => true,
+        };
+        let dolby_vision =
+            self.dolby_vision.is_none_or(|dv| dv.profile <= 10 && dv.compat <= 7 && dv.level <= 13);
+        let audio = self.audio.len() <= PROBE_TRACKS_MAX
+            && self.audio.iter().all(|t| {
+                short(&t.codec)
+                    && t.language.as_deref().is_none_or(short)
+                    && t.name.as_deref().is_none_or(short)
+                    && t.channels <= 64
+            });
+        let subtitles = self.subtitles.len() <= PROBE_TRACKS_MAX
+            && self.subtitles.iter().all(|t| short(&t.codec) && t.language.as_deref().is_none_or(short));
+        let byte_index = self.byte_index.len() <= PROBE_KEYFRAMES_MAX
+            && self.byte_index.iter().all(|(time, _)| finite_time(*time))
+            && self.byte_index.windows(2).all(|w| w[0].0 <= w[1].0 && w[0].1 <= w[1].1);
+        matches!(self.container.as_str(), "matroska" | "mp4")
+            && self.duration.is_finite()
+            && (0.0..=7.0 * 24.0 * 60.0 * 60.0).contains(&self.duration)
+            && self.width <= 65_535
+            && self.height <= 65_535
+            && self.codecs.as_deref().is_none_or(short)
+            && self.frame_rate.is_none_or(|n| n.is_finite() && (0.0..=1000.0).contains(&n))
+            && video
+            && dolby_vision
+            && audio
+            && subtitles
+            && self.keyframes.len() <= PROBE_KEYFRAMES_MAX
+            && ordered_times(&self.keyframes)
+            && byte_index
+    }
+
+    fn into_media(self) -> Option<MediaInfo> {
+        let container = match self.container.as_str() {
+            "matroska" => "matroska",
+            "mp4" => "mp4",
+            _ => return None,
+        };
+        Some(MediaInfo {
+            container,
+            duration: self.duration,
+            video: self.video,
+            codecs: self.codecs,
+            width: self.width,
+            height: self.height,
+            hdr: self.hdr,
+            hlg: self.hlg,
+            frame_rate: self.frame_rate,
+            dolby_vision: self.dolby_vision,
+            dolby_vision_record_mismatch: self.dolby_vision_record_mismatch,
+            dolby_vision_recordless: self.dolby_vision_recordless,
+            audio: self.audio,
+            subtitles: self.subtitles,
+            keyframes: self.keyframes,
+            closed_gops: self.closed_gops,
+            byte_index: self.byte_index,
+            video_bytes: self.video_bytes,
+        })
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct StoredProbeFile {
+    schema: u32,
+    entries: Vec<(String, StoredMediaInfo)>,
+}
+
+#[derive(Default)]
+pub struct ProbeCache {
+    entries: std::collections::VecDeque<(String, MediaInfo)>,
+    generation: u64,
+}
+
+impl ProbeCache {
+    pub fn get(&mut self, key: &str) -> Option<MediaInfo> {
+        let at = self.entries.iter().position(|(k, _)| k == key)?;
+        let found = self.entries.remove(at)?;
+        let answer = found.1.clone();
+        self.entries.push_back(found);
+        Some(answer)
+    }
+
+    pub fn put(&mut self, key: String, info: &MediaInfo) {
+        self.entries.retain(|(k, _)| *k != key);
+        let stored = StoredMediaInfo::from(info);
+        if !valid_probe_key(&key)
+            || !stored.valid()
+            || serde_json::to_vec(&(key.as_str(), &stored))
+                .map_or(true, |json| json.len() > PROBE_ENTRY_MAX_BYTES)
+        {
+            return;
+        }
+        if self.entries.len() >= PROBE_MAX {
+            self.entries.pop_front();
+        }
+        self.entries.push_back((key, info.clone()));
+        while self.entries.len() > 1 && self.to_json().len() > PROBE_FILE_MAX_BYTES {
+            self.entries.pop_front();
+        }
+        self.generation += 1;
+    }
+
+    fn to_json(&self) -> Vec<u8> {
+        let file = StoredProbeFile {
+            schema: PROBE_SCHEMA,
+            entries: self.entries.iter().map(|(k, i)| (k.clone(), StoredMediaInfo::from(i))).collect(),
+        };
+        serde_json::to_vec(&file).unwrap_or_default()
+    }
+
+    fn from_json(bytes: &[u8]) -> Result<Self, String> {
+        if bytes.len() > PROBE_FILE_MAX_BYTES {
+            return Err(format!("{} bytes exceeds {PROBE_FILE_MAX_BYTES}", bytes.len()));
+        }
+        let file: StoredProbeFile = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
+        if file.schema != PROBE_SCHEMA {
+            return Err(format!("schema {} is not {PROBE_SCHEMA}", file.schema));
+        }
+        if file.entries.len() > PROBE_MAX {
+            return Err(format!("{} entries exceeds {PROBE_MAX}", file.entries.len()));
+        }
+        let mut entries = std::collections::VecDeque::new();
+        let mut keys = std::collections::HashSet::new();
+        for (key, stored) in file.entries {
+            let encoded = serde_json::to_vec(&(key.as_str(), &stored)).map_err(|e| e.to_string())?;
+            if !valid_probe_key(&key)
+                || !keys.insert(key.clone())
+                || encoded.len() > PROBE_ENTRY_MAX_BYTES
+                || !stored.valid()
+            {
+                return Err("invalid or oversized probe entry".into());
+            }
+            entries.push_back((key, stored.into_media().ok_or("invalid probe container")?));
+        }
+        Ok(Self { entries, generation: 0 })
+    }
+}
+
+fn valid_probe_key(key: &str) -> bool {
+    let Some((size, digest)) = key.split_once(':') else { return false };
+    size.parse::<u64>().is_ok_and(|n| n > 0)
+        && digest.len() == 64
+        && digest.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+}
+
+fn read_bounded(path: &Path, max: usize) -> std::io::Result<Vec<u8>> {
+    let file = std::fs::File::open(path)?;
+    if file.metadata()?.len() > max as u64 {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "file exceeds size limit"));
+    }
+    let mut bytes = Vec::new();
+    file.take(max as u64 + 1).read_to_end(&mut bytes)?;
+    if bytes.len() > max {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "file grew past size limit"));
+    }
+    Ok(bytes)
+}
+
+/// A stable file identity with no URL, ticket or install secret: exact size and SHA-256 of the head already fetched
+/// from the fresh debrid URL. `None` without a trustworthy size; a head digest alone could alias truncated responses.
+pub fn probe_key(size: Option<u64>, head: &[u8]) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let size = size.filter(|n| *n > 0)?;
+    let digest = Sha256::digest(head);
+    Some(format!("{size}:{}", digest.iter().map(|b| format!("{b:02x}")).collect::<String>()))
 }
 
 /// Releases remembered as playing nowhere.
@@ -215,6 +450,8 @@ pub struct AppState {
     opened: Mutex<OpenedCache>,
     /// What opened releases showed of their video, for `POST /remux/releases`.
     known: Mutex<KnownReleases>,
+    probe_cache: Mutex<ProbeCache>,
+    probe_cache_written: Mutex<u64>,
     /// Releases that play in no browser, and the generation of them last written to disk.
     unplayable: Mutex<Unplayable>,
     unplayable_written: Mutex<u64>,
@@ -225,7 +462,13 @@ pub struct AppState {
     pub scratch_ok: AtomicBool,
     /// Can this ffmpeg transcode on the GPU (`check_transcode`), with `MAX_TRANSCODES` above 0?
     pub transcode_ok: AtomicBool,
-    /// Sessions transcoding now, against `MAX_TRANSCODES`.
+    producer_slots: Arc<tokio::sync::Semaphore>,
+    transcode_slots: Arc<tokio::sync::Semaphore>,
+    /// Producers holding an active-remux slot now.
+    pub active_producers: Arc<AtomicUsize>,
+    /// Requests queued fairly for a producer slot.
+    pub producer_waiters: AtomicUsize,
+    /// Producers transcoding now, against `MAX_TRANSCODES`.
     pub transcodes: Arc<AtomicUsize>,
     /// Each session's loopback door to its release, which its ffmpeg reads through (`source`).
     pub doors: crate::source::Doors,
@@ -279,12 +522,21 @@ impl Drop for Slot<'_> {
     }
 }
 
-/// A held transcode against `MAX_TRANSCODES`, owned by its session; released when the session is dropped.
-pub struct TranscodeSlot(Arc<AtomicUsize>);
+/// The resources held only while one ffmpeg process exists. Tokio semaphores queue acquisitions FIFO; dropping a
+/// cancelled future or this value releases everything without a side channel.
+pub struct ProducerPermit {
+    _producer: tokio::sync::OwnedSemaphorePermit,
+    _transcode: Option<tokio::sync::OwnedSemaphorePermit>,
+    active: Arc<AtomicUsize>,
+    transcodes: Option<Arc<AtomicUsize>>,
+}
 
-impl Drop for TranscodeSlot {
+impl Drop for ProducerPermit {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Relaxed);
+        self.active.fetch_sub(1, Relaxed);
+        if let Some(count) = &self.transcodes {
+            count.fetch_sub(1, Relaxed);
+        }
     }
 }
 
@@ -300,6 +552,8 @@ impl AppState {
                 .build()
                 .expect("reqwest client")
         };
+        let producer_slots = Arc::new(tokio::sync::Semaphore::new(cfg.max_active_remuxes));
+        let transcode_slots = Arc::new(tokio::sync::Semaphore::new(cfg.max_transcodes));
         Arc::new(AppState {
             cfg,
             http: client(reqwest::redirect::Policy::default()),
@@ -312,6 +566,8 @@ impl AppState {
             starts: Mutex::new(HashMap::new()),
             opened: Mutex::new(OpenedCache::default()),
             known: Mutex::new(KnownReleases::default()),
+            probe_cache: Mutex::new(ProbeCache::default()),
+            probe_cache_written: Mutex::new(0),
             unplayable: Mutex::new(Unplayable::default()),
             unplayable_written: Mutex::new(0),
             scratch_bytes: AtomicU64::new(0),
@@ -320,20 +576,51 @@ impl AppState {
             ffmpeg_ok: AtomicBool::new(false),
             scratch_ok: AtomicBool::new(false),
             transcode_ok: AtomicBool::new(false),
+            producer_slots,
+            transcode_slots,
+            active_producers: Arc::new(AtomicUsize::new(0)),
+            producer_waiters: AtomicUsize::new(0),
             transcodes: Arc::new(AtomicUsize::new(0)),
             doors: Default::default(),
         })
     }
 
-    /// A transcode for a new session, or `None` when transcoding is off or `MAX_TRANSCODES` are running.
-    /// The GPU is shared with the camera stack and Incus gives no GPU priority, so this cap is the only one.
-    pub fn reserve_transcode(&self) -> Option<TranscodeSlot> {
-        if !self.transcode_ok.load(Relaxed) {
+    pub fn can_transcode(&self) -> bool {
+        self.transcode_ok.load(Relaxed) && self.cfg.max_transcodes > 0
+    }
+
+    /// Wait fairly for a process slot, and for a GPU slot first where this is a transcode. No session owns either
+    /// resource before media is requested. Acquiring the scarcer GPU first prevents a GPU waiter from occupying a copy
+    /// slot while it cannot run.
+    pub async fn acquire_producer(self: &Arc<Self>, transcode: bool) -> Option<ProducerPermit> {
+        if transcode && !self.can_transcode() {
             return None;
         }
-        let max = self.cfg.max_transcodes;
-        self.transcodes.fetch_update(Relaxed, Relaxed, |n| (n < max).then_some(n + 1)).ok()?;
-        Some(TranscodeSlot(self.transcodes.clone()))
+        self.producer_waiters.fetch_add(1, Relaxed);
+        struct Waiting<'a>(&'a AtomicUsize);
+        impl Drop for Waiting<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Relaxed);
+            }
+        }
+        let waiting = Waiting(&self.producer_waiters);
+        let gpu = match transcode {
+            true => Some(self.transcode_slots.clone().acquire_owned().await.ok()?),
+            false => None,
+        };
+        let producer = self.producer_slots.clone().acquire_owned().await.ok()?;
+        drop(waiting);
+        self.active_producers.fetch_add(1, Relaxed);
+        let transcodes = transcode.then(|| {
+            self.transcodes.fetch_add(1, Relaxed);
+            self.transcodes.clone()
+        });
+        Some(ProducerPermit {
+            _producer: producer,
+            _transcode: gpu,
+            active: self.active_producers.clone(),
+            transcodes,
+        })
     }
 
     pub fn known(&self) -> MutexGuard<'_, KnownReleases> {
@@ -342,6 +629,51 @@ impl AppState {
 
     pub fn opened(&self) -> MutexGuard<'_, OpenedCache> {
         self.opened.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub fn probe(&self, key: &str) -> Option<MediaInfo> {
+        self.probe_cache.lock().unwrap_or_else(|e| e.into_inner()).get(key)
+    }
+
+    pub fn remember_probe(self: &Arc<Self>, key: String, info: &MediaInfo) {
+        self.probe_cache.lock().unwrap_or_else(|e| e.into_inner()).put(key, info);
+        let st = self.clone();
+        tokio::task::spawn_blocking(move || st.write_probe_cache());
+    }
+
+    pub fn load_probe_cache(&self) {
+        let path = self.cfg.scratch_dir.join(PROBE_FILE);
+        let loaded = match read_bounded(&path, PROBE_FILE_MAX_BYTES) {
+            Ok(bytes) => ProbeCache::from_json(&bytes),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(e) => Err(e.to_string()),
+        };
+        match loaded {
+            Ok(cache) => {
+                eprintln!("probe cache: {} file(s) remembered", cache.entries.len());
+                *self.probe_cache.lock().unwrap_or_else(|e| e.into_inner()) = cache;
+            }
+            Err(e) => eprintln!("probe cache: {} could not be read: {e}", path.display()),
+        }
+    }
+
+    fn write_probe_cache(&self) {
+        let mut written = self.probe_cache_written.lock().unwrap_or_else(|e| e.into_inner());
+        let (generation, json) = {
+            let cache = self.probe_cache.lock().unwrap_or_else(|e| e.into_inner());
+            (cache.generation, cache.to_json())
+        };
+        if generation <= *written {
+            return;
+        }
+        let path = self.cfg.scratch_dir.join(PROBE_FILE);
+        let tmp = path.with_extension("json.tmp");
+        match std::fs::write(&tmp, json).and_then(|()| std::fs::rename(&tmp, &path)) {
+            Ok(()) => *written = generation,
+            Err(e) => crate::log_limited("probe_cache_write", || {
+                format!("probe cache: {} could not be written: {e}", path.display())
+            }),
+        }
     }
 
     pub fn unplayable(&self) -> MutexGuard<'_, Unplayable> {
@@ -706,6 +1038,90 @@ mod tests {
         assert!(cache.get(&format!("r{OPENED_MAX}"), t0).is_some());
         cache.forget("r1");
         assert!(cache.get("r1", t0).is_none(), "a dead link is forgotten");
+    }
+
+    #[test]
+    fn probe_metadata_round_trips_without_a_url_or_credential() {
+        let (resolved, mut info) = opened("https://secret.example/file?token=private");
+        info.duration = 6.0;
+        info.keyframes = vec![0.0, 2.5, 5.0];
+        info.audio.push(crate::probe::AudioTrack {
+            codec: "A_AAC".into(),
+            language: Some("eng".into()),
+            channels: 2,
+            name: None,
+            default: true,
+            commentary: false,
+            bytes: Some(123),
+        });
+        let key = probe_key(resolved.size, &resolved.head).unwrap();
+        let mut cache = ProbeCache::default();
+        cache.put(key.clone(), &info);
+        let json = cache.to_json();
+        let text = String::from_utf8(json.clone()).unwrap();
+        assert!(!text.contains("secret.example") && !text.contains("private"));
+        let mut restored = ProbeCache::from_json(&json).unwrap();
+        let hit = restored.get(&key).unwrap();
+        assert_eq!(hit.container, "matroska");
+        assert_eq!(hit.keyframes, info.keyframes);
+        assert_eq!(hit.audio, info.audio);
+        assert!(restored.get("another-size-or-head").is_none());
+    }
+
+    #[test]
+    fn probe_metadata_rejects_another_schema_and_requires_a_size() {
+        let bytes = br#"{"schema":999,"entries":[]}"#;
+        assert!(ProbeCache::from_json(bytes).is_err());
+        assert!(probe_key(None, b"head").is_none());
+        assert_ne!(probe_key(Some(4), b"head"), probe_key(Some(5), b"head"));
+        assert_ne!(probe_key(Some(4), b"head"), probe_key(Some(4), b"changed"));
+    }
+
+    #[test]
+    fn probe_metadata_accepts_a_long_legitimate_index_inside_its_bounds() {
+        let (_, mut info) = opened("https://debrid/large");
+        info.duration = 40_000.0;
+        info.keyframes = (0..20_000).map(|n| n as f64 * 2.0).collect();
+        info.byte_index = info.keyframes.iter().map(|time| (*time, (*time * 1_000_000.0) as u64)).collect();
+        let key = probe_key(Some(40_000_000_000), b"large-head").unwrap();
+        let mut cache = ProbeCache::default();
+        cache.put(key.clone(), &info);
+        let json = cache.to_json();
+        assert!(json.len() <= PROBE_FILE_MAX_BYTES);
+        assert_eq!(ProbeCache::from_json(&json).unwrap().get(&key).unwrap().keyframes.len(), 20_000);
+    }
+
+    #[test]
+    fn hostile_probe_metadata_is_rejected_at_every_persistent_bound() {
+        let (resolved, info) = opened("https://debrid/file");
+        let key = probe_key(resolved.size, &resolved.head).unwrap();
+        let stored = StoredMediaInfo::from(&info);
+
+        assert!(ProbeCache::from_json(&vec![b' '; PROBE_FILE_MAX_BYTES + 1]).is_err());
+        let too_many = StoredProbeFile {
+            schema: PROBE_SCHEMA,
+            entries: vec![(key.clone(), stored.clone()); PROBE_MAX + 1],
+        };
+        assert!(ProbeCache::from_json(&serde_json::to_vec(&too_many).unwrap()).is_err());
+
+        let mut oversized_shape = stored.clone();
+        oversized_shape.keyframes = vec![0.0; PROBE_KEYFRAMES_MAX + 1];
+        let hostile = StoredProbeFile { schema: PROBE_SCHEMA, entries: vec![(key.clone(), oversized_shape)] };
+        assert!(ProbeCache::from_json(&serde_json::to_vec(&hostile).unwrap()).is_err());
+
+        let mut oversized_string = stored;
+        oversized_string.codecs = Some("x".repeat(PROBE_STRING_MAX + 1));
+        let hostile = StoredProbeFile { schema: PROBE_SCHEMA, entries: vec![(key, oversized_string)] };
+        assert!(ProbeCache::from_json(&serde_json::to_vec(&hostile).unwrap()).is_err());
+    }
+
+    #[test]
+    fn an_oversized_probe_file_is_refused_before_it_is_read() {
+        let path = std::env::temp_dir().join(format!("den-remux-probe-bound-{}", std::process::id()));
+        std::fs::write(&path, vec![0; PROBE_FILE_MAX_BYTES + 1]).unwrap();
+        let result = read_bounded(&path, PROBE_FILE_MAX_BYTES);
+        let _ = std::fs::remove_file(path);
+        assert!(result.is_err());
     }
 
     #[test]

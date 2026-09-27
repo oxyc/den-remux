@@ -447,6 +447,7 @@ pub struct Job {
     paused: Duration,
     child: Child,
     stderr: Option<tokio::task::JoinHandle<String>>,
+    permit: Option<crate::state::ProducerPermit>,
 }
 
 /// A run's pull, as one log line: how much of the film it made, how fast while it ran, and why it is over.
@@ -465,7 +466,13 @@ fn pull_summary(id: u32, start: f64, media: f64, bytes: u64, running: f64, pause
 }
 
 impl Job {
-    pub fn spawn(ffmpeg: &str, id: u32, start: f64, spec: &Spec<'_>) -> std::io::Result<Job> {
+    pub fn spawn(
+        ffmpeg: &str,
+        id: u32,
+        start: f64,
+        spec: &Spec<'_>,
+        permit: crate::state::ProducerPermit,
+    ) -> std::io::Result<Job> {
         std::fs::create_dir_all(spec.dir)?;
         let ca = Path::new(CA_BUNDLE).exists().then_some(CA_BUNDLE);
         let mut cmd = Command::new(ffmpeg);
@@ -514,6 +521,7 @@ impl Job {
             paused: Duration::ZERO,
             child,
             stderr,
+            permit: Some(permit),
         })
     }
 
@@ -530,6 +538,7 @@ impl Job {
         if self.exit.is_none() {
             if let Ok(Some(status)) = self.child.try_wait() {
                 self.exit = Some(status.success());
+                self.permit = None;
                 unregister_group(self.pid);
             }
         }
@@ -553,6 +562,11 @@ impl Job {
                 self.paused += since.elapsed();
             }
         }
+    }
+
+    pub fn parked_for(&self) -> Option<Duration> {
+        (self.exit.is_none() && self.stopped)
+            .then(|| self.paused_since.map_or(Duration::ZERO, |at| at.elapsed()))
     }
 
     /// The tail of ffmpeg's stderr, once it has exited.

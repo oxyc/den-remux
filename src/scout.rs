@@ -278,17 +278,31 @@ pub async fn resolve(
             if json { " (JSON, not media)" } else { "" }
         ));
     }
-    let size = match status {
-        206 => resp
-            .headers()
-            .get(reqwest::header::CONTENT_RANGE)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.rsplit('/').next())
-            .and_then(|t| t.parse().ok()),
-        _ => resp.content_length(),
+    let range = match status {
+        206 => {
+            let (start, end, total) = resp
+                .headers()
+                .get(reqwest::header::CONTENT_RANGE)
+                .and_then(|v| v.to_str().ok())
+                .and_then(crate::httputil::content_range)
+                .ok_or_else(|| "the play URL answered an invalid Content-Range".to_string())?;
+            let length = end - start + 1;
+            if start != 0
+                || length != HEAD_BYTES.min(total)
+                || resp.content_length().is_some_and(|content_length| content_length != length)
+            {
+                return Err("the play URL answered a Content-Range other than the requested head".into());
+            }
+            Some((length, total))
+        }
+        _ => None,
     };
+    let size = range.map(|(_, total)| total).or_else(|| resp.content_length());
     let url = resp.url().to_string();
     let head = crate::probe::read_capped(resp, HEAD_BYTES).await?;
+    if range.is_some_and(|(length, _)| head.len() as u64 != length) {
+        return Err("the play URL's body did not match its Content-Range".into());
+    }
     Ok(Resolved { url, head, size })
 }
 
@@ -307,6 +321,21 @@ mod tests {
         assert!(!is_imdb("tt01x"));
         assert!(!is_imdb("../etc"));
         assert!(!is_imdb("tt0111161:1:2"), "an episode comes as season and episode fields");
+    }
+
+    #[test]
+    fn only_an_exact_satisfiable_content_range_parses() {
+        assert_eq!(crate::httputil::content_range("bytes 0-262143/1000000"), Some((0, 262143, 1000000)));
+        for invalid in [
+            "bytes */100",
+            "bytes 5-4/100",
+            "bytes 0-100/100",
+            "bytes 0-9/*",
+            "items 0-9/100",
+            "bytes 0-9/100/extra",
+        ] {
+            assert_eq!(crate::httputil::content_range(invalid), None, "{invalid}");
+        }
     }
 
     #[test]

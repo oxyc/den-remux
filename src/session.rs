@@ -142,8 +142,6 @@ pub struct Inner {
     /// The debrid link ffmpeg reads — scout's play URL, resolved — and whether it has been re-fetched.
     input: String,
     reresolved: bool,
-    /// This session's hold on the GPU; given back when it ends.
-    transcode: Option<crate::state::TranscodeSlot>,
 }
 
 pub struct Session {
@@ -208,6 +206,8 @@ pub struct Session {
     /// forgotten there too.
     opened_key: String,
     inner: Mutex<Inner>,
+    /// One request at a time may queue for and start this session's producer.
+    producer_gate: tokio::sync::Mutex<()>,
     wake: Notify,
 }
 
@@ -491,23 +491,39 @@ impl Session {
             && (!passed || kept)
     }
 
-    /// Make sure a job is heading for segment `n`: leave a running job that will reach it soon, start
-    /// one at `n` otherwise. `Err` when the source has failed too often to try again.
-    fn ensure_job(&self, i: &mut Inner, n: usize, st: &AppState) -> Result<(), ()> {
+    fn producer_needed(&self, i: &Inner, n: usize) -> Result<bool, ()> {
+        if i.ended {
+            return Err(());
+        }
         let first_keyframe = self.info.keyframes.first().copied().unwrap_or(0.0);
         let keep = i.job.as_ref().is_some_and(|j| {
             j.exit.is_none()
                 && Self::heads_for(&self.segments, n, first_keyframe, j.id, j.start, j.next_start, &i.gops)
         });
         if keep {
-            return Ok(());
+            return Ok(false);
         }
         // A run failed without output: the next one waits for `reresolve_if_needed` to fetch a fresh link.
         if i.failures > 0 && !i.reresolved {
-            return Ok(());
+            return Ok(false);
         }
         if i.failures >= MAX_FAILURES {
             return Err(());
+        }
+        Ok(true)
+    }
+
+    /// Start a producer for `n` with resources acquired outside the session lock. Rechecks because another request may
+    /// have made it ready while this one waited fairly.
+    fn ensure_job(
+        &self,
+        i: &mut Inner,
+        n: usize,
+        st: &Arc<AppState>,
+        permit: crate::state::ProducerPermit,
+    ) -> Result<(), ()> {
+        if !self.producer_needed(i, n)? {
+            return Ok(());
         }
         let (start, seek) = self.restart_point(n);
         let id = i.next_job;
@@ -524,7 +540,7 @@ impl Session {
             text: &self.text_tracks,
             dir: &dir,
         };
-        match Job::spawn(&st.cfg.ffmpeg, id, start, &spec) {
+        match Job::spawn(&st.cfg.ffmpeg, id, start, &spec, permit) {
             Ok(new) => {
                 if let Some(old) = i.job.replace(new) {
                     // A run that already exited said so when it did.
@@ -548,6 +564,41 @@ impl Session {
                 Err(())
             }
         }
+    }
+
+    async fn start_producer(&self, st: &Arc<AppState>, n: usize, deadline: Instant) -> Result<(), ()> {
+        let gate =
+            tokio::time::timeout_at(deadline.into(), self.producer_gate.lock()).await.map_err(|_| ())?;
+        let old = {
+            let mut i = self.lock();
+            self.refresh(&mut i, st);
+            if !self.producer_needed(&i, n)? {
+                return Ok(());
+            }
+            i.job.take()
+        };
+        if let Some(old) = old {
+            if old.exit.is_none() {
+                eprintln!(
+                    "session {}: {}",
+                    self.short(),
+                    old.pull_line(&format!("replaced for segment {n}"))
+                );
+            }
+            old.stop().await;
+        }
+        let permit = tokio::time::timeout_at(deadline.into(), st.acquire_producer(self.transcoded))
+            .await
+            .map_err(|_| ())?
+            .ok_or(())?;
+        let result = {
+            let mut i = self.lock();
+            self.refresh(&mut i, st);
+            self.ensure_job(&mut i, n, st, permit)
+        };
+        drop(gate);
+        self.wake.notify_one();
+        result
     }
 
     /// Pause the job once it is `AHEAD_SEGMENTS` past the newest request — or, once that request's
@@ -621,7 +672,7 @@ impl Session {
 
     pub async fn serve_segment(
         &self,
-        st: &AppState,
+        st: &Arc<AppState>,
         n: usize,
         head: bool,
         headers: &hyper::HeaderMap,
@@ -629,7 +680,7 @@ impl Session {
         let deadline = Instant::now() + SEGMENT_WAIT;
         loop {
             self.reresolve_if_needed(st).await;
-            let paths = {
+            let (paths, start) = {
                 let mut i = self.lock();
                 if i.ended {
                     return gone();
@@ -638,11 +689,13 @@ impl Session {
                 i.want = n;
                 self.refresh(&mut i, st);
                 let ready = self.ready(&i, n);
-                if ready.is_none() && self.ensure_job(&mut i, n, st).is_err() {
-                    return source_failed();
-                }
+                let start = match ready.is_none().then(|| self.producer_needed(&i, n)).transpose() {
+                    Ok(Some(needed)) => needed,
+                    Ok(None) => false,
+                    Err(()) => return source_failed(),
+                };
                 self.gate(&mut i, st);
-                ready
+                (ready, start)
             };
             self.wake.notify_one();
             if let Some(paths) = paths {
@@ -656,6 +709,9 @@ impl Session {
                     return media_response(media, head, self.exp, headers);
                 }
             }
+            if start && self.start_producer(st, n, deadline).await.is_err() && Instant::now() >= deadline {
+                return busy();
+            }
             if Instant::now() >= deadline {
                 return busy();
             }
@@ -663,31 +719,39 @@ impl Session {
         }
     }
 
-    pub async fn serve_init(&self, st: &AppState, head: bool, headers: &hyper::HeaderMap) -> Response<Body> {
+    pub async fn serve_init(
+        &self,
+        st: &Arc<AppState>,
+        head: bool,
+        headers: &hyper::HeaderMap,
+    ) -> Response<Body> {
         let deadline = Instant::now() + SEGMENT_WAIT;
         loop {
             self.reresolve_if_needed(st).await;
-            let init = {
+            let (init, start) = {
                 let mut i = self.lock();
                 if i.ended {
                     return gone();
                 }
                 i.last_seen = Instant::now();
                 self.refresh(&mut i, st);
-                if i.init.is_none() {
-                    let want = i.want;
-                    if self.ensure_job(&mut i, want, st).is_err() {
-                        return source_failed();
-                    }
-                }
+                let start = match i.init.is_none().then(|| self.producer_needed(&i, i.want)).transpose() {
+                    Ok(Some(needed)) => needed,
+                    Ok(None) => false,
+                    Err(()) => return source_failed(),
+                };
                 self.gate(&mut i, st);
-                i.init.clone()
+                (i.init.clone(), start)
             };
             self.wake.notify_one();
             if let Some(path) = init {
                 if let Ok(Ok(media)) = tokio::task::spawn_blocking(move || open_parts(&[path])).await {
                     return media_response(media, head, self.exp, headers);
                 }
+            }
+            if start {
+                let want = self.lock().want;
+                let _ = self.start_producer(st, want, deadline).await;
             }
             if Instant::now() >= deadline {
                 return busy();
@@ -703,10 +767,10 @@ impl Session {
     /// Safari reports as "Media failed to decode" — and a job that seeks into a remote file, and perhaps starts a
     /// transcode, takes longer than that to write one. hls.js waits as long as it takes. Whatever stops this early
     /// (a run that fails, a job that won't start) is left to the player's own request, which handles it as before.
-    pub async fn prepare(&self, st: &AppState) {
+    pub async fn prepare(&self, st: &Arc<AppState>) {
         let deadline = Instant::now() + INIT_WAIT;
         loop {
-            {
+            let start = {
                 let mut i = self.lock();
                 if i.ended {
                     return;
@@ -716,12 +780,15 @@ impl Session {
                     return;
                 }
                 let want = i.want;
-                if self.ensure_job(&mut i, want, st).is_err() {
-                    return;
-                }
+                let start = self.producer_needed(&i, want).unwrap_or(false);
                 self.gate(&mut i, st);
-            }
+                start
+            };
             self.wake.notify_one();
+            if start {
+                let want = self.lock().want;
+                let _ = self.start_producer(st, want, deadline).await;
+            }
             if Instant::now() >= deadline {
                 // The session is answered anyway, and Safari will likely give up on the map before it is written.
                 eprintln!(
@@ -920,8 +987,6 @@ impl Session {
             st.scratch_bytes.fetch_sub(i.bytes, Relaxed);
             i.bytes = 0;
             i.gops.clear();
-            // Now rather than when the last handle on the session drops: the next session may want it.
-            i.transcode = None;
             i.job.take()
         };
         if let Some(j) = job {
@@ -1149,7 +1214,7 @@ fn the_files_own_head(r: &scout::Resolved) -> bool {
 /// Try one candidate: follow its play URL, read the head, and probe it — or take all of that from a recent
 /// open of the same release by the same install. What the probe found is remembered for `releases`' verdicts.
 async fn open(
-    st: &AppState,
+    st: &Arc<AppState>,
     src: &scout::ScoutSource,
     title: &str,
     s: &scout::Stream,
@@ -1162,21 +1227,33 @@ async fn open(
     let r = scout::resolve(&st.scout_http, &crate::config::local(&s.url, &st.cfg.origin_aliases), src)
         .await
         .map_err(OpenFailure::passing)?;
-    let info =
-        match crate::probe::probe(&Source::Http { client: &st.source_http, url: &r.url }, &r.head).await {
+    let stable_key = crate::state::probe_key(r.size, &r.head);
+    let cached = stable_key.as_deref().and_then(|key| st.probe(key));
+    let from_cache = cached.is_some();
+    let info = match cached {
+        Some(info) => info,
+        None => match crate::probe::probe(&Source::Http { client: &st.source_http, url: &r.url }, &r.head)
+            .await
+        {
             Ok(info) => info,
             Err(e) => {
                 let neither =
                     matches!(&e, crate::probe::ProbeError::Unsupported(w) if w == crate::probe::NEITHER);
                 return Err(OpenFailure { why: e.to_string(), lasting: neither && the_files_own_head(&r) });
             }
-        };
+        },
+    };
     st.known().put(known_key(title, s), &info);
     if let VideoCodec::Other(c) = &info.video {
         return Err(OpenFailure { why: format!("video is {c}, which needs a re-encode"), lasting: true });
     }
     if info.audio.is_empty() {
         return Err(OpenFailure { why: "no audio track".into(), lasting: true });
+    }
+    if !from_cache {
+        if let Some(key) = stable_key {
+            st.remember_probe(key, &info);
+        }
     }
     st.opened().put(key, &r, &info, Instant::now());
     Ok((r, info))
@@ -2126,7 +2203,7 @@ pub async fn create(
                     }
                 }
                 Ok(found) => {
-                    chosen = Some((c, found, None));
+                    chosen = Some((c, found, false));
                     break;
                 }
                 Err(failure) => {
@@ -2165,7 +2242,7 @@ pub async fn create(
             .min_by(|&a, &b| head_start(&too_big[a]).total_cmp(&head_start(&too_big[b])));
         if let Some(i) = longer {
             let (c, found) = too_big.swap_remove(i);
-            chosen = Some((c, found, None));
+            chosen = Some((c, found, false));
         }
     }
     let who = if guest { "a guest" } else { "a member" };
@@ -2192,9 +2269,9 @@ pub async fn create(
             Some(too_big.remove(i))
         });
         if let Some((c, found)) = convert {
-            match st.reserve_transcode() {
-                Some(slot) => {
-                    // Every conversion is the box's GPU for a whole film: the log says why no copy would do.
+            match st.can_transcode() {
+                true => {
+                    // The GPU is acquired fairly only when the player asks for media; an abandoned session owns none.
                     eprintln!(
                         "session: {imdb} converting \"{}\" for {who} to {}p at {} kbit/s (at most {}){}: {why}",
                         c.attributes.label,
@@ -2203,15 +2280,15 @@ pub async fn create(
                         preset.peak / 1000,
                         if fitting.is_none() { ", more than the link carries" } else { "" }
                     );
-                    chosen = Some((c, found, Some(slot)));
+                    chosen = Some((c, found, true));
                 }
-                // The GPU is off or in use: it still plays as it is, below.
-                None if from_too_big => too_big.push((c, found)),
-                None => {
+                // The GPU is unavailable: it still plays as it is, below.
+                false if from_too_big => too_big.push((c, found)),
+                false => {
                     no_transcode = true;
                     eprintln!(
-                        "session: {imdb} can't play \"{}\" for {who}: it needs converting ({why}), and no transcode \
-                         is free",
+                        "session: {imdb} can't play \"{}\" for {who}: it needs converting ({why}), and transcoding \
+                         is unavailable",
                         c.attributes.label
                     );
                 }
@@ -2222,7 +2299,7 @@ pub async fn create(
         // Last, the copy too big for the link that needs the least: a stall now and then beats nothing to play.
         if let Some(i) = (0..too_big.len()).min_by_key(|&i| bitrate(&too_big[i]).unwrap_or(u64::MAX)) {
             let (c, found) = too_big.swap_remove(i);
-            chosen = Some((c, found, None));
+            chosen = Some((c, found, false));
         }
     }
     let Some((c, (resolved, info), transcode)) = chosen else {
@@ -2272,9 +2349,10 @@ pub async fn create(
         ));
     }
     st.scratch_ok.store(true, Relaxed);
-    let segments = playlist::segments(&info.keyframes, info.duration, playlist::TARGET_SECS);
     // A resume at or past the end starts the title over.
     let start_at = effective_start(want.start_at, info.duration);
+    let segments =
+        playlist::segments_for_start(&info.keyframes, info.duration, playlist::TARGET_SECS, start_at);
     let first_segment = start_segment(&segments, start_at);
     let codecs = info.codecs.clone().unwrap_or_else(|| {
         // A file without a codec configuration record; name the commonest profile rather than none.
@@ -2297,16 +2375,16 @@ pub async fn create(
     });
     let (peak, avg) = playlist::bandwidth(size, info.duration);
     let (codecs, resolution, (peak, avg)) = match transcode {
-        Some(_) => (
+        true => (
             job::TRANSCODE_CODECS.to_string(),
             transcode_size(info.width, info.height, preset),
             (preset.peak + 192_000, preset.bitrate),
         ),
-        None => (codecs, (info.width, info.height), (peak, avg)),
+        false => (codecs, (info.width, info.height), (peak, avg)),
     };
     // Dolby Vision stays in a copy for a player that shows it; everywhere else, and in every transcode, the base
     // layer plays alone.
-    let kept_dv = kept_dolby_vision(&info, transcode.is_some(), want.playable);
+    let kept_dv = kept_dolby_vision(&info, transcode, want.playable);
     let dovi = match (info.dolby_vision, kept_dv) {
         (None, _) => job::Dovi::Absent,
         (Some(_), None) => job::Dovi::Strip,
@@ -2316,7 +2394,7 @@ pub async fn create(
         Some((own, supplemental, range)) => {
             (own.unwrap_or(codecs), Some(playlist::DolbyVision { supplemental, range }))
         }
-        None if transcode.is_none() => {
+        None if !transcode => {
             let range = copied_range(&info, &codecs);
             (codecs, range.map(|range| playlist::DolbyVision { supplemental: None, range }))
         }
@@ -2333,10 +2411,10 @@ pub async fn create(
         renditions.iter().map(|r| (r.lang.clone(), crate::lang::name(&r.lang))).collect();
     let opened_key = opened_key(&source.base, c);
     // A transcode's keyframes are its encoder's IDRs, in closed GOPs; a copy's are the release's own.
-    let closed_gops = transcode.is_some() || info.closed_gops;
+    let closed_gops = transcode || info.closed_gops;
     let (prebuffer, need, demand) = match transcode {
-        Some(_) => (want.max_bitrate.map(|rate| preset.head_start(rate)), None, None),
-        None => {
+        true => (want.max_bitrate.map(|rate| preset.head_start(rate)), None, None),
+        false => {
             let delivery = Delivery::of(&info, size, want);
             let bytes = playlist::segment_bytes(&segments, &info.byte_index, delivery.bytes);
             (
@@ -2407,7 +2485,7 @@ pub async fn create(
         renditions,
         text_tracks,
         own: Default::default(),
-        transcoded: transcode.is_some(),
+        transcoded: transcode,
         preset,
         inner: Mutex::new(Inner {
             job: None,
@@ -2422,8 +2500,8 @@ pub async fn create(
             failures: 0,
             input: resolved.url,
             reresolved: false,
-            transcode,
         }),
+        producer_gate: tokio::sync::Mutex::new(()),
         wake: Notify::new(),
     });
     st.insert_session(session.clone());
@@ -2470,7 +2548,7 @@ pub async fn create(
 /// goes idle or expires.
 async fn supervise(st: Arc<AppState>, s: Arc<Session>) {
     loop {
-        let (running, idle_at) = {
+        let (running, idle_at, park_in) = {
             let mut i = s.lock();
             if i.ended {
                 return;
@@ -2480,8 +2558,30 @@ async fn supervise(st: Arc<AppState>, s: Arc<Session>) {
             (
                 i.job.as_ref().is_some_and(|j| j.exit.is_none() && !j.stopped),
                 i.last_seen + st.cfg.session_idle,
+                i.job
+                    .as_ref()
+                    .and_then(Job::parked_for)
+                    .map(|paused| st.cfg.producer_idle.saturating_sub(paused)),
             )
         };
+        // A parked producer is reusable while capacity is free. Under contention it yields immediately instead of
+        // making the FIFO queue wait one idle timeout for every wave of logical sessions.
+        let under_pressure = park_in.is_some() && st.producer_waiters.load(Relaxed) > 0;
+        if park_in.is_some_and(|remaining| remaining.is_zero()) || under_pressure {
+            let parked = {
+                let mut i = s.lock();
+                i.job
+                    .as_ref()
+                    .and_then(Job::parked_for)
+                    .filter(|paused| under_pressure || *paused >= st.cfg.producer_idle)
+                    .and_then(|_| i.job.take())
+            };
+            if let Some(job) = parked {
+                eprintln!("session {}: {}", s.short(), job.pull_line("parked; producer slot released"));
+                job.stop().await;
+                continue;
+            }
+        }
         let now = unix_now();
         if Instant::now() >= idle_at {
             st.end_session(&s.sid, "idle").await;
@@ -2492,7 +2592,13 @@ async fn supervise(st: Arc<AppState>, s: Arc<Session>) {
             return;
         }
         let exp_at = Instant::now() + Duration::from_secs(s.exp - now);
-        let wait = if running { TICK } else { idle_at.min(exp_at).saturating_duration_since(Instant::now()) };
+        let until_end = idle_at.min(exp_at).saturating_duration_since(Instant::now());
+        // Producer waiters belong to other sessions and cannot notify this one directly, so parked jobs poll cheaply.
+        let wait = if running || park_in.is_some() {
+            TICK.min(park_in.unwrap_or(TICK)).min(until_end)
+        } else {
+            until_end
+        };
         tokio::select! {
             _ = tokio::time::sleep(wait) => {}
             _ = s.wake.notified() => {}

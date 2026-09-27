@@ -37,6 +37,41 @@ pub fn segments(keyframes: &[f64], duration: f64, target: f64) -> Vec<Segment> {
         .collect()
 }
 
+/// [`segments`] with the segment a player opens on split at the file's nearby keyframes. ffmpeg already writes one
+/// file per GOP; exposing those first GOPs lets playback begin after one has arrived instead of withholding it until
+/// the ordinary six-second segment is complete. Later segments keep the ordinary target and its low request rate.
+///
+/// `start` is backed up by the same one second as the producer (`session::START_SLACK`): native players sometimes ask
+/// for the segment immediately before an `EXT-X-START`, and that request should get the short path too.
+pub fn segments_for_start(keyframes: &[f64], duration: f64, target: f64, start: f64) -> Vec<Segment> {
+    let ordinary = segments(keyframes, duration, target);
+    let point = (start - 1.0).max(0.0).min(duration);
+    let Some(window) = ordinary.iter().find(|s| s.start <= point && point < s.end) else { return ordinary };
+    let mut cuts: Vec<f64> = ordinary.iter().map(|s| s.start).collect();
+    // Include every GOP boundary from the one at/before the backed-up start through the first one after the actual
+    // start. Ordinarily this is one extra cut; including the preceding boundary keeps a resume near a normal cut safe.
+    let before = keyframes.iter().copied().take_while(|k| *k <= point + 1e-9).last().unwrap_or_else(|| {
+        // Segment zero names the media timeline from zero even when the first encoded frame is a few milliseconds
+        // later. That first keyframe is its beginning, not a useful 0-to-first-frame bootstrap segment.
+        keyframes.first().copied().unwrap_or(window.start)
+    });
+    for k in keyframes.iter().copied().filter(|k| *k > window.start && *k < window.end) {
+        let first_frame_of_zero = window.start == 0.0 && (k - before).abs() < 1e-9;
+        if k + 1e-9 >= before && !first_frame_of_zero {
+            cuts.push(k);
+        }
+        if k > start + 1e-9 && !first_frame_of_zero {
+            break;
+        }
+    }
+    cuts.sort_by(f64::total_cmp);
+    cuts.dedup_by(|a, b| (*a - *b).abs() < 1e-9);
+    cuts.iter()
+        .enumerate()
+        .map(|(i, &start)| Segment { start, end: cuts.get(i + 1).copied().unwrap_or(duration) })
+        .collect()
+}
+
 /// `EXT-X-INDEPENDENT-SEGMENTS` where every segment decodes without the one before it (`MediaInfo::closed_gops`):
 /// a segment that opens on a CRA carries leading pictures that reference the segment before, and saying otherwise
 /// tells a player it may start decoding anywhere without it.
@@ -291,6 +326,32 @@ mod tests {
         for s in &segs[1..] {
             assert!(KF.contains(&s.start), "every boundary but the first is a real keyframe");
         }
+    }
+
+    #[test]
+    fn only_the_opening_window_is_split_into_gops() {
+        let segs = segments_for_start(&KF, 30.021, TARGET_SECS, 0.0);
+        let starts: Vec<f64> = segs.iter().map(|s| s.start).collect();
+        assert_eq!(starts, [0.0, 2.5, 8.0, 13.0, 19.5, 24.0]);
+        assert_eq!(segs[0].end, 2.5, "first playable bytes need one GOP rather than eight seconds");
+        assert_eq!(segs[1].end, 8.0, "the rest of the opening window is one ordinary segment");
+        assert_eq!(segs.last().unwrap().end, 30.021);
+    }
+
+    #[test]
+    fn a_nonzero_first_timestamp_does_not_make_an_empty_bootstrap_segment() {
+        let segs = segments_for_start(&[0.021, 2.521, 8.021, 13.021], 19.0, TARGET_SECS, 0.0);
+        let starts: Vec<f64> = segs.iter().map(|s| s.start).collect();
+        assert_eq!(starts, [0.0, 2.521, 8.021, 13.021]);
+    }
+
+    #[test]
+    fn a_resume_gets_a_short_segment_at_both_sides_of_its_start() {
+        let segs = segments_for_start(&KF, 30.021, TARGET_SECS, 18.8);
+        let starts: Vec<f64> = segs.iter().map(|s| s.start).collect();
+        assert_eq!(starts, [0.0, 8.0, 13.0, 16.0, 19.5, 24.0]);
+        let containing = segs.iter().find(|s| s.start <= 18.8 && 18.8 < s.end).unwrap();
+        assert_eq!((containing.start, containing.end), (16.0, 19.5));
     }
 
     #[test]
