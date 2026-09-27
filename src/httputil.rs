@@ -14,6 +14,15 @@ use tokio_util::io::ReaderStream;
 /// mid-flight, full-buffer bodies never do).
 pub type Body = BoxBody<Bytes, std::io::Error>;
 
+/// A satisfied single byte range. Callers still compare all three values with the range they requested and the
+/// identity they already hold; parsing a plausible total is not validation.
+pub fn content_range(value: &str) -> Option<(u64, u64, u64)> {
+    let (span, total) = value.strip_prefix("bytes ")?.split_once('/')?;
+    let (start, end) = span.split_once('-')?;
+    let (start, end, total) = (start.parse().ok()?, end.parse().ok()?, total.parse().ok()?);
+    (start <= end && end < total).then_some((start, end, total))
+}
+
 pub fn full(data: impl Into<Bytes>) -> Body {
     Full::new(data.into()).map_err(|never| match never {}).boxed()
 }

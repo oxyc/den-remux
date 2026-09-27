@@ -231,13 +231,6 @@ pub async fn list(
 /// How many redirects a play URL may take to reach the file. Scout's is one 302; a debrid may add one.
 const MAX_HOPS: usize = 5;
 
-fn content_range(value: &str) -> Option<(u64, u64, u64)> {
-    let (span, total) = value.strip_prefix("bytes ")?.split_once('/')?;
-    let (start, end) = span.split_once('-')?;
-    let (start, end, total) = (start.parse().ok()?, end.parse().ok()?, total.parse().ok()?);
-    (start <= end && end < total).then_some((start, end, total))
-}
-
 /// Follow a play URL (scout's `/p/<ticket>`, a 302 to the debrid) and read the head of the file in the
 /// same request.
 ///
@@ -291,7 +284,7 @@ pub async fn resolve(
                 .headers()
                 .get(reqwest::header::CONTENT_RANGE)
                 .and_then(|v| v.to_str().ok())
-                .and_then(content_range)
+                .and_then(crate::httputil::content_range)
                 .ok_or_else(|| "the play URL answered an invalid Content-Range".to_string())?;
             let length = end - start + 1;
             if start != 0
@@ -332,7 +325,7 @@ mod tests {
 
     #[test]
     fn only_an_exact_satisfiable_content_range_parses() {
-        assert_eq!(content_range("bytes 0-262143/1000000"), Some((0, 262143, 1000000)));
+        assert_eq!(crate::httputil::content_range("bytes 0-262143/1000000"), Some((0, 262143, 1000000)));
         for invalid in [
             "bytes */100",
             "bytes 5-4/100",
@@ -341,7 +334,7 @@ mod tests {
             "items 0-9/100",
             "bytes 0-9/100/extra",
         ] {
-            assert_eq!(content_range(invalid), None, "{invalid}");
+            assert_eq!(crate::httputil::content_range(invalid), None, "{invalid}");
         }
     }
 

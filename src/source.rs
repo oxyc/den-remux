@@ -306,14 +306,35 @@ fn fetch(entry: Arc<Entry>, start: u64, end: u64, chunks: &'static [u64]) -> Pul
                     return;
                 }
             };
-            let mut left = to - at + 1;
+            let expected = (at, to, entry.size);
+            let actual = resp
+                .headers()
+                .get(reqwest::header::CONTENT_RANGE)
+                .and_then(|v| v.to_str().ok())
+                .and_then(crate::httputil::content_range);
+            let content_length = resp.content_length();
+            if actual != Some(expected) || content_length != Some(span) {
+                let why = format!(
+                    "upstream mismatched bytes {at}-{to}: Content-Range={actual:?} Content-Length={content_length:?}"
+                );
+                failed_by_task.fetch_add(span, Relaxed);
+                failed(&tx, why).await;
+                return;
+            }
+            let mut left = span;
             loop {
                 match resp.chunk().await {
                     Ok(Some(chunk)) => {
-                        let n = (chunk.len() as u64).min(left);
+                        let n = chunk.len() as u64;
+                        if n > left {
+                            failed_by_task.fetch_add(left, Relaxed);
+                            failed(&tx, format!("upstream sent {} extra bytes for {at}-{to}", n - left))
+                                .await;
+                            return;
+                        }
                         left -= n;
                         at += n;
-                        if tx.send(Ok(chunk.slice(..n as usize))).await.is_err() {
+                        if tx.send(Ok(chunk)).await.is_err() {
                             account_abandoned(
                                 &requested_by_task,
                                 &read,
@@ -328,7 +349,22 @@ fn fetch(entry: Arc<Entry>, start: u64, end: u64, chunks: &'static [u64]) -> Pul
                             return;
                         }
                         if left == 0 {
-                            break;
+                            match resp.chunk().await {
+                                Ok(None) => break,
+                                Ok(Some(extra)) => {
+                                    failed(
+                                        &tx,
+                                        format!("upstream sent {} extra bytes after {to}", extra.len()),
+                                    )
+                                    .await;
+                                    return;
+                                }
+                                Err(e) => {
+                                    failed(&tx, format!("upstream body after {to}: {}", e.without_url()))
+                                        .await;
+                                    return;
+                                }
+                            }
                         }
                     }
                     Ok(None) => {
@@ -443,6 +479,81 @@ mod tests {
             }
         });
         (base, requests)
+    }
+
+    /// One response to the adaptive reader's fixed bytes 100-199/1000 request.
+    async fn range_response(
+        content_range: Option<&str>,
+        content_length: Option<u64>,
+        body_len: usize,
+    ) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let content_range = content_range.map(str::to_string);
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let service = service_fn(move |_req: Request<hyper::body::Incoming>| {
+                let content_range = content_range.clone();
+                async move {
+                    let frames = futures_util::stream::once(async move {
+                        Ok::<_, std::io::Error>(Frame::data(Bytes::from(vec![7; body_len])))
+                    });
+                    let mut response = Response::builder().status(StatusCode::PARTIAL_CONTENT);
+                    if let Some(value) = content_range {
+                        response = response.header("content-range", value);
+                    }
+                    if let Some(value) = content_length {
+                        response = response.header("content-length", value);
+                    }
+                    Ok::<_, Infallible>(response.body(BodyExt::boxed(StreamBody::new(frames))).unwrap())
+                }
+            });
+            let _ = hyper::server::conn::http1::Builder::new()
+                .serve_connection(TokioIo::new(stream), service)
+                .await;
+        });
+        url
+    }
+
+    async fn fetch_one(
+        content_range: Option<&str>,
+        content_length: Option<u64>,
+        body_len: usize,
+    ) -> Result<Vec<u8>, ()> {
+        let url = range_response(content_range, content_length, body_len).await;
+        let entry = Arc::new(Entry {
+            client: reqwest::Client::new(),
+            upstream: Mutex::new(url),
+            head: Bytes::new(),
+            size: 1000,
+            stats: Arc::new(Stats::default()),
+        });
+        let mut pull = fetch(entry, 100, 199, &CHUNKS);
+        let mut out = Vec::new();
+        while let Some(item) = pull.rx.recv().await {
+            match item {
+                Ok(bytes) => out.extend_from_slice(&bytes),
+                Err(_) => return Err(()),
+            }
+        }
+        Ok(out)
+    }
+
+    #[tokio::test]
+    async fn an_adaptive_range_requires_exact_response_headers_and_body() {
+        assert_eq!(fetch_one(Some("bytes 100-199/1000"), Some(100), 100).await.unwrap(), vec![7; 100]);
+        for (name, content_range, content_length, body_len) in [
+            ("wrong start", Some("bytes 101-199/1000"), Some(99), 99),
+            ("wrong end", Some("bytes 100-198/1000"), Some(99), 99),
+            ("wrong total", Some("bytes 100-199/999"), Some(100), 100),
+            ("malformed", Some("not a range"), Some(100), 100),
+            ("missing range", None, Some(100), 100),
+            ("wrong length", Some("bytes 100-199/1000"), Some(99), 99),
+            ("missing length", Some("bytes 100-199/1000"), None, 100),
+            ("short body", Some("bytes 100-199/1000"), Some(100), 99),
+        ] {
+            assert!(fetch_one(content_range, content_length, body_len).await.is_err(), "{name}");
+        }
     }
 
     #[tokio::test]
