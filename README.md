@@ -12,7 +12,7 @@ browser ──POST /remux/session {imdb, scout}───►  scout (the library'
 <video> ──GET /remux/s/<sid>/<sig>/seg<N>.m4s─►  ffmpeg: -c:v copy -c:a aac, one fMP4 file per GOP
 ```
 
-This is the MVP ("phase 2") of oxyc/den#11: movies and episodes, cached releases only, AAC stereo, two sessions.
+The current process and data flow are summarized in [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## Routes
 
@@ -172,9 +172,10 @@ itself is never logged. Brave on iOS sends Safari's User-Agent, so it reads as S
   ranks below the copy that starves least. Every transcode chosen is logged with its size and rate, for whom, and why no
   copy would do. A named `filename` is weighed alone, the same way. Without `maxBitrate` nothing changes. The session's
   log line names the link.
-- **A transcode is decided at selection, never as a way out of playback.** Members and guests alike, first come first
-  served on the one GPU slot. With the slot in use, or transcoding off, a title that only a transcode would play gets
-  `404 no_copy` up front ("can't be played on this device right now"), not a wait. A player replacing a session
+- **A transcode is decided at selection, never as a way out of playback.** Members and guests alike may create a
+  logical transcode session without reserving the GPU. When media is requested, producers wait fairly under
+  `MAX_ACTIVE_REMUXES` and `MAX_TRANSCODES`; a request that cannot start within its 20 s segment deadline gets 503.
+  With transcoding unavailable, a title that only a transcode would play gets `404 no_copy` up front. A player replacing a session
   mid-film — another audio track, another release, casting — sends `"transcode":"never"`. A player switching away from
   a release its link can't carry also names it in `exclude` and sends `"fitsOnly":true` with the rate it is getting:
   it takes a copy that link carries, or `404 no_fitting_copy` and keeps playing what it has.
@@ -199,7 +200,9 @@ itself is never logged. Brave on iOS sends Safari's User-Agent, so it reads as S
   plays only converted is the last resort, and the search goes on — up to 12 releases, starting none after 30 s,
   20 s each — while a release that may play as it is remains. An opened release — its debrid link and probe — is remembered
   per install for 10 minutes (8 releases at most), so another of its audio tracks, or the title again, starts
-  without scout or a probe; a link that stops working mid-session is fetched again and forgotten. A named `filename` (another
+  without scout or a probe. Full probe metadata is also kept credential-free in `SCRATCH_DIR/probe-metadata.json`
+  by schema, exact size and a SHA-256 of the probed head, so a process restart normally needs only a fresh play link.
+  A link that stops working mid-session is fetched again and forgotten. A named `filename` (another
   audio track of the release playing) goes first and is kept, converted if need be.
 
 Only a valid `/remux/s/…` bearer URL gets public CORS. Those responses carry
@@ -235,8 +238,9 @@ people watching, not titles clicked.
   `SCOUT_ORIGINS` with exactly one base64url config segment and no credentials, query or fragment — the
   SSRF guard, without which a request could make this service fetch anything on the LAN.
 - **Shares and limits.** An install plays `MAX_SESSIONS_PER_INSTALL` sessions at once and its oldest gives
-  way to a new one, so one household — or one leaked install URL — cannot hold every slot; `MAX_SESSIONS`
-  and `MAX_TRANSCODES` cap the box. Logins, new sessions and speed tests are limited to 10 a minute per visitor,
+  way to a new one, so one household — or one leaked install URL — cannot hold every slot. `MAX_SESSIONS` caps
+  logical sessions, `MAX_ACTIVE_REMUXES` caps ffmpeg producers, and `MAX_TRANSCODES` caps the producers using the GPU.
+  Logins, new sessions and speed tests are limited to 10 a minute per visitor,
   counted together: the address a `TRUSTED_PROXIES` proxy forwarded, else the connection's. A speed test is up to
   8 MiB of the home upload, and all it tells anyone is how fast that is.
 - **The key reaches scout and nothing else.** An HTTP client forwards custom headers across a
@@ -249,7 +253,9 @@ people watching, not titles clicked.
   byte leaves from the homelab's IP. `SCOUT_INSTALL_URL`, this service's own install, is a fallback for
   driving it by hand. ffmpeg itself reads the release through a door on 127.0.0.1 (`src/source.rs`), a random
   path per session: the file's head from the bytes the probe already holds, and the rest over this process's
-  pooled connections to the host, warm from the probe. Reading the link itself, ffmpeg made a fresh TCP and TLS
+  pooled connections to the host, warm from the probe. Sequential reads begin with 1 MiB and grow through
+  16, 64 and 128 MiB ranges; the body stays behind a bounded eight-frame queue, so range size does not become
+  resident buffering. Reading the link itself, ffmpeg made a fresh TCP and TLS
   connection for each of the three seeks a Matroska start makes; on a 200 ms path that was 2.6 s to a resumed
   job's `init.mp4`, and through the door it is 0.7 s. The link never appears on ffmpeg's command line.
 - **A browser key is for what needs den-remux to vouch.** An availability-only scout install, or the
@@ -364,13 +370,15 @@ Every variable is unprefixed; `.env.example` lists them with their defaults.
 | `ORIGIN_ALIASES` | — | `<public origin>=<LAN origin>` pairs (`https://d-scout.oxy.fi=http://192.168.86.193:8080,…`). An install, play or subtitle URL on a public name is fetched at the LAN address: scout and den-subtitles are on this box, so the WAN and the tunnel never sit between them, and this service never needs the Access token the public names ask for. The public name must still be in `SCOUT_ORIGINS`/`SUBTITLE_ORIGINS`. |
 | `BROWSER_KEY_HASHES` | — | Optional. Comma-separated hex SHA-256 of each browser key, for an availability-only scout install or `SCOUT_INSTALL_URL`. Removing one logs that browser out. |
 | `REMUX_URL_KEY` | random | **Secret.** Signs cookies and session URLs. **Set it**: unset, every restart logs the browsers out (`/health` says `url_key_ephemeral`). Rotating it kills every cookie and session URL. |
-| `MAX_SESSIONS` | `2` | Sessions at once; the next gets 429 `too_many_sessions`. |
+| `MAX_SESSIONS` | `8` | Logical sessions kept at once; the next gets 429 `too_many_sessions`. |
 | `MAX_SESSIONS_PER_INSTALL` | `2` | Sessions one scout install plays at once without a login; past it, its oldest ends. |
+| `MAX_ACTIVE_REMUXES` | `2` | ffmpeg producers active at once. Extra sessions wait fairly when media is requested. |
+| `PRODUCER_IDLE_SECS` | `10` | Reap a producer paused on a full ahead window after this long; keep its logical session and finished GOPs. |
 | `SESSION_IDLE_SECS` | `600` | A session with no request for this long is ended (min 30). |
-| `SCRATCH_DIR` | `/cache` | Where GOP files go. den-remux's alone: every `s-*` directory in it is deleted at start. `unplayable.json` keeps, across restarts, the releases a session found play in no browser (neither Matroska nor MP4, a video nothing here copies or converts, no audio): skipped unopened for 7 days, 10 000 at most. |
+| `SCRATCH_DIR` | `/cache` | Where GOP files go. den-remux's alone: every `s-*` directory in it is deleted at start. Stable probe metadata and unplayable verdicts persist here without credentials. |
 | `SCRATCH_MAX_BYTES` | `1073741824` | Cap across sessions; past it a job pauses once the requested segment is done (min 64 MiB). |
 | `FFMPEG_PATH` | `ffmpeg` | The image sets `/usr/local/bin/ffmpeg`. (There is no `FFPROBE_PATH`: probing is done in-process.) |
-| `MAX_TRANSCODES` | `1` | Sessions transcoding on the GPU at once; `0` turns transcoding off. Copies do not count. |
+| `MAX_TRANSCODES` | `1` | Active producers transcoding on the GPU at once; `0` turns transcoding off. Copies do not count. |
 | `VAAPI_DEVICE` | `/dev/dri/renderD128` | The GPU's render node. Transcoding is on only when it exists and ffmpeg has the VAAPI encoder and filters (the startup line says `transcode=vaapi(max N)` or `off`). |
 | `TRUSTED_PROXIES` | — | Proxy IPs (comma-separated) whose `X-Forwarded-For` names the visitor, for the limit on logins and new sessions: `tailscale serve`'s host. |
 | `WEB_ORIGINS` | — | Pages on another origin that may log in and start sessions (comma-separated): the Den web app on its public name. Session files are readable from anywhere already. |
@@ -389,15 +397,16 @@ A browser key and its hash: `key=$(head -c 24 /dev/urandom | base64 | tr '+/' '-
 `scratch_unwritable`, `scout_unconfigured` (neither `SCOUT_ORIGINS` nor `SCOUT_INSTALL_URL`),
 `scout_key_missing`, `url_key_ephemeral`.
 
-`/metrics` (gauges and counters prefixed `remux_`): sessions and the cap, ffmpeg processes alive, scratch
-bytes and the cap, transcodes and their cap (0 when off), sessions and ffmpeg runs started. The log is state changes: the startup line, one line
+`/metrics` (gauges and counters prefixed `remux_`): sessions and their cap, active/waiting producers and their cap,
+ffmpeg processes alive, scratch bytes and its cap, GPU producers and their cap, upstream bytes requested/consumed/
+abandoned, and session/run totals. The log is state changes: the startup line, one line
 per session start and end (with the reason: `idle`, `expired`, `deleted`, `replaced`, `shutdown`), a
 failed ffmpeg run's last stderr line (scrubbed), and rate-limited upstream failures.
 
 ffmpeg is built from a checksummed source tarball (`FFMPEG_VERSION`/`FFMPEG_SHA256` in the Dockerfile);
 dependabot cannot bump it, so bump both lines by hand.
 
-## Limits (MVP)
+## Limits
 
 - **Cached releases only** (an uncached one would start a debrid download).
 - **H.264, HEVC, AV1 and VP9 sources only.** AV1 and VP9 play only as a copy, for a player whose `playable` says it
@@ -453,8 +462,8 @@ audio and subtitles are unchanged.
   on to this one with the node's group (a drop-in written only where the device exists).
 - **A cap of its own.** The iGPU is shared with the camera stack (Frigate/Scrypted), and Incus has no GPU
   priority — `/dev/dri` is first come, first served. So transcodes are capped inside den-remux:
-  `MAX_TRANSCODES` (default 1), separate from `MAX_SESSIONS`; copies do not count against it, and an ended
-  session gives its transcode back at once.
+  `MAX_TRANSCODES` (default 1), separate from `MAX_ACTIVE_REMUXES`; copies do not count against it, and a stopped
+  producer gives the GPU back at once while its logical session remains resumable.
 - **Tested** by the flags (`job.rs`) and the slot (`tests.rs`) here, and on the box's GPU by hand: CI has no
   GPU.
 
