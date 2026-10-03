@@ -115,6 +115,15 @@ pub struct Requested {
     pub why: String,
 }
 
+/// How long `create` took in each of its stretches (den-edge#234's step 0, the `Server-Timing` header on the 201):
+/// scout's list ("resolve"), and picking a release from it ("open", with how many were tried). Measured so the
+/// wait a slow release shows can be read back from a real session rather than guessed at.
+pub struct Timing {
+    pub resolve_ms: u64,
+    pub open_ms: u64,
+    pub tried: usize,
+}
+
 #[derive(Clone, Debug)]
 pub struct Gop {
     pub job: u32,
@@ -1980,7 +1989,7 @@ pub async fn create(
     admission: Admission,
     want: &Want<'_>,
     public: bool,
-) -> Result<Arc<Session>, ApiError> {
+) -> Result<(Arc<Session>, Timing), ApiError> {
     let imdb = want.id;
     let base = scout_base(st, want.scout)?;
     let by_install = !matches!(admission, Admission::Browser(_));
@@ -2033,7 +2042,11 @@ pub async fn create(
         ),
     })?;
     let secrets = [source.base.as_str()];
+    // Timed for the `Server-Timing` header on the 201 (den-edge#234's step 0): how long scout's list took
+    // ("resolve"), and how long picking a release from it took ("open", with how many were tried).
+    let resolve_started = Instant::now();
     let list = scout_list(st, &source, imdb, by_install, want.playable).await?;
+    let resolve_ms = resolve_started.elapsed().as_millis() as u64;
     let candidates = scout::candidates(
         &list,
         want.filename,
@@ -2103,7 +2116,7 @@ pub async fn create(
     let named_first = usize::from(ranked.first().is_some_and(|(_, c)| want.filename == Some(c.filename())));
     ranked[named_first..].sort_by_key(|(f, _)| *f);
     let mut no_transcode = false;
-    let (mut chosen, fallback, mut too_big) = {
+    let (mut chosen, fallback, mut too_big, open_ms, tried) = {
         let source = &source;
         let started = Instant::now();
         let mut queue = ranked.into_iter().peekable();
@@ -2218,7 +2231,7 @@ pub async fn create(
                 }
             }
         }
-        (chosen, fallback, too_big)
+        (chosen, fallback, too_big, started.elapsed().as_millis() as u64, tried)
     };
     // Nothing plays as it is with a head start of `MAX_PREBUFFER` or less. What comes next, in order: a copy that asks
     // at most `LONG_PREBUFFER` of it, a transcode, the copy that starves least — and else a refusal, up front, which a
@@ -2541,7 +2554,7 @@ pub async fn create(
         },
     );
     tokio::spawn(supervise(st.clone(), session.clone()));
-    Ok(session)
+    Ok((session, Timing { resolve_ms, open_ms, tried }))
 }
 
 /// The one task per session: tick while ffmpeg runs, sleep otherwise, and end the session when it

@@ -42,7 +42,7 @@ use std::convert::Infallible;
 use std::future::Future;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use http_body_util::BodyExt;
@@ -276,9 +276,20 @@ where
     ) {
         if let Some(origin) = web_origin(&state, &parts.headers) {
             resp.headers_mut().insert("access-control-allow-origin", origin);
+            // `/remux/session`'s `Server-Timing` too (den-edge#234's step 0): a cross-origin `fetch` can only read
+            // a response header this lists, and den-remux is cross-origin from the page on every deployment but
+            // the dev server's.
             resp.headers_mut().insert(
                 "access-control-expose-headers",
-                hyper::header::HeaderValue::from_static(auth::BROWSER_TOKEN_HEADER),
+                if parts.uri.path() == "/remux/session" {
+                    hyper::header::HeaderValue::from_str(&format!(
+                        "{}, Server-Timing",
+                        auth::BROWSER_TOKEN_HEADER
+                    ))
+                    .expect("a fixed ASCII header-name list is always a valid header value")
+                } else {
+                    hyper::header::HeaderValue::from_static(auth::BROWSER_TOKEN_HEADER)
+                },
             );
         }
         resp.headers_mut().append("vary", hyper::header::HeaderValue::from_static("origin"));
@@ -795,69 +806,84 @@ where
     let public = public_session_request(state, parts);
     let created = session::create(state, admission, &want, public).await;
     // Apple's players give up on an init.mp4 that takes more than about five seconds; hls.js doesn't need this.
-    if let (Ok(s), Some("native")) = (&created, req.player.as_deref()) {
+    // Timed too, for the `Server-Timing` header below (den-edge#234's step 0).
+    let mut init_ms: Option<u64> = None;
+    if let (Ok((s, _)), Some("native")) = (&created, req.player.as_deref()) {
+        let started = Instant::now();
         s.prepare(state).await;
+        init_ms = Some(started.elapsed().as_millis() as u64);
     }
     match created {
-        Ok(s) => httputil::json(
-            StatusCode::CREATED,
-            &serde_json::json!({
-                // What is playing, which a converted release is not what its name says: the size it came down to,
-                // and whether its colours were tone-mapped to SDR.
-                "video": {
-                    "codec": match (s.transcoded, &s.info.video) {
-                        (false, probe::VideoCodec::Hevc) => "hevc",
-                        (false, probe::VideoCodec::Av1) => "av1",
-                        (false, probe::VideoCodec::Vp9) => "vp9",
-                        _ => "h264",
+        Ok((s, timing)) => {
+            // den-edge#234's step 0: measure first, before writing the web client's copy. `timing-allow-origin`
+            // is already sent (`add_cors`), so a cross-origin page can read this too.
+            let server_timing = format!(
+                "resolve;dur={},open;dur={};desc=\"{} tried\"{}",
+                timing.resolve_ms,
+                timing.open_ms,
+                timing.tried,
+                init_ms.map(|ms| format!(",init;dur={ms}")).unwrap_or_default(),
+            );
+            httputil::json(
+                StatusCode::CREATED,
+                &serde_json::json!({
+                    // What is playing, which a converted release is not what its name says: the size it came down to,
+                    // and whether its colours were tone-mapped to SDR.
+                    "video": {
+                        "codec": match (s.transcoded, &s.info.video) {
+                            (false, probe::VideoCodec::Hevc) => "hevc",
+                            (false, probe::VideoCodec::Av1) => "av1",
+                            (false, probe::VideoCodec::Vp9) => "vp9",
+                            _ => "h264",
+                        },
+                        "transcoded": s.transcoded,
+                        "width": played(&s).0,
+                        "height": played(&s).1,
+                        "tonemapped": s.transcoded && session::tonemaps(&s.info),
                     },
-                    "transcoded": s.transcoded,
-                    "width": played(&s).0,
-                    "height": played(&s).1,
-                    "tonemapped": s.transcoded && session::tonemaps(&s.info),
-                },
-                "sid": s.sid,
-                "playlist": format!("/remux/s/{}/{}/master.m3u8", s.sid, s.sig),
-                "speed": format!("/remux/s/{}/{}/speed", s.sid, s.sig),
-                // `requested`: the release the player named, when another was played, and why it was passed over.
-                "release": {
-                    "label": s.release.label,
-                    "filename": s.release.filename,
-                    "size": s.release.size,
-                    "requested": s.release.requested.as_ref().map(|r| serde_json::json!({
-                        "filename": r.filename,
-                        "why": r.why,
-                    })),
-                },
-                "duration": s.info.duration,
-                // Seconds to buffer before playing, on the link the player named, so a copy then plays through
-                // without running dry; null where that isn't known.
-                "prebuffer": s.prebuffer.map(|p| (p * 10.0).ceil() / 10.0),
-                // What a copy needs of a link, bits a second, to start within 10 s and never run dry — and each
-                // segment's `[start, bytes]` as the session sends it, from which a player can work that out again at
-                // the rate it is getting.
-                "need": s.need.map(|n| n.bitrate),
-                "segments": s.demand.as_ref().map(|d| d.iter()
-                    .map(|(start, bytes)| serde_json::json!([(start * 1000.0).round() / 1000.0, bytes]))
-                    .collect::<Vec<_>>()),
-                "expiresAt": s.exp,
-                "audioTrack": s.audio,
-                // The channels the session's audio carries, beside the track's own in `audioTracks`: fewer is a
-                // conversion to stereo.
-                "audioChannels": s.audio_channels,
-                "audioTracks":s.info.audio.iter().map(|a| serde_json::json!({
-                    "language": a.language,
-                    "name": a.name,
-                    "channels": a.channels,
-                    "commentary": a.commentary,
-                })).collect::<Vec<_>>(),
-                "subtitles": s.renditions.iter().map(|r| serde_json::json!({
-                    "language": r.lang,
-                    "name": lang::name(&r.lang),
-                })).collect::<Vec<_>>(),
-            }),
-            &[],
-        ),
+                    "sid": s.sid,
+                    "playlist": format!("/remux/s/{}/{}/master.m3u8", s.sid, s.sig),
+                    "speed": format!("/remux/s/{}/{}/speed", s.sid, s.sig),
+                    // `requested`: the release the player named, when another was played, and why it was passed over.
+                    "release": {
+                        "label": s.release.label,
+                        "filename": s.release.filename,
+                        "size": s.release.size,
+                        "requested": s.release.requested.as_ref().map(|r| serde_json::json!({
+                            "filename": r.filename,
+                            "why": r.why,
+                        })),
+                    },
+                    "duration": s.info.duration,
+                    // Seconds to buffer before playing, on the link the player named, so a copy then plays through
+                    // without running dry; null where that isn't known.
+                    "prebuffer": s.prebuffer.map(|p| (p * 10.0).ceil() / 10.0),
+                    // What a copy needs of a link, bits a second, to start within 10 s and never run dry — and each
+                    // segment's `[start, bytes]` as the session sends it, from which a player can work that out again at
+                    // the rate it is getting.
+                    "need": s.need.map(|n| n.bitrate),
+                    "segments": s.demand.as_ref().map(|d| d.iter()
+                        .map(|(start, bytes)| serde_json::json!([(start * 1000.0).round() / 1000.0, bytes]))
+                        .collect::<Vec<_>>()),
+                    "expiresAt": s.exp,
+                    "audioTrack": s.audio,
+                    // The channels the session's audio carries, beside the track's own in `audioTracks`: fewer is a
+                    // conversion to stereo.
+                    "audioChannels": s.audio_channels,
+                    "audioTracks":s.info.audio.iter().map(|a| serde_json::json!({
+                        "language": a.language,
+                        "name": a.name,
+                        "channels": a.channels,
+                        "commentary": a.commentary,
+                    })).collect::<Vec<_>>(),
+                    "subtitles": s.renditions.iter().map(|r| serde_json::json!({
+                        "language": r.lang,
+                        "name": lang::name(&r.lang),
+                    })).collect::<Vec<_>>(),
+                }),
+                &[("server-timing", server_timing.as_str())],
+            )
+        }
         Err(e) => httputil::error(e.status, e.code, &e.detail),
     }
 }
