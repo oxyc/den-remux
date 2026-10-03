@@ -717,6 +717,10 @@ async fn end_to_end(
     };
     let r = call(&state, "POST", "/remux/session", Some(&cookie), &body).await;
     assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    // den-edge#234's step 0: resolve and open, timed, so a slow start can be read back from a real session.
+    let timing = r.headers["server-timing"].to_str().unwrap().to_string();
+    assert!(timing.contains("resolve;dur="), "{timing}");
+    assert!(timing.contains("open;dur=") && timing.contains("tried\""), "{timing}");
     let created = r.json();
     let playlist = created["playlist"].as_str().unwrap().to_string();
     let base = playlist.trim_end_matches("master.m3u8").to_string();
