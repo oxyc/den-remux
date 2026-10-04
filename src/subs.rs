@@ -98,14 +98,25 @@ pub(crate) fn own_wins(own: &SubtitleTrack, den: Option<&Entry>, dub: bool) -> b
 }
 
 /// The index of the best of `tracks`' own candidates in `lang`, for a session whose audio is `audio_lang` — or
-/// `None` when the release has no text track in `lang` at all. Ties (two tracks at the same tier) keep the
-/// lower index, so an earlier track is not displaced by a later one that ranks no better.
+/// `None` when the release has no USABLE text track in `lang`. Ties (two tracks at the same tier) keep the lower
+/// index, so an earlier track is not displaced by a later one that ranks no better.
+///
+/// Outside a dub context, a forced/foreign-parts-only track is never a candidate at all — not even as a last
+/// resort when it is the only track in its language. Offered plain, it captions only the foreign-language parts,
+/// which over an otherwise-single-language film reads as "barely any subtitles", not "some subtitles": exactly
+/// the Fauda complaint this fix started from, just aimed at the release's own track instead of a downloaded one.
+/// A forced track is only ever right where the dub it accompanies supplies the rest — `own_wins` still applies
+/// `in_context` to rank it against den-subtitles' candidate once it IS one.
 fn best_own(tracks: &[SubtitleTrack], lang: &str, audio_lang: Option<&str>) -> Option<usize> {
     let dub = audio_lang == Some(lang);
     tracks
         .iter()
         .enumerate()
-        .filter(|(_, t)| t.text && t.language.as_deref().map(crate::lang::canonical).as_deref() == Some(lang))
+        .filter(|(_, t)| {
+            t.text
+                && t.language.as_deref().map(crate::lang::canonical).as_deref() == Some(lang)
+                && (dub || !t.forced)
+        })
         .min_by_key(|(_, t)| in_context(own_tier(t), dub))
         .map(|(n, _)| n)
 }
@@ -169,10 +180,14 @@ fn explain_track(
         Some(_) if !t.text => "dropped (bitmap, can't become WebVTT)".to_string(),
         Some(l) => match best_own(tracks, l, audio_lang) {
             Some(best_n) if best_n != n => format!("dropped (track {best_n} ranks higher for {l})"),
-            _ if renditions.iter().any(|r| r.own == Some(n)) => format!("offered as {l}"),
+            Some(_) if renditions.iter().any(|r| r.own == Some(n)) => format!("offered as {l}"),
             // Kept by `plan()`'s own-candidate pass but not turned into a Rendition: not among
             // the browser's requested languages, or `MAX_LANGUAGES` was already spent on others.
-            _ => format!("kept as a candidate for {l}, not used this session"),
+            Some(_) => format!("kept as a candidate for {l}, not used this session"),
+            // `best_own` excludes every candidate: this track, forced, is the only one in `l`, and the
+            // session's audio is not a dub in `l` — offered plain it would caption only the foreign-
+            // language parts, near-empty over an otherwise-single-language film.
+            None => format!("dropped (forced, and the session's audio is not a dub in {l})"),
         },
     };
     let flags: Vec<&str> =
@@ -510,13 +525,13 @@ mod tests {
         let named = ["fi".to_string(), "de".to_string()];
         // No den-subtitles: only what the release has, the languages asked for first, then its others.
         // Bitmap and unlabelled tracks make no rendition, and a language with two full tracks takes the
-        // first. Swedish's only own track is forced — with no better candidate, it is still "every usable
-        // track selectable": offered as a last resort, rather than invisible the way it was before.
+        // first. Swedish's only own track is forced, and nothing here names the audio as a Swedish dub,
+        // so it is no rendition at all — offered plain it would caption only the foreign-language parts,
+        // which over an otherwise-single-language film reads as "barely any subtitles".
         assert_eq!(
             plan(&named, false, &tracks, None),
             [
                 Rendition { lang: "fi".into(), den: false, own: Some(2) },
-                Rendition { lang: "sv".into(), den: false, own: Some(1) },
                 Rendition { lang: "en".into(), den: false, own: Some(3) },
             ]
         );
@@ -527,7 +542,6 @@ mod tests {
             [
                 Rendition { lang: "fi".into(), den: true, own: Some(2) },
                 Rendition { lang: "de".into(), den: true, own: None },
-                Rendition { lang: "sv".into(), den: false, own: Some(1) },
                 Rendition { lang: "en".into(), den: false, own: Some(3) },
             ]
         );
@@ -631,6 +645,26 @@ mod tests {
             plan(&requested, false, &tracks, Some("en")),
             [Rendition { lang: "en".into(), den: false, own: Some(1) }]
         );
+    }
+
+    /// A forced track is never a rendition's own candidate outside a dub context, even when it is the
+    /// only track its language has at all — the regression a Docker e2e run caught: a release's forced
+    /// Swedish track, with English audio, must stay invisible rather than surface as near-empty "Swedish"
+    /// subtitles (captioning only the foreign-language parts of an otherwise all-English film). The same
+    /// forced track, in a dub context for its own language, is the right default.
+    #[test]
+    fn a_sole_forced_track_is_offered_only_in_its_own_dub_context() {
+        let swedish = [track("S_TEXT/UTF8", Some("swe"), true, true)];
+        let requested = ["sv".to_string()];
+        // English audio: not a Swedish dub. The forced Swedish track is no candidate at all.
+        assert!(plan(&requested, false, &swedish, Some("en")).is_empty());
+        assert_eq!(best_own(&swedish, "sv", Some("en")), None);
+        // A Swedish dub: now it's the only, and therefore the default, candidate.
+        assert_eq!(
+            plan(&requested, false, &swedish, Some("sv")),
+            [Rendition { lang: "sv".into(), den: false, own: Some(0) }]
+        );
+        assert_eq!(best_own(&swedish, "sv", Some("sv")), Some(0));
     }
 
     /// A plain, unflagged den-subtitles entry — not marked foreign-parts-only or dubbed.
