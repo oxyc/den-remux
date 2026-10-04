@@ -49,17 +49,89 @@ pub struct Rendition {
     pub own: Option<usize>,
 }
 
-/// The renditions of a session, most wanted first: each language the browser named that den-subtitles can be asked for
-/// or the release carries, then the release's other languages. A full track of its language only — never one flagged
-/// forced (foreign-language parts), a bitmap, or one that names no language, which cannot be labelled.
-pub fn plan(requested: &[String], den: bool, tracks: &[SubtitleTrack]) -> Vec<Rendition> {
+/// A full track, read start to end: the best a track of a language can be, when the session's audio is in some
+/// other language and the viewer needs the whole dialogue translated.
+pub(crate) const FULL_TIER: u8 = 0;
+/// SDH: a full track plus sound descriptions. Ranked the same whichever language the audio is in — it is still a
+/// full track, just one also meant for a deaf or hard-of-hearing viewer.
+const SDH_TIER: u8 = 1;
+/// Forced, or foreign-parts-only: cues only over whatever is NOT in the session's own audio language. The best a
+/// track can be when the audio is a dub in this very language, where a full track would just repeat it.
+pub(crate) const FORCED_TIER: u8 = 2;
+
+/// A release's own track, before any audio-aware reordering: mirrors the Apple TV's `subtitleRank` (full, then
+/// SDH, then forced).
+pub(crate) fn own_tier(t: &SubtitleTrack) -> u8 {
+    match (t.forced, t.hearing_impaired) {
+        (true, _) => FORCED_TIER,
+        (false, true) => SDH_TIER,
+        (false, false) => FULL_TIER,
+    }
+}
+
+/// `tier`, read in the session's audio context. `dub` is whether the session's audio is itself a dub in the
+/// track's own language — not the title's original language, which this never learns: a subtitle in the same
+/// language the audio is already spoken in is either a dub's captions (where only the untranslated, forced parts
+/// are wanted) or a same-language accessibility track over original audio (where the full track is wanted and
+/// there usually is no forced alternative to confuse it with). Only the full/forced ends swap; SDH sits in the
+/// middle either way, since it is a full track regardless of context.
+pub(crate) fn in_context(tier: u8, dub: bool) -> u8 {
+    if dub {
+        FORCED_TIER - tier
+    } else {
+        tier
+    }
+}
+
+/// Does the release's own track win rendition `n`'s playlist over den-subtitles' best candidate, given whether
+/// the session's audio is a dub in this language? Own wins ties: it is official, already in sync, and costs no
+/// download, so den-subtitles only overrides it when den's candidate ranks strictly better here — e.g. the
+/// release's only own track is forced/foreign-parts-only but the audio is not a dub, so a full download wins, or
+/// the audio IS a dub and den's listed candidate is flagged foreign-parts-only/looks-dubbed while the release's
+/// own track is a full one, so the flagged download — a better fit for a dub — wins instead.
+pub(crate) fn own_wins(own: &SubtitleTrack, den: Option<&Entry>, dub: bool) -> bool {
+    let own_rank = in_context(own_tier(own), dub);
+    match den {
+        Some(e) => own_rank <= in_context(e.tier(), dub),
+        None => true,
+    }
+}
+
+/// The index of the best of `tracks`' own candidates in `lang`, for a session whose audio is `audio_lang` — or
+/// `None` when the release has no text track in `lang` at all. Ties (two tracks at the same tier) keep the
+/// lower index, so an earlier track is not displaced by a later one that ranks no better.
+fn best_own(tracks: &[SubtitleTrack], lang: &str, audio_lang: Option<&str>) -> Option<usize> {
+    let dub = audio_lang == Some(lang);
+    tracks
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| t.text && t.language.as_deref().map(crate::lang::canonical).as_deref() == Some(lang))
+        .min_by_key(|(_, t)| in_context(own_tier(t), dub))
+        .map(|(n, _)| n)
+}
+
+/// The renditions of a session, most wanted first: each language the browser named that den-subtitles can be
+/// asked for or the release carries, then the release's other languages. A bitmap track, or one that names no
+/// language, is never offered. `audio_lang` is the session's own selected audio language (`lang::canonical`),
+/// which decides which of a language's own tracks — full, SDH, or forced/foreign-parts-only — is the best one:
+/// see `in_context`. The pick here is provisional where den-subtitles is also asked (`den: true`): whether it
+/// actually plays over a downloaded file is `Session::subtitle_playlist`'s call, made with den-subtitles' own
+/// answer in hand.
+pub fn plan(
+    requested: &[String],
+    den: bool,
+    tracks: &[SubtitleTrack],
+    audio_lang: Option<&str>,
+) -> Vec<Rendition> {
     let mut own: Vec<(String, usize)> = Vec::new();
-    for (n, t) in tracks.iter().enumerate() {
+    for t in tracks {
         let Some(lang) = t.language.as_deref().map(crate::lang::canonical).filter(|l| !l.is_empty()) else {
             continue;
         };
-        if t.text && !t.forced && !own.iter().any(|(l, _)| *l == lang) {
-            own.push((lang, n));
+        if t.text && !own.iter().any(|(l, _)| *l == lang) {
+            if let Some(n) = best_own(tracks, &lang, audio_lang) {
+                own.push((lang, n));
+            }
         }
     }
     let found = |lang: &str| own.iter().find(|(l, _)| l == lang).map(|(_, n)| *n);
@@ -82,32 +154,26 @@ pub fn plan(requested: &[String], den: bool, tracks: &[SubtitleTrack]) -> Vec<Re
 /// Why `plan()` offered or dropped the release's subtitle track `n` — never part of the decision
 /// itself, only an account of it, so a report of "subtitles are missing/wrong" can be answered from
 /// the next session's log instead of needing the file: whether this release even HAS an embedded
-/// full track in the reported language, and if it does, why it wasn't the one served. Mirrors
-/// `plan()`'s own filter order (language tag, then text/bitmap, then forced, then "first same-language
-/// track wins") textually, so the two stay easy to audit against each other by eye.
-fn explain_track(tracks: &[SubtitleTrack], n: usize, renditions: &[Rendition]) -> String {
+/// full track in the reported language, and if it does, why it wasn't the one served. Calls `plan()`'s
+/// own `best_own` rather than re-deriving the same rule by eye, so the two can never drift apart.
+fn explain_track(
+    tracks: &[SubtitleTrack],
+    n: usize,
+    renditions: &[Rendition],
+    audio_lang: Option<&str>,
+) -> String {
     let t = &tracks[n];
     let lang = t.language.as_deref().map(crate::lang::canonical).filter(|l| !l.is_empty());
     let reason = match &lang {
         None => "dropped (no usable language tag)".to_string(),
         Some(_) if !t.text => "dropped (bitmap, can't become WebVTT)".to_string(),
-        Some(_) if t.forced => "dropped (forced)".to_string(),
-        Some(l) => {
-            // The first non-forced text track of this language is the one `plan()` keeps; any later
-            // one of the same language is shadowed by it, never offered.
-            let first = tracks.iter().enumerate().find_map(|(i, u)| {
-                let same_lang =
-                    u.language.as_deref().map(crate::lang::canonical).as_deref() == Some(l.as_str());
-                (u.text && !u.forced && same_lang).then_some(i)
-            });
-            match first {
-                Some(first_n) if first_n != n => format!("dropped (track {first_n} already covers {l})"),
-                _ if renditions.iter().any(|r| r.own == Some(n)) => format!("offered as {l}"),
-                // Kept by `plan()`'s own-candidate pass but not turned into a Rendition: not among
-                // the browser's requested languages, or `MAX_LANGUAGES` was already spent on others.
-                _ => format!("kept as a candidate for {l}, not used this session"),
-            }
-        }
+        Some(l) => match best_own(tracks, l, audio_lang) {
+            Some(best_n) if best_n != n => format!("dropped (track {best_n} ranks higher for {l})"),
+            _ if renditions.iter().any(|r| r.own == Some(n)) => format!("offered as {l}"),
+            // Kept by `plan()`'s own-candidate pass but not turned into a Rendition: not among
+            // the browser's requested languages, or `MAX_LANGUAGES` was already spent on others.
+            _ => format!("kept as a candidate for {l}, not used this session"),
+        },
     };
     let flags: Vec<&str> =
         [t.forced.then_some("forced"), t.default.then_some("default"), t.hearing_impaired.then_some("sdh")]
@@ -125,11 +191,15 @@ fn explain_track(tracks: &[SubtitleTrack], n: usize, renditions: &[Rendition]) -
 
 /// One line, logged once per session: every subtitle stream the release carries — index, language,
 /// codec, disposition flags, title — and why `plan()` offered or dropped each. Never a URL.
-pub fn describe_subtitles(tracks: &[SubtitleTrack], renditions: &[Rendition]) -> String {
+pub fn describe_subtitles(
+    tracks: &[SubtitleTrack],
+    renditions: &[Rendition],
+    audio_lang: Option<&str>,
+) -> String {
     if tracks.is_empty() {
         return "no subtitle tracks".to_string();
     }
-    (0..tracks.len()).map(|n| explain_track(tracks, n, renditions)).collect::<Vec<_>>().join("; ")
+    (0..tracks.len()).map(|n| explain_track(tracks, n, renditions, audio_lang)).collect::<Vec<_>>().join("; ")
 }
 
 /// The subtitle side of a session.
@@ -154,6 +224,28 @@ pub struct Entry {
     pub url: String,
     #[serde(default)]
     pub lang: String,
+    /// OpenSubtitles' own flag: cues only over the OTHER language's dialogue, not a full transcript of this
+    /// one — the muxed `forced` flag's downloaded equivalent.
+    #[serde(default, rename = "foreignPartsOnly")]
+    pub foreign_parts_only: bool,
+    /// den-subtitles' own read of the release string: made for a DUBBED release, so its cues cover only what
+    /// that dub leaves untranslated. Ranked the same as `foreign_parts_only` — both mean "not a full track".
+    #[serde(default, rename = "looksDubbed")]
+    pub looks_dubbed: bool,
+}
+
+impl Entry {
+    /// This entry, read the same way a release's own track is: `FORCED_TIER` when it covers only part of the
+    /// dialogue (either flag), else `FULL_TIER` — den-subtitles has no SDH signal to offer, so there is no
+    /// middle tier for a downloaded file. `in_context` still applies: the tier flips in a dub context the same
+    /// way an own forced track's does.
+    pub(crate) fn tier(&self) -> u8 {
+        if self.foreign_parts_only || self.looks_dubbed {
+            FORCED_TIER
+        } else {
+            FULL_TIER
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -416,26 +508,30 @@ mod tests {
             track("S_TEXT/UTF8", None, true, false),
         ];
         let named = ["fi".to_string(), "de".to_string()];
-        // No den-subtitles: only what the release has, the languages asked for first, then its others. Forced, bitmap
-        // and unlabelled tracks make no rendition, and a language with two tracks takes the first.
+        // No den-subtitles: only what the release has, the languages asked for first, then its others.
+        // Bitmap and unlabelled tracks make no rendition, and a language with two full tracks takes the
+        // first. Swedish's only own track is forced — with no better candidate, it is still "every usable
+        // track selectable": offered as a last resort, rather than invisible the way it was before.
         assert_eq!(
-            plan(&named, false, &tracks),
+            plan(&named, false, &tracks, None),
             [
                 Rendition { lang: "fi".into(), den: false, own: Some(2) },
+                Rendition { lang: "sv".into(), den: false, own: Some(1) },
                 Rendition { lang: "en".into(), den: false, own: Some(3) },
             ]
         );
         // With it, every language asked for is a rendition — den-subtitles may have it — and the release's own track is
         // its fallback where there is one.
         assert_eq!(
-            plan(&named, true, &tracks),
+            plan(&named, true, &tracks, None),
             [
                 Rendition { lang: "fi".into(), den: true, own: Some(2) },
                 Rendition { lang: "de".into(), den: true, own: None },
+                Rendition { lang: "sv".into(), den: false, own: Some(1) },
                 Rendition { lang: "en".into(), den: false, own: Some(3) },
             ]
         );
-        assert!(plan(&[], false, &[track("S_HDMV/PGS", Some("eng"), false, false)]).is_empty());
+        assert!(plan(&[], false, &[track("S_HDMV/PGS", Some("eng"), false, false)], None).is_empty());
     }
 
     #[test]
@@ -444,7 +540,7 @@ mod tests {
             .iter()
             .map(|l| track("S_TEXT/UTF8", Some(l), true, false))
             .collect();
-        assert_eq!(plan(&[], false, &tracks).len(), MAX_LANGUAGES);
+        assert_eq!(plan(&[], false, &tracks, None).len(), MAX_LANGUAGES);
     }
 
     /// `describe_subtitles`'s account of each track must agree with what `plan()` actually decided —
@@ -465,41 +561,146 @@ mod tests {
             track("S_TEXT/UTF8", Some("eng"), true, false), // 5: ...the full English track
         ];
         let requested = ["en".to_string()];
-        let renditions = plan(&requested, false, &tracks);
-        // `plan()`'s own, pre-existing "first same-language track wins" rule means the SDH track at
-        // 4 is what got offered — the full track at 5 is shadowed by it. That is itself a real,
-        // separate gap (no SDH-vs-full preference, unlike the audio side's `commentary` demotion) —
-        // not fixed here, but the log must say so truthfully, not claim 5 was offered when it wasn't.
-        // Hebrew (track 1) rides along too: `plan()` offers every own-track language, not only the
-        // requested one, when nothing asked for den-subtitles.
+        // No audio language known: neither Hebrew nor English is a dub-in-its-own-language context, so the
+        // plain full-over-SDH-over-forced order applies throughout.
+        let renditions = plan(&requested, false, &tracks, None);
+        // The full track at 5 now correctly beats the SDH track at 4 (`own_tier`/`best_own`), and the full
+        // Hebrew track at 1 beats the forced one at 0 — track order no longer decides it. Hebrew rides
+        // along too: `plan()` offers every own-track language, not only the requested one, when nothing
+        // asked for den-subtitles.
         assert_eq!(
             renditions,
             [
-                Rendition { lang: "en".into(), den: false, own: Some(4) },
+                Rendition { lang: "en".into(), den: false, own: Some(5) },
                 Rendition { lang: "he".into(), den: false, own: Some(1) },
             ]
         );
 
-        let desc = describe_subtitles(&tracks, &renditions);
+        let desc = describe_subtitles(&tracks, &renditions, None);
         assert!(desc.contains("0 lang=he codec=S_TEXT/UTF8 [forced,default]"), "{desc}");
-        assert!(desc.contains("dropped (forced)"), "{desc}");
+        assert!(desc.contains("dropped (track 1 ranks higher for he)"), "{desc}");
         assert!(desc.contains("1 lang=he") && desc.contains("-> offered as he"), "{desc}");
         assert!(desc.contains("2 lang=en") && desc.contains("bitmap, can't become WebVTT"), "{desc}");
         assert!(desc.contains("3 lang=und") && desc.contains("no usable language tag"), "{desc}");
         assert!(
             desc.contains("4 lang=en codec=S_TEXT/UTF8 [default,sdh] title=\"English [SDH]\"")
-                && desc.contains("-> offered as en"),
-            "{desc}"
+                && desc.contains("dropped (track 5 ranks higher for en)"),
+            "the SDH track must lose to the full one, not shadow it by listing order: {desc}"
         );
-        assert!(
-            desc.contains("5 lang=en") && desc.contains("dropped (track 4 already covers en)"),
-            "the full English track's fate must be stated, not silently omitted: {desc}"
-        );
+        assert!(desc.contains("5 lang=en") && desc.contains("-> offered as en"), "{desc}");
     }
 
     #[test]
     fn describe_subtitles_says_so_when_there_are_none() {
-        assert_eq!(describe_subtitles(&[], &[]), "no subtitle tracks");
+        assert_eq!(describe_subtitles(&[], &[], None), "no subtitle tracks");
+    }
+
+    /// Mirrors the Apple TV's `subtitleRank`: within one language's own tracks, a full track wins over an
+    /// SDH one whatever order they are listed in the file — not "the first non-forced track wins", which let
+    /// an SDH track hide a full one listed after it.
+    #[test]
+    fn own_tracks_rank_full_over_sdh_whatever_order_they_are_listed() {
+        let tracks = [
+            SubtitleTrack { hearing_impaired: true, ..track("S_TEXT/UTF8", Some("eng"), true, false) }, // 0: SDH, listed first
+            track("S_TEXT/UTF8", Some("eng"), true, false), // 1: full, listed second
+        ];
+        let requested = ["en".to_string()];
+        assert_eq!(
+            plan(&requested, false, &tracks, None),
+            [Rendition { lang: "en".into(), den: false, own: Some(1) }]
+        );
+    }
+
+    /// Rule: when the session's audio is a dub in the subtitle's own language, a forced/foreign-parts own
+    /// track is the right default instead of a full one — it captions only what the dub leaves
+    /// untranslated, where a full track would duplicate the spoken dialogue.
+    #[test]
+    fn a_dub_in_the_subtitle_s_own_language_prefers_the_forced_track() {
+        let tracks = [
+            track("S_TEXT/UTF8", Some("eng"), true, false), // 0: full English
+            track("S_TEXT/UTF8", Some("eng"), true, true),  // 1: forced English
+        ];
+        let requested = ["en".to_string()];
+        // Without a dub context, full still wins, same as any other language.
+        assert_eq!(
+            plan(&requested, false, &tracks, None),
+            [Rendition { lang: "en".into(), den: false, own: Some(0) }]
+        );
+        // The session's own audio is an English dub: forced is now the better own candidate.
+        assert_eq!(
+            plan(&requested, false, &tracks, Some("en")),
+            [Rendition { lang: "en".into(), den: false, own: Some(1) }]
+        );
+    }
+
+    /// A plain, unflagged den-subtitles entry — not marked foreign-parts-only or dubbed.
+    fn den_entry(lang: &str) -> Entry {
+        Entry {
+            url: "http://s/subtitle/1.srt".into(),
+            lang: lang.into(),
+            foreign_parts_only: false,
+            looks_dubbed: false,
+        }
+    }
+
+    /// `Session::subtitle_playlist`'s own-vs-downloaded call, as the five scenarios this fix targets (the Fauda
+    /// report: a guest's English subtitles, downloaded for a dubbed release, were missing whole scenes).
+    mod own_wins_tests {
+        use super::*;
+
+        /// An English-audio release with its own full English track plus a plain den-subtitles English file:
+        /// the own track is the default — it costs no download and is already in sync, so it wins the tie.
+        #[test]
+        fn an_own_full_track_beats_a_plain_download() {
+            let own = track("S_TEXT/UTF8", Some("eng"), true, false);
+            assert!(own_wins(&own, Some(&den_entry("en")), true));
+        }
+
+        /// Hebrew audio with a full own English track and a den-subtitles file flagged foreign-parts-only: full
+        /// is the default. The audio is not a dub in English, so the full track is what's needed — the
+        /// foreign-parts file would miss whatever the Hebrew dialogue says.
+        #[test]
+        fn a_full_own_track_beats_a_foreign_parts_download_when_the_audio_is_not_its_dub() {
+            let own = track("S_TEXT/UTF8", Some("eng"), true, false);
+            let partial = Entry { foreign_parts_only: true, ..den_entry("en") };
+            assert!(own_wins(&own, Some(&partial), false));
+        }
+
+        /// English dub audio with an own forced English track, against a plain (unflagged) den-subtitles
+        /// download: forced is the default. The dub already speaks the dialogue; a full track, own or
+        /// downloaded, would duplicate it, so the forced track — captioning only what the dub leaves
+        /// untranslated — wins even over a download that out-tiers it in every other context.
+        #[test]
+        fn an_own_forced_track_beats_a_full_download_when_the_audio_is_its_dub() {
+            let own = track("S_TEXT/UTF8", Some("eng"), true, true);
+            assert!(own_wins(&own, Some(&den_entry("en")), true));
+        }
+
+        /// A release with no own English track at all: den-subtitles is used — there is no own candidate for
+        /// `own_wins` to call, and `plan()` never puts one in a `Rendition` to call it with.
+        #[test]
+        fn no_own_track_means_plan_names_none() {
+            let tracks = [track("S_HDMV/PGS", Some("eng"), false, false)];
+            let requested = ["en".to_string()];
+            assert_eq!(
+                plan(&requested, true, &tracks, None),
+                [Rendition { lang: "en".into(), den: true, own: None }]
+            );
+        }
+
+        /// A den-subtitles file flagged foreign-parts-only or looks-dubbed never beats a full own track when the
+        /// audio isn't a dub in that language, however the own track's tier would otherwise compare — the whole
+        /// point of carrying the flags through from den-subtitles#15.
+        #[test]
+        fn a_flagged_download_never_beats_a_full_own_track_outside_a_dub_context() {
+            let own = track("S_TEXT/UTF8", Some("eng"), true, false);
+            for partial in [
+                Entry { foreign_parts_only: true, ..den_entry("en") },
+                Entry { looks_dubbed: true, ..den_entry("en") },
+            ] {
+                assert!(own_wins(&own, Some(&partial), false));
+            }
+        }
     }
 
     #[test]

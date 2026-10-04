@@ -2413,9 +2413,12 @@ async fn a_subtitle_that_failed_once_is_tried_again() {
     state.end_all("test").await;
 }
 
-/// A release that carries its own text subtitles offers them: a language den-subtitles has nothing in is the release's
-/// track, cut per video segment; one den-subtitles has stays its one document; and the release's other languages are
-/// offered with no den-subtitles or language named at all. Forced tracks are never a rendition.
+/// A release that carries its own text subtitles offers them: a language den-subtitles has nothing in is the
+/// release's track, cut per video segment, and so is English — the release's own English track wins its tie with
+/// den-subtitles' (the session's audio is English too, but den's listed file is a plain, unflagged one, so there
+/// is no forced/foreign-parts reason to prefer it; own costs no download and is already in sync). Swedish's only
+/// own track is forced, but with no better Swedish candidate at all it is still offered — "every usable track
+/// selectable" — rather than invisible.
 #[tokio::test]
 async fn a_release_offers_its_own_subtitles_where_den_subtitles_has_none() {
     let origin = origin().await;
@@ -2429,23 +2432,41 @@ async fn a_release_offers_its_own_subtitles_where_den_subtitles_has_none() {
     assert_eq!(j["release"]["filename"], "subs.mkv");
     assert_eq!(
         j["subtitles"],
-        serde_json::json!([{"language": "en", "name": "English"}, {"language": "fi", "name": "Finnish"}]),
-        "the forced Swedish track is no rendition"
+        serde_json::json!([
+            {"language": "en", "name": "English"},
+            {"language": "fi", "name": "Finnish"},
+            {"language": "sv", "name": "Swedish"},
+        ]),
+        "Swedish's forced track is a last-resort rendition, not dropped"
     );
     let base = j["playlist"].as_str().unwrap().trim_end_matches("master.m3u8").to_string();
     let master = call(&state, "GET", &format!("{base}master.m3u8"), None, "").await.text();
-    assert!(master.contains("URI=\"sub0.m3u8\"") && master.contains("URI=\"sub1.m3u8\""), "{master}");
-    assert!(!master.contains("URI=\"sub2.m3u8\""), "{master}");
-    let en = call(&state, "GET", &format!("{base}sub0.m3u8"), None, "").await.text();
-    assert!(en.contains("\nsub0.vtt\n") && !en.contains("sub0_0.vtt"), "den-subtitles has English: {en}");
+    assert!(
+        master.contains("URI=\"sub0.m3u8\"")
+            && master.contains("URI=\"sub1.m3u8\"")
+            && master.contains("URI=\"sub2.m3u8\""),
+        "{master}"
+    );
+    let en = call(&state, "GET", &format!("{base}sub0.m3u8"), None, "").await;
+    assert_kept_for_session(&en, j["expiresAt"].as_u64().unwrap(), "sub0.m3u8");
+    let media = call(&state, "GET", &format!("{base}media.m3u8"), None, "").await.text();
+    let en = en.text();
+    for i in 0..extinfs(&media).len() {
+        assert!(en.contains(&format!("\nsub0_{i}.vtt\n")), "the own track wins its tie with den: {en}");
+    }
+    assert!(!en.contains("sub0.vtt"), "{en}");
     let fi = call(&state, "GET", &format!("{base}sub1.m3u8"), None, "").await;
     assert_kept_for_session(&fi, j["expiresAt"].as_u64().unwrap(), "sub1.m3u8");
-    let media = call(&state, "GET", &format!("{base}media.m3u8"), None, "").await.text();
     let fi = fi.text();
     for i in 0..extinfs(&media).len() {
         assert!(fi.contains(&format!("\nsub1_{i}.vtt\n")), "a segment for video segment {i}: {fi}");
     }
     assert!(!fi.contains("sub1.vtt"), "{fi}");
+    // Swedish: nothing den-subtitles was even asked about, so its own forced track is used outright.
+    let sv = call(&state, "GET", &format!("{base}sub2.m3u8"), None, "").await.text();
+    for i in 0..extinfs(&media).len() {
+        assert!(sv.contains(&format!("\nsub2_{i}.vtt\n")), "a segment for video segment {i}: {sv}");
+    }
     state.end_all("test").await;
 
     // Nothing asked for, nothing to ask of: the release's own languages, in its order.
@@ -2453,7 +2474,11 @@ async fn a_release_offers_its_own_subtitles_where_den_subtitles_has_none() {
     assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
     assert_eq!(
         r.json()["subtitles"],
-        serde_json::json!([{"language": "en", "name": "English"}, {"language": "fi", "name": "Finnish"}])
+        serde_json::json!([
+            {"language": "en", "name": "English"},
+            {"language": "fi", "name": "Finnish"},
+            {"language": "sv", "name": "Swedish"},
+        ])
     );
     let base = r.json()["playlist"].as_str().unwrap().trim_end_matches("master.m3u8").to_string();
     let en = call(&state, "GET", &format!("{base}sub0.m3u8"), None, "").await.text();
@@ -2467,7 +2492,7 @@ async fn a_release_offers_its_own_subtitles_where_den_subtitles_has_none() {
         StatusCode::NOT_FOUND
     );
     assert_eq!(
-        call(&state, "GET", &format!("{base}sub2_0.vtt"), None, "").await.status,
+        call(&state, "GET", &format!("{base}sub3_0.vtt"), None, "").await.status,
         StatusCode::NOT_FOUND
     );
     state.end_all("test").await;
