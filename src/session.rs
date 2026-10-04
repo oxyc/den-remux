@@ -2586,6 +2586,14 @@ pub async fn create(
             (None, _) => String::new(),
         },
     );
+    // Answers "does this release have an embedded English track, and why wasn't it used" from the
+    // log alone, on the next report — never a URL, just the release's own subtitle streams and
+    // `plan()`'s verdict on each.
+    eprintln!(
+        "session {}: subtitles: {}",
+        session.short(),
+        crate::subs::describe_subtitles(&session.info.subtitles, &session.renditions)
+    );
     tokio::spawn(supervise(st.clone(), session.clone()));
     Ok((session, Timing { resolve_ms, open_ms, tried }))
 }

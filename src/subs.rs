@@ -79,6 +79,59 @@ pub fn plan(requested: &[String], den: bool, tracks: &[SubtitleTrack]) -> Vec<Re
     out
 }
 
+/// Why `plan()` offered or dropped the release's subtitle track `n` — never part of the decision
+/// itself, only an account of it, so a report of "subtitles are missing/wrong" can be answered from
+/// the next session's log instead of needing the file: whether this release even HAS an embedded
+/// full track in the reported language, and if it does, why it wasn't the one served. Mirrors
+/// `plan()`'s own filter order (language tag, then text/bitmap, then forced, then "first same-language
+/// track wins") textually, so the two stay easy to audit against each other by eye.
+fn explain_track(tracks: &[SubtitleTrack], n: usize, renditions: &[Rendition]) -> String {
+    let t = &tracks[n];
+    let lang = t.language.as_deref().map(crate::lang::canonical).filter(|l| !l.is_empty());
+    let reason = match &lang {
+        None => "dropped (no usable language tag)".to_string(),
+        Some(_) if !t.text => "dropped (bitmap, can't become WebVTT)".to_string(),
+        Some(_) if t.forced => "dropped (forced)".to_string(),
+        Some(l) => {
+            // The first non-forced text track of this language is the one `plan()` keeps; any later
+            // one of the same language is shadowed by it, never offered.
+            let first = tracks.iter().enumerate().find_map(|(i, u)| {
+                let same_lang =
+                    u.language.as_deref().map(crate::lang::canonical).as_deref() == Some(l.as_str());
+                (u.text && !u.forced && same_lang).then_some(i)
+            });
+            match first {
+                Some(first_n) if first_n != n => format!("dropped (track {first_n} already covers {l})"),
+                _ if renditions.iter().any(|r| r.own == Some(n)) => format!("offered as {l}"),
+                // Kept by `plan()`'s own-candidate pass but not turned into a Rendition: not among
+                // the browser's requested languages, or `MAX_LANGUAGES` was already spent on others.
+                _ => format!("kept as a candidate for {l}, not used this session"),
+            }
+        }
+    };
+    let flags: Vec<&str> =
+        [t.forced.then_some("forced"), t.default.then_some("default"), t.hearing_impaired.then_some("sdh")]
+            .into_iter()
+            .flatten()
+            .collect();
+    format!(
+        "{n} lang={} codec={} [{}] title={:?} -> {reason}",
+        lang.as_deref().unwrap_or(t.language.as_deref().unwrap_or("und")),
+        t.codec,
+        flags.join(","),
+        t.name.as_deref().unwrap_or(""),
+    )
+}
+
+/// One line, logged once per session: every subtitle stream the release carries — index, language,
+/// codec, disposition flags, title — and why `plan()` offered or dropped each. Never a URL.
+pub fn describe_subtitles(tracks: &[SubtitleTrack], renditions: &[Rendition]) -> String {
+    if tracks.is_empty() {
+        return "no subtitle tracks".to_string();
+    }
+    (0..tracks.len()).map(|n| explain_track(tracks, n, renditions)).collect::<Vec<_>>().join("; ")
+}
+
 /// The subtitle side of a session.
 pub struct Subs {
     /// den-subtitles' install URL, sealed config included — a secret.
@@ -341,7 +394,15 @@ mod tests {
     }
 
     fn track(codec: &str, language: Option<&str>, text: bool, forced: bool) -> SubtitleTrack {
-        SubtitleTrack { codec: codec.into(), language: language.map(String::from), text, forced }
+        SubtitleTrack {
+            codec: codec.into(),
+            language: language.map(String::from),
+            text,
+            forced,
+            default: true,
+            hearing_impaired: false,
+            name: None,
+        }
     }
 
     #[test]
@@ -384,6 +445,61 @@ mod tests {
             .map(|l| track("S_TEXT/UTF8", Some(l), true, false))
             .collect();
         assert_eq!(plan(&[], false, &tracks).len(), MAX_LANGUAGES);
+    }
+
+    /// `describe_subtitles`'s account of each track must agree with what `plan()` actually decided —
+    /// the whole point of logging it is that a report can be answered from the log, not from
+    /// re-deriving plan()'s rules by eye and hoping they still match what shipped.
+    #[test]
+    fn describe_subtitles_agrees_with_plan_s_own_decisions() {
+        let tracks = [
+            track("S_TEXT/UTF8", Some("heb"), true, true), // 0: forced Hebrew
+            track("S_TEXT/UTF8", Some("heb"), true, false), // 1: full Hebrew
+            track("S_HDMV/PGS", Some("eng"), false, false), // 2: bitmap English
+            track("S_TEXT/UTF8", None, true, false),       // 3: untagged
+            SubtitleTrack {
+                name: Some("English [SDH]".into()),
+                hearing_impaired: true,
+                ..track("S_TEXT/UTF8", Some("eng"), true, false) // 4: English SDH, listed before...
+            },
+            track("S_TEXT/UTF8", Some("eng"), true, false), // 5: ...the full English track
+        ];
+        let requested = ["en".to_string()];
+        let renditions = plan(&requested, false, &tracks);
+        // `plan()`'s own, pre-existing "first same-language track wins" rule means the SDH track at
+        // 4 is what got offered — the full track at 5 is shadowed by it. That is itself a real,
+        // separate gap (no SDH-vs-full preference, unlike the audio side's `commentary` demotion) —
+        // not fixed here, but the log must say so truthfully, not claim 5 was offered when it wasn't.
+        // Hebrew (track 1) rides along too: `plan()` offers every own-track language, not only the
+        // requested one, when nothing asked for den-subtitles.
+        assert_eq!(
+            renditions,
+            [
+                Rendition { lang: "en".into(), den: false, own: Some(4) },
+                Rendition { lang: "he".into(), den: false, own: Some(1) },
+            ]
+        );
+
+        let desc = describe_subtitles(&tracks, &renditions);
+        assert!(desc.contains("0 lang=he codec=S_TEXT/UTF8 [forced,default]"), "{desc}");
+        assert!(desc.contains("dropped (forced)"), "{desc}");
+        assert!(desc.contains("1 lang=he") && desc.contains("-> offered as he"), "{desc}");
+        assert!(desc.contains("2 lang=en") && desc.contains("bitmap, can't become WebVTT"), "{desc}");
+        assert!(desc.contains("3 lang=und") && desc.contains("no usable language tag"), "{desc}");
+        assert!(
+            desc.contains("4 lang=en codec=S_TEXT/UTF8 [default,sdh] title=\"English [SDH]\"")
+                && desc.contains("-> offered as en"),
+            "{desc}"
+        );
+        assert!(
+            desc.contains("5 lang=en") && desc.contains("dropped (track 4 already covers en)"),
+            "the full English track's fate must be stated, not silently omitted: {desc}"
+        );
+    }
+
+    #[test]
+    fn describe_subtitles_says_so_when_there_are_none() {
+        assert_eq!(describe_subtitles(&[], &[]), "no subtitle tracks");
     }
 
     #[test]
