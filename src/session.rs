@@ -151,6 +151,15 @@ pub struct Inner {
     /// The debrid link ffmpeg reads — scout's play URL, resolved — and whether it has been re-fetched.
     input: String,
     reresolved: bool,
+    /// Segments actually sent to a player (never a HEAD), for the end-of-session summary line.
+    segments_served: u64,
+    /// The sum of those segments' own durations: seconds of the film actually delivered, as against
+    /// the session's wall-clock age.
+    seconds_served: f64,
+    /// The last subtitle rendition a player was actually sent cues from — its index, and whether they
+    /// came from the release's own track or den-subtitles — for the summary line. `None` when no
+    /// subtitle was ever served.
+    subtitle_used: Option<(usize, &'static str)>,
 }
 
 pub struct Session {
@@ -1345,6 +1354,10 @@ pub struct Want<'a> {
     /// The session this one replaces mid-film, which plays on until this one has served a segment
     /// (`AppState::reserve`).
     pub replaces: Option<&'a str>,
+    /// The creating request's `X-Request-Id` (`redact::request_id`), so the session's own log lines —
+    /// including the ones this call writes before the session exists, while still picking a release —
+    /// can be joined back to the request that started it with one grep.
+    pub rid: Option<&'a str>,
 }
 
 /// What the player decodes, as its own tests found (`playable` in `POST /remux/session`): the highest level it
@@ -1763,7 +1776,7 @@ fn delivered_bytes(info: &MediaInfo, want: &Want<'_>) -> Option<u64> {
     let video = info.video_bytes?;
     let n = match want.audio_track {
         Some(n) if n < info.audio.len() => n,
-        _ => crate::lang::pick_audio(&info.audio, want.audio),
+        _ => crate::lang::pick_audio(&info.audio, want.audio).0,
     };
     let track = info.audio.get(n)?;
     let (_, out) = audio_plan(&track.codec, track.channels, want.playable);
@@ -2367,8 +2380,8 @@ pub async fn create(
         }
         return Err(api(StatusCode::NOT_FOUND, "no_playable_release", "No cached release could be opened."));
     };
-    let audio = match want.audio_track {
-        Some(n) if n < info.audio.len() => n,
+    let (audio, audio_reason) = match want.audio_track {
+        Some(n) if n < info.audio.len() => (n, crate::lang::AudioReason::Explicit),
         Some(_) => {
             return Err(api(
                 StatusCode::BAD_REQUEST,
