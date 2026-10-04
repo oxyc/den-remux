@@ -5,7 +5,7 @@
 //!      MAX_SESSIONS, MAX_SESSIONS_PER_INSTALL, MAX_ACTIVE_REMUXES, PRODUCER_IDLE_SECS, SESSION_IDLE_SECS,
 //!      SCRATCH_DIR, SCRATCH_MAX_BYTES, FFMPEG_PATH, MAX_TRANSCODES, VAAPI_DEVICE, TRUSTED_PROXIES, WEB_ORIGINS,
 //!      METRICS_TOKEN, LOG_REQUESTS,
-//!      EDGE_SECRET, GUEST_MAX_SESSIONS.
+//!      EDGE_SECRET, GUEST_MAX_SESSIONS, EDGE_REPORT_URL.
 
 use std::env;
 use std::path::PathBuf;
@@ -79,6 +79,10 @@ pub struct Config {
     pub edge_secret: Option<String>,
     /// `GUEST_MAX_SESSIONS` — sessions one grant may play at once (default 2, at most 8); past it, its oldest ends.
     pub guest_max_sessions: usize,
+    /// `EDGE_REPORT_URL` — den-edge's own base URL, if set: where a guest grant's session reports how long it
+    /// played when it ends (`session::report_usage`), so den-edge's "your guests" list can show plays and hours
+    /// without ever being told a title. `None` turns the report off; a grant's session still ends the same.
+    pub edge_report_url: Option<String>,
 }
 
 fn env_opt(key: &str) -> Option<String> {
@@ -264,6 +268,7 @@ impl Config {
                 .and_then(|v| v.parse().ok())
                 .filter(|n| (1..=8).contains(n))
                 .unwrap_or(2),
+            edge_report_url: env_opt("EDGE_REPORT_URL").map(|u| u.trim_end_matches('/').to_string()),
         }
     }
 }

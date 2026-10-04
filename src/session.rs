@@ -998,6 +998,9 @@ impl Session {
             i.gops.clear();
             i.job.take()
         };
+        if let Some(gid) = self.owner.strip_prefix("grant:") {
+            report_usage(st, gid, self.started.elapsed().as_secs());
+        }
         if let Some(j) = job {
             if j.exit.is_none() {
                 eprintln!("session {}: {}", self.short(), j.pull_line("session ended"));
@@ -1009,6 +1012,36 @@ impl Session {
         self.wake.notify_one();
         true
     }
+}
+
+/// oxyc/den#100's follow-up: tell den-edge how long a guest grant's session played, so its "your guests" list can
+/// show plays and hours without this box ever naming a title, a release or an address — only `gid` and `seconds`
+/// leave. Fire-and-forget, on the one secret the two already share (`EDGE_SECRET`/`x-den-edge-secret`): a lost
+/// report costs the host an undercount, never a session that fails to end.
+/// `pub(crate)` only so `tests.rs` can call it directly, without a real ffmpeg session, to prove what it sends.
+pub(crate) fn report_usage(st: &AppState, gid: &str, seconds: u64) {
+    let (Some(base), Some(secret)) = (st.cfg.edge_report_url.clone(), st.cfg.edge_secret.clone()) else {
+        return;
+    };
+    if seconds == 0 {
+        return;
+    }
+    let http = st.http.clone();
+    let gid = gid.to_owned();
+    tokio::spawn(async move {
+        let body = serde_json::json!({ "gid": gid, "seconds": seconds }).to_string();
+        let sent = http
+            .post(format!("{base}/grant/usage"))
+            .header("x-den-edge-secret", secret)
+            .header("content-type", "application/json")
+            .timeout(Duration::from_secs(5))
+            .body(body)
+            .send()
+            .await;
+        if let Err(e) = sent {
+            eprintln!("grant usage report: {e}");
+        }
+    });
 }
 
 /// A segment's GOP files opened for one response, and the validator that names these bytes.
