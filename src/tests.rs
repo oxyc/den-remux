@@ -597,6 +597,7 @@ fn test_config(origin: &str, max_sessions: usize, idle: Duration, scout_key: Opt
         log_requests: false,
         edge_secret: Some(EDGE_SECRET.into()),
         guest_max_sessions: 2,
+        edge_report_url: None,
     }
 }
 
@@ -1693,6 +1694,78 @@ async fn a_guest_owner_is_honoured_only_with_the_edge_secret() {
     let body = format!(r#"{{"imdb":"tt0000001","scout":"{origin}/cfg"}}"#);
     let r = call_with(&state, "POST", "/remux/releases", None, &edge("grant:0a1b2c3d"), &body).await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+}
+
+/// A one-shot stand-in for den-edge's `/grant/usage` (oxyc/den#100's follow-up): captures the path, the
+/// `x-den-edge-secret` header and the body of the one request it answers, then 204s.
+async fn mock_edge_usage() -> (String, tokio::sync::oneshot::Receiver<(String, Option<String>, String)>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let tx = Arc::new(std::sync::Mutex::new(Some(tx)));
+    tokio::spawn(async move {
+        let Ok((stream, _)) = listener.accept().await else { return };
+        let service = hyper::service::service_fn(move |req: Request<hyper::body::Incoming>| {
+            let tx = Arc::clone(&tx);
+            async move {
+                let secret =
+                    req.headers().get("x-den-edge-secret").and_then(|v| v.to_str().ok()).map(String::from);
+                let path = req.uri().path().to_string();
+                let body = req.into_body().collect().await.map(|c| c.to_bytes()).unwrap_or_default();
+                if let Some(tx) = tx.lock().unwrap().take() {
+                    let _ = tx.send((path, secret, String::from_utf8_lossy(&body).into_owned()));
+                }
+                Ok::<_, Infallible>(Response::new(Full::new(Bytes::new())))
+            }
+        });
+        let _ = hyper::server::conn::http1::Builder::new()
+            .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
+            .await;
+    });
+    (format!("http://{addr}"), rx)
+}
+
+/// den-remux's smallest piece for the host's "your guests" counts: a grant's session, ending, names only itself
+/// and how long it played — never a title, a release or an address. The secret is the one the two already share.
+#[tokio::test]
+async fn a_guests_session_reports_only_the_grant_and_the_seconds() {
+    let (edge_url, rx) = mock_edge_usage().await;
+    let state = state_from(Config {
+        edge_report_url: Some(edge_url),
+        ..test_config("http://127.0.0.1:1", 2, Duration::from_secs(600), None)
+    });
+    crate::session::report_usage(&state, "0a1b2c3d", 42);
+    let (path, secret, body) = tokio::time::timeout(Duration::from_secs(2), rx).await.unwrap().unwrap();
+    assert_eq!(path, "/grant/usage");
+    assert_eq!(secret.as_deref(), Some(EDGE_SECRET));
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&body).unwrap(),
+        serde_json::json!({ "gid": "0a1b2c3d", "seconds": 42 })
+    );
+}
+
+/// Nothing is sent for a session that played no time, nor when the box isn't told where den-edge is: a lost
+/// report must never be the reason a session fails to end.
+#[tokio::test]
+async fn a_guests_session_report_is_skipped_without_a_url_or_without_any_time_played() {
+    let (edge_url, rx) = mock_edge_usage().await;
+    let no_time = state_from(Config {
+        edge_report_url: Some(edge_url),
+        ..test_config("http://127.0.0.1:1", 2, Duration::from_secs(600), None)
+    });
+    crate::session::report_usage(&no_time, "0a1b2c3d", 0);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), rx).await.is_err(),
+        "zero seconds: nothing sent"
+    );
+
+    let (_unused, rx2) = mock_edge_usage().await;
+    let no_url = state_from(Config {
+        edge_report_url: None,
+        ..test_config("http://127.0.0.1:1", 2, Duration::from_secs(600), None)
+    });
+    crate::session::report_usage(&no_url, "0a1b2c3d", 42);
+    assert!(tokio::time::timeout(Duration::from_millis(200), rx2).await.is_err(), "no URL: nothing sent");
 }
 
 /// A grant plays `GUEST_MAX_SESSIONS` at once and its oldest gives way; that never touches a host's sessions,
