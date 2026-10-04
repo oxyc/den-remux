@@ -73,10 +73,38 @@ pub fn name(tag: &str) -> String {
     entry(tag).map(|e| e.3.to_string()).unwrap_or_else(|| tag.to_string())
 }
 
+/// Why `pick_audio` chose the track it did — for the one log line a session writes naming its audio
+/// track, never for the decision itself.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AudioReason {
+    /// The player named the track by index, from an earlier session's `audioTracks`.
+    Explicit,
+    /// It is in this preferred language (most wanted first in `Want::audio`), the best-ranked one a
+    /// track is in.
+    Preferred(String),
+    /// No preference matched; it is the container's own default-flagged track — usually the release's
+    /// original language.
+    Default,
+    /// No preference matched and nothing is flagged default: the first track, counting audio tracks
+    /// only (or track 0, where every track is a commentary).
+    First,
+}
+
+impl std::fmt::Display for AudioReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AudioReason::Explicit => write!(f, "named by the player"),
+            AudioReason::Preferred(lang) => write!(f, "preferred language {lang}"),
+            AudioReason::Default => write!(f, "original language"),
+            AudioReason::First => write!(f, "first"),
+        }
+    }
+}
+
 /// The audio track to play, counting audio tracks only: the first of `prefs` (most wanted first) that a
 /// track is in — among those, the one flagged default — and never a commentary. Without a match, the
 /// first default track that is not a commentary, then any that is not.
-pub fn pick_audio(tracks: &[AudioTrack], prefs: &[String]) -> usize {
+pub fn pick_audio(tracks: &[AudioTrack], prefs: &[String]) -> (usize, AudioReason) {
     let usable = || tracks.iter().enumerate().filter(|(_, t)| !t.commentary);
     for p in prefs {
         let want = canonical(p);
@@ -84,10 +112,14 @@ pub fn pick_audio(tracks: &[AudioTrack], prefs: &[String]) -> usize {
             .filter(|(_, t)| t.language.as_deref().map(canonical).as_deref() == Some(want.as_str()))
             .min_by_key(|(i, t)| (!t.default, *i));
         if let Some((i, _)) = best {
-            return i;
+            return (i, AudioReason::Preferred(want));
         }
     }
-    usable().min_by_key(|(i, t)| (!t.default, *i)).map_or(0, |(i, _)| i)
+    match usable().min_by_key(|(i, t)| (!t.default, *i)) {
+        Some((i, t)) if t.default => (i, AudioReason::Default),
+        Some((i, _)) => (i, AudioReason::First),
+        None => (0, AudioReason::First),
+    }
 }
 
 #[cfg(test)]
@@ -126,10 +158,19 @@ mod tests {
             track(Some("fin"), false, false),
         ];
         let prefs = |p: &[&str]| p.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        assert_eq!(pick_audio(&tracks, &prefs(&["fi", "en"])), 2);
-        assert_eq!(pick_audio(&tracks, &prefs(&["sv", "en-US"])), 1, "no Swedish, so English");
-        assert_eq!(pick_audio(&tracks, &prefs(&["sv"])), 0, "nothing matches: the default track");
-        assert_eq!(pick_audio(&tracks, &[]), 0);
+        assert_eq!(pick_audio(&tracks, &prefs(&["fi", "en"])), (2, AudioReason::Preferred("fi".into())));
+        let (i, why) = pick_audio(&tracks, &prefs(&["sv", "en-US"]));
+        assert_eq!((i, why), (1, AudioReason::Preferred("en".into())), "no Swedish, so English");
+        assert_eq!(
+            pick_audio(&tracks, &prefs(&["sv"])),
+            (0, AudioReason::Default),
+            "nothing matches: the default track"
+        );
+        assert_eq!(pick_audio(&tracks, &[]), (0, AudioReason::Default));
+        assert_eq!(AudioReason::Preferred("fi".into()).to_string(), "preferred language fi");
+        assert_eq!(AudioReason::Default.to_string(), "original language");
+        assert_eq!(AudioReason::First.to_string(), "first");
+        assert_eq!(AudioReason::Explicit.to_string(), "named by the player");
     }
 
     #[test]
@@ -139,11 +180,12 @@ mod tests {
             track(Some("fre"), true, false),
             track(Some("eng"), false, false),
         ];
-        assert_eq!(pick_audio(&tracks, &["en".to_string()]), 2);
+        assert_eq!(pick_audio(&tracks, &["en".to_string()]), (2, AudioReason::Preferred("en".into())));
         // Among matches, the default-flagged one.
         let tracks = [track(Some("eng"), false, false), track(Some("eng"), true, false)];
-        assert_eq!(pick_audio(&tracks, &["en".to_string()]), 1);
-        // Only commentaries: track 0 rather than nothing.
-        assert_eq!(pick_audio(&[track(None, true, true)], &[]), 0);
+        assert_eq!(pick_audio(&tracks, &["en".to_string()]), (1, AudioReason::Preferred("en".into())));
+        // Only commentaries: track 0 rather than nothing, and "first" rather than "original" — a
+        // commentary's own default flag never stands for the release's original language.
+        assert_eq!(pick_audio(&[track(None, true, true)], &[]), (0, AudioReason::First));
     }
 }

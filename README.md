@@ -385,7 +385,8 @@ Every variable is unprefixed; `.env.example` lists them with their defaults.
 | `METRICS_TOKEN` | — | Turns on `/metrics` behind `Authorization: Bearer <token>`; otherwise it is a 404. |
 | `EDGE_SECRET` | — | **Secret**, shared with den-edge (`REMUX_EDGE_SECRET`). With it, a request to `/remux/session` or `/remux/releases` carrying `x-den-edge-secret` and `x-den-owner: grant:<8 hex>` plays as that guest grant: its own cap (`GUEST_MAX_SESSIONS`), never counted against a host; converted for as a host is, on the same one GPU slot. It also turns on `POST /remux/admin/kill {"owner":"grant:<gid>"}` → `{"ended": n}`, which ends that grant's sessions. Unset, the headers are ignored and the admin route is a 404. |
 | `GUEST_MAX_SESSIONS` | `2` | Sessions one guest grant plays at once (1–8); past it, its oldest ends. |
-| `LOG_REQUESTS` | off | `1` writes `<METHOD> <path> <status> <ms>ms[ rid=<X-Request-Id>]` per response. |
+| `LOG_REQUESTS` | off | `1` writes `<METHOD> <path> <status> <ms>ms[ rid=<X-Request-Id>]` per response; `POST /remux/session`'s line also carries `session=<id>` once it creates one. |
+| `LOG_IDENTITY` | on | `0`/`false` drops the title id, release label, size and the chosen audio/subtitle's language from the audio-track and end-of-session log lines, keeping everything else (session id, `rid`, codecs, channel counts, segment/second counts, end reason). |
 | `PORT` | `8095` | |
 
 A browser key and its hash: `key=$(head -c 24 /dev/urandom | base64 | tr '+/' '-_'); printf %s "$key" | sha256sum`.
@@ -399,9 +400,13 @@ A browser key and its hash: `key=$(head -c 24 /dev/urandom | base64 | tr '+/' '-
 
 `/metrics` (gauges and counters prefixed `remux_`): sessions and their cap, active/waiting producers and their cap,
 ffmpeg processes alive, scratch bytes and its cap, GPU producers and their cap, upstream bytes requested/consumed/
-abandoned, and session/run totals. The log is state changes: the startup line, one line
-per session start and end (with the reason: `idle`, `expired`, `deleted`, `replaced`, `shutdown`), a
-failed ffmpeg run's last stderr line (scrubbed), and rate-limited upstream failures.
+abandoned, and session/run totals. The log is state changes: the startup line, every release skipped or converted
+while picking one, one line naming the audio track chosen and why (`event=audio_track`), one line per session end
+(`event=session`: title id, release, chosen audio/subtitle, transcode, segments and seconds served, end reason —
+`idle`, `expired`, `deleted`, `replaced`, `shutdown`, …), a failed ffmpeg run's last stderr line (scrubbed), and
+rate-limited upstream failures. Every session-scoped line carries the session's own short id and, where the
+creating request sent one, its `X-Request-Id` as `rid=`, so one grep over either joins a session's whole life — and
+the request that started it — together. `LOG_IDENTITY=0` keeps all of that except which title and release it was.
 
 ffmpeg is built from a checksummed source tarball (`FFMPEG_VERSION`/`FFMPEG_SHA256` in the Dockerfile);
 dependabot cannot bump it, so bump both lines by hand.
