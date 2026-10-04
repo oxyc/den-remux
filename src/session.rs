@@ -826,15 +826,28 @@ impl Session {
         self.lock().init.is_some()
     }
 
-    /// Rendition `n`'s playlist: one document spanning the film when den-subtitles serves the language — it has first
-    /// say, its subtitle usually being timed to the release — else a segment per video segment from the release's own
-    /// track, where it has one. A language with neither is the document, which serves as empty.
+    /// The session's own selected audio track, as `lang::canonical` gives it — what decides whether a subtitle in
+    /// that same language is a dub's captions or a same-language accessibility track (`subs::in_context`).
+    fn audio_lang(&self) -> Option<String> {
+        self.info.audio.get(self.audio).and_then(|a| a.language.as_deref()).map(crate::lang::canonical)
+    }
+
+    /// Rendition `n`'s playlist: a segment per video segment from the release's own track where it has the better
+    /// candidate for the session's audio context (`subs::own_wins`), else the one document den-subtitles serves
+    /// spanning the film. A language with neither is the document, which serves as empty.
     pub async fn subtitle_playlist(&self, st: &AppState, n: usize) -> String {
         let Some(r) = self.renditions.get(n) else { return String::new() };
         let own = match (r.own, r.den) {
             (None, _) => false,
             (Some(_), false) => true,
-            (Some(_), true) => !self.den_offers(st, n).await,
+            (Some(own_track), true) => {
+                let dub = self.audio_lang().as_deref() == Some(r.lang.as_str());
+                crate::subs::own_wins(
+                    &self.info.subtitles[own_track],
+                    self.den_best(st, n).await.as_ref(),
+                    dub,
+                )
+            }
         };
         match own {
             true => playlist::subtitle_segments(&self.segments, n),
@@ -842,14 +855,15 @@ impl Session {
         }
     }
 
-    /// Does den-subtitles list a subtitle in rendition `n`'s language? Not when it could not be asked.
-    async fn den_offers(&self, st: &AppState, n: usize) -> bool {
-        let (Some(sb), Some(r)) = (self.subs.as_ref(), self.renditions.get(n)) else { return false };
+    /// den-subtitles' best-ranked listed entry in rendition `n`'s language — its list is already sorted best
+    /// first within each language — or `None` when it was not asked, or offers nothing in it.
+    async fn den_best(&self, st: &AppState, n: usize) -> Option<crate::subs::Entry> {
+        let (sb, r) = (self.subs.as_ref()?, self.renditions.get(n)?);
         let mut cache = sb.cache.lock().await;
         if cache.list.is_none() {
             cache.list = self.list_subtitles(st, sb).await;
         }
-        cache.list.iter().flatten().any(|e| crate::lang::canonical(&e.lang) == r.lang)
+        cache.list.iter().flatten().find(|e| crate::lang::canonical(&e.lang) == r.lang).cloned()
     }
 
     /// Rendition `n`'s own track over video segment `w`, once the job has read the film past it: the cues showing in
@@ -2459,7 +2473,11 @@ pub async fn create(
         }
         None => (codecs, None),
     };
-    let renditions = crate::subs::plan(&sub_langs, sub_base.is_some(), &info.subtitles);
+    // What language the session's own audio is in, so `plan()` can tell a dub's captions (forced/
+    // foreign-parts-only is right) apart from a translation subtitle (the full track is right).
+    let audio_lang = info.audio[audio].language.as_deref().map(crate::lang::canonical);
+    let renditions =
+        crate::subs::plan(&sub_langs, sub_base.is_some(), &info.subtitles, audio_lang.as_deref());
     let text_tracks: Vec<usize> = renditions.iter().filter_map(|r| r.own).collect();
     let subs = sub_base.map(|base| crate::subs::Subs {
         base,
@@ -2605,7 +2623,11 @@ pub async fn create(
     eprintln!(
         "session {}: subtitles: {}",
         session.short(),
-        crate::subs::describe_subtitles(&session.info.subtitles, &session.renditions)
+        crate::subs::describe_subtitles(
+            &session.info.subtitles,
+            &session.renditions,
+            session.audio_lang().as_deref()
+        )
     );
     tokio::spawn(supervise(st.clone(), session.clone()));
     Ok((session, Timing { resolve_ms, open_ms, tried }))
