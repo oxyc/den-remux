@@ -54,6 +54,12 @@ pub struct SubtitleTrack {
     pub text: bool,
     /// Flagged forced (foreign-language parts only), so no full track of its language.
     pub forced: bool,
+    /// Matroska's FlagDefault (on unless a muxer turned it off); always on for MP4, which has no such flag.
+    pub default: bool,
+    /// Matroska's FlagHearingImpaired (SDH — a full track plus sound descriptions); MP4 has no such flag.
+    pub hearing_impaired: bool,
+    /// The muxer's title for the track ("English [SDH]", "English (Forced)"), when it named one.
+    pub name: Option<String>,
 }
 
 #[derive(Clone, Debug)]
