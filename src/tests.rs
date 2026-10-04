@@ -595,6 +595,7 @@ fn test_config(origin: &str, max_sessions: usize, idle: Duration, scout_key: Opt
         web_origins: vec!["https://d.example".into()],
         metrics_token: None,
         log_requests: false,
+        log_identity: true,
         edge_secret: Some(EDGE_SECRET.into()),
         guest_max_sessions: 2,
         edge_report_url: None,

@@ -174,6 +174,9 @@ pub struct Session {
     pub public: bool,
     /// When it was set up, so an install past its share ends its oldest.
     pub started: Instant,
+    /// The creating request's `X-Request-Id`, carried for the lifetime of the session so every line it
+    /// writes — including the end-of-session summary — can be joined back to that request.
+    pub rid: Option<String>,
     pub imdb: String,
     pub dir: PathBuf,
     pub release: Release,
@@ -198,6 +201,8 @@ pub struct Session {
     pub dovi: job::Dovi,
     /// The HEVC is transcoded to H.264 on the GPU, for a player that cannot take it.
     pub transcoded: bool,
+    /// Why it is transcoded, for the end-of-session summary line; `None` when `transcoded` is false.
+    pub transcode_reason: Option<String>,
     /// The size and rate a transcode comes down to: 720p for a player whose link can't carry 1080p.
     pub preset: job::Preset,
     pub segments: Vec<Segment>,
@@ -411,7 +416,7 @@ impl Session {
         }
         if newly_exited {
             let why = if job.exit == Some(true) { "reached the end" } else { "failed" };
-            eprintln!("session {}: {}", self.short(), job.pull_line(why));
+            eprintln!("session {}: {}{}", self.short(), job.pull_line(why), rid_tail(self.rid.as_deref()));
             if job.exit == Some(true) {
                 finished.push(job.id);
             } else {
@@ -419,14 +424,15 @@ impl Session {
                     *failures += 1;
                 }
                 if let Some(tail) = job.take_stderr() {
-                    let (sid, start) = (self.short().to_string(), job.start);
+                    let (sid, start, rid) =
+                        (self.short().to_string(), job.start, rid_tail(self.rid.as_deref()));
                     let secrets = [input.clone(), self.play_url.clone(), self.source.base.clone()];
                     tokio::spawn(async move {
                         let tail = tail.await.unwrap_or_default();
                         let refs: Vec<&str> = secrets.iter().map(String::as_str).collect();
                         let tail = crate::redact::scrub(tail.trim(), &refs);
                         eprintln!(
-                            "session {sid}: ffmpeg from {start:.3}s failed: {}",
+                            "session {sid}: ffmpeg from {start:.3}s failed: {}{rid}",
                             tail.lines().last().unwrap_or("(no output)")
                         );
                     });
@@ -564,9 +570,10 @@ impl Session {
                     // A run that already exited said so when it did.
                     if old.exit.is_none() {
                         eprintln!(
-                            "session {}: {}",
+                            "session {}: {}{}",
                             self.short(),
-                            old.pull_line(&format!("replaced for segment {n}"))
+                            old.pull_line(&format!("replaced for segment {n}")),
+                            rid_tail(self.rid.as_deref())
                         );
                     }
                     tokio::spawn(old.stop());
@@ -576,7 +583,11 @@ impl Session {
             }
             Err(e) => {
                 crate::log_limited("ffmpeg_spawn", || {
-                    format!("session {}: ffmpeg would not start: {e}", self.short())
+                    format!(
+                        "session {}: ffmpeg would not start: {e}{}",
+                        self.short(),
+                        rid_tail(self.rid.as_deref())
+                    )
                 });
                 i.failures += 1;
                 Err(())
@@ -598,9 +609,10 @@ impl Session {
         if let Some(old) = old {
             if old.exit.is_none() {
                 eprintln!(
-                    "session {}: {}",
+                    "session {}: {}{}",
                     self.short(),
-                    old.pull_line(&format!("replaced for segment {n}"))
+                    old.pull_line(&format!("replaced for segment {n}")),
+                    rid_tail(self.rid.as_deref())
                 );
             }
             old.stop().await;
@@ -681,9 +693,10 @@ impl Session {
                 self.lock().input = r.url;
             }
             Err(e) => eprintln!(
-                "session {}: re-resolving the release failed: {}",
+                "session {}: re-resolving the release failed: {}{}",
                 self.short(),
-                crate::redact::scrub(&e, &[&self.source.base])
+                crate::redact::scrub(&e, &[&self.source.base]),
+                rid_tail(self.rid.as_deref())
             ),
         }
     }
@@ -723,6 +736,13 @@ impl Session {
                         let mut i = self.lock();
                         self.prune(&mut i, n, st);
                         self.gate(&mut i, st);
+                        // Not on a HEAD: it never carries the body, so counting it would overstate what
+                        // actually reached the player — the end-of-session summary line's `segments`/`seconds`.
+                        if !head {
+                            let seg = self.segments[n];
+                            i.segments_served += 1;
+                            i.seconds_served += seg.end - seg.start;
+                        }
                     }
                     return media_response(media, head, self.exp, headers);
                 }
@@ -810,9 +830,10 @@ impl Session {
             if Instant::now() >= deadline {
                 // The session is answered anyway, and Safari will likely give up on the map before it is written.
                 eprintln!(
-                    "session {}: init.mp4 not written after {}s; answering without it",
+                    "session {}: init.mp4 not written after {}s; answering without it{}",
                     self.short(),
-                    INIT_WAIT.as_secs()
+                    INIT_WAIT.as_secs(),
+                    rid_tail(self.rid.as_deref())
                 );
                 return;
             }
@@ -893,6 +914,7 @@ impl Session {
                 let own = self.own.lock().unwrap_or_else(|e| e.into_inner());
                 if own.covers(track, from, seg.end) {
                     let doc = own.window(track, seg.start, seg.end);
+                    self.lock().subtitle_used = Some((n, "embedded"));
                     return httputil::text("text/vtt; charset=utf-8", &self.cache_control(), doc);
                 }
             }
@@ -937,6 +959,7 @@ impl Session {
             cache.docs.resize(n + 1, None);
         }
         cache.docs[n] = Some(doc.clone());
+        self.lock().subtitle_used = Some((n, "den-subtitles"));
         Some(doc)
     }
 
@@ -973,7 +996,12 @@ impl Session {
             .await
             .inspect_err(|e| {
                 crate::log_limited("subtitles_list", || {
-                    format!("session {}: subtitles: {}", self.short(), crate::redact::scrub(e, &secrets))
+                    format!(
+                        "session {}: subtitles: {}{}",
+                        self.short(),
+                        crate::redact::scrub(e, &secrets),
+                        rid_tail(self.rid.as_deref())
+                    )
                 });
             })
             .ok()
@@ -985,7 +1013,11 @@ impl Session {
         let vtt = subs::vtt_url(url);
         if !subs::on_origin(&vtt, &st.cfg.subtitle_origins) {
             crate::log_limited("subtitle_origin", || {
-                format!("session {}: skipped a subtitle not on SUBTITLE_ORIGINS", self.short())
+                format!(
+                    "session {}: skipped a subtitle not on SUBTITLE_ORIGINS{}",
+                    self.short(),
+                    rid_tail(self.rid.as_deref())
+                )
             });
             return None;
         }
@@ -1001,16 +1033,23 @@ impl Session {
             Ok(body) => subs::for_hls(&body),
             Err(e) => {
                 crate::log_limited("subtitle_fetch", || {
-                    format!("session {}: {}", self.short(), crate::redact::scrub(&e, &[sb.base.as_str()]))
+                    format!(
+                        "session {}: {}{}",
+                        self.short(),
+                        crate::redact::scrub(&e, &[sb.base.as_str()]),
+                        rid_tail(self.rid.as_deref())
+                    )
                 });
                 None
             }
         }
     }
 
-    /// Stop the job, reap it, and delete the session's scratch. `false` if it had already ended.
-    pub async fn end(&self, st: &AppState) -> bool {
-        let job = {
+    /// Stop the job, reap it, and delete the session's scratch, after logging the one line that explains —
+    /// and, with its session id and `rid`, lets a reader reproduce — what played. `why` names how it ended
+    /// (`idle`, `expired`, `deleted`, `replaced`, …). `false` if it had already ended, which logs nothing.
+    pub async fn end(&self, st: &AppState, why: &str) -> bool {
+        let (job, segments_served, seconds_served, subtitle_used) = {
             let mut i = self.lock();
             if i.ended {
                 return false;
@@ -1019,14 +1058,42 @@ impl Session {
             st.scratch_bytes.fetch_sub(i.bytes, Relaxed);
             i.bytes = 0;
             i.gops.clear();
-            i.job.take()
+            (i.job.take(), i.segments_served, i.seconds_served, i.subtitle_used)
         };
+        let subtitle = subtitle_used
+            .map(|(idx, source)| (idx, self.renditions.get(idx).map_or("und", |r| r.lang.as_str()), source));
+        eprintln!(
+            "{}",
+            session_summary_line(
+                self.short(),
+                self.rid.as_deref(),
+                st.cfg.log_identity,
+                why,
+                &self.imdb,
+                &self.release.label,
+                self.release.size,
+                self.audio,
+                self.info.audio.get(self.audio).and_then(|a| a.language.as_deref()).unwrap_or("und"),
+                self.audio_copy.unwrap_or("aac"),
+                self.audio_channels,
+                subtitle,
+                self.transcoded,
+                self.transcode_reason.as_deref(),
+                segments_served,
+                seconds_served,
+            )
+        );
         if let Some(gid) = self.owner.strip_prefix("grant:") {
             report_usage(st, gid, self.started.elapsed().as_secs());
         }
         if let Some(j) = job {
             if j.exit.is_none() {
-                eprintln!("session {}: {}", self.short(), j.pull_line("session ended"));
+                eprintln!(
+                    "session {}: {}{}",
+                    self.short(),
+                    j.pull_line("session ended"),
+                    rid_tail(self.rid.as_deref())
+                );
             }
             j.stop().await;
         }
@@ -1062,7 +1129,9 @@ pub(crate) fn report_usage(st: &AppState, gid: &str, seconds: u64) {
             .send()
             .await;
         if let Err(e) = sent {
-            eprintln!("grant usage report: {e}");
+            // `without_url`: a reqwest::Error's Display otherwise carries the request URL — den-edge's own
+            // base, not a secret, but still never worth a stray log line naming an address.
+            eprintln!("grant usage report: {}", e.without_url());
         }
     });
 }
@@ -2043,6 +2112,88 @@ pub async fn releases(
         .collect())
 }
 
+/// ` rid=<id>` when the session's creating request had one, else nothing: the tail every one of a
+/// session's own log lines ends with, besides its `session <short>:` prefix, so one grep over either
+/// joins a request's own log line to everything its session went on to do.
+fn rid_tail(rid: Option<&str>) -> String {
+    rid.map(|r| format!(" rid={r}")).unwrap_or_default()
+}
+
+/// The one line logged once per session (`event=audio_track`), naming the audio track that plays and
+/// why: `idx` and `lang` are identity under `LOG_IDENTITY` — together they say which of the release's
+/// language tracks was picked — `codec`, `channels` and the reason itself are not, since none of them
+/// alone says what title is playing.
+#[allow(clippy::too_many_arguments)]
+fn audio_track_line(
+    short: &str,
+    rid: Option<&str>,
+    identity: bool,
+    idx: usize,
+    lang: &str,
+    codec: &str,
+    channels: u32,
+    reason: &crate::lang::AudioReason,
+) -> String {
+    let rid = rid_tail(rid);
+    let who = if identity { format!(" idx={idx} lang={lang}") } else { String::new() };
+    format!(
+        "session {short}: event=audio_track outcome=served reason={reason}{rid} session={short} codec={codec} \
+         channels={channels}{who}"
+    )
+}
+
+/// The one line logged when a session ends (`event=session`): with the session id and `rid` already on every
+/// line it wrote while playing, this is what lets a report be explained AND reproduced from the box's journal
+/// alone. `why` (`idle`, `expired`, `deleted`, `replaced`, `replacement never played`, a source error, …),
+/// the session id, codecs, channel counts, whether a track was chosen and where from, and the segment/second
+/// counts are always on; the title id, release label, size and the chosen audio/subtitle's own language are
+/// identity, gated by `LOG_IDENTITY`.
+#[allow(clippy::too_many_arguments)]
+fn session_summary_line(
+    short: &str,
+    rid: Option<&str>,
+    identity: bool,
+    why: &str,
+    imdb: &str,
+    label: &str,
+    size: Option<u64>,
+    audio_idx: usize,
+    audio_lang: &str,
+    audio_codec: &str,
+    audio_channels: u32,
+    subtitle: Option<(usize, &str, &str)>,
+    transcoded: bool,
+    transcode_reason: Option<&str>,
+    segments_served: u64,
+    seconds_served: f64,
+) -> String {
+    let rid = rid_tail(rid);
+    let id = if identity {
+        format!(" imdb={imdb} label={label:?} size={}", size.map_or("unknown".to_string(), |s| s.to_string()))
+    } else {
+        String::new()
+    };
+    let audio_lang = if identity { format!(" audio_lang={audio_lang}") } else { String::new() };
+    let sub = match subtitle {
+        Some((idx, lang, source)) => {
+            let who =
+                if identity { format!(" subtitle_idx={idx} subtitle_lang={lang}") } else { String::new() };
+            format!(" subtitle={source}{who}")
+        }
+        None => " subtitle=none".to_string(),
+    };
+    let transcode = match (transcoded, transcode_reason) {
+        (true, Some(why)) => format!(" transcoded=yes transcode_reason={why:?}"),
+        (true, None) => " transcoded=yes".to_string(),
+        (false, _) => " transcoded=no".to_string(),
+    };
+    format!(
+        "session {short}: event=session outcome=ended reason={why}{rid} session={short} audio_idx={audio_idx} \
+         audio_codec={audio_codec} audio_channels={audio_channels}{audio_lang}{sub}{transcode} \
+         segments={segments_served} seconds={seconds_served:.1}{id}"
+    )
+}
+
 /// `POST /remux/session`: pick and probe a release, choose its audio track, and set up its session.
 pub async fn create(
     st: &Arc<AppState>,
@@ -2051,6 +2202,12 @@ pub async fn create(
     public: bool,
 ) -> Result<(Arc<Session>, Timing), ApiError> {
     let imdb = want.id;
+    // Minted now rather than once a release is chosen, so every decision this call logs while picking one —
+    // a skip, a fallback to a conversion — carries the same id as the session it leads to, and one grep over
+    // `session {short}` joins them. Reused below as the session's own `sid`.
+    let sid = crate::auth::random_id();
+    let short = sid[..6].to_string();
+    let rid_suffix = want.rid.map(|r| format!(" rid={r}")).unwrap_or_default();
     let base = scout_base(st, want.scout)?;
     let by_install = !matches!(admission, Admission::Browser(_));
     let guest = matches!(admission, Admission::Guest(_));
@@ -2127,7 +2284,7 @@ pub async fn create(
     for s in list.iter().filter(|s| s.attributes.cached == Some(true) && !s.attributes.three_d) {
         if let Some(ext) = scout::left_out_by_name(s) {
             eprintln!(
-                "session: {imdb} skipped \"{}\" unopened: {ext} is not a container this service opens",
+                "session {short}: {imdb} skipped \"{}\" unopened: {ext} is not a container this service opens{rid_suffix}",
                 s.attributes.label
             );
             if want.filename == Some(s.filename()) {
@@ -2145,14 +2302,17 @@ pub async fn create(
     for c in &candidates {
         if want.exclude.iter().any(|f| f == c.filename()) {
             eprintln!(
-                "session: {imdb} skipped \"{}\" unopened: the player is switching away from it",
+                "session {short}: {imdb} skipped \"{}\" unopened: the player is switching away from it{rid_suffix}",
                 c.attributes.label
             );
             continue;
         }
         let remembered = unplayable_key(imdb, c).and_then(|k| st.unplayable().get(&k, unix_now()));
         if let Some(why) = remembered {
-            eprintln!("session: {imdb} skipped \"{}\" unopened: remembered: {why}", c.attributes.label);
+            eprintln!(
+                "session {short}: {imdb} skipped \"{}\" unopened: remembered: {why}{rid_suffix}",
+                c.attributes.label
+            );
             if want.filename == Some(c.filename()) {
                 requested_why = Some(why);
             }
@@ -2161,7 +2321,7 @@ pub async fn create(
         match fit(&c.attributes, want.playable, takes_hevc) {
             Fit::Never => {
                 eprintln!(
-                    "session: {imdb} skipped \"{}\" unopened: scout's attributes say it can't play here",
+                    "session {short}: {imdb} skipped \"{}\" unopened: scout's attributes say it can't play here{rid_suffix}",
                     c.attributes.label
                 );
                 if want.filename == Some(c.filename()) {
@@ -2213,7 +2373,7 @@ pub async fn create(
                         ""
                     };
                     eprintln!(
-                        "session: {imdb} skipped \"{}\": {}{record} has no picture without Dolby Vision",
+                        "session {short}: {imdb} skipped \"{}\": {}{record} has no picture without Dolby Vision{rid_suffix}",
                         c.attributes.label,
                         info.dolby_vision.map(|dv| dv.to_string()).unwrap_or_default()
                     );
@@ -2228,7 +2388,7 @@ pub async fn create(
                     if info.video == VideoCodec::Hevc && !plays(want.playable, takes_hevc, &info) =>
                 {
                     eprintln!(
-                        "session: {imdb} \"{}\" ({}) plays here only converted",
+                        "session {short}: {imdb} \"{}\" ({}) plays here only converted{rid_suffix}",
                         c.attributes.label,
                         info.codecs.as_deref().unwrap_or("HEVC")
                     );
@@ -2246,7 +2406,7 @@ pub async fn create(
                 // H.264, AV1 or VP9 beyond the player: nothing here makes H.264 smaller, or converts AV1 or VP9 at all.
                 Ok((_, info)) if !plays(want.playable, takes_hevc, &info) => {
                     eprintln!(
-                        "session: {imdb} skipped \"{}\": {} is beyond this player",
+                        "session {short}: {imdb} skipped \"{}\": {} is beyond this player{rid_suffix}",
                         c.attributes.label,
                         info.codecs.as_deref().unwrap_or("its video")
                     );
@@ -2263,7 +2423,7 @@ pub async fn create(
                     ) =>
                 {
                     eprintln!(
-                        "session: {imdb} \"{}\" needs {} — more than the player's {} kbit/s",
+                        "session {short}: {imdb} \"{}\" needs {} — more than the player's {} kbit/s{rid_suffix}",
                         c.attributes.label,
                         need(&info, &Delivery::of(&info, r.size.or(c.attributes.size_bytes), want))
                             .map_or_else(String::new, |n| n.to_string()),
@@ -2281,7 +2441,10 @@ pub async fn create(
                 }
                 Err(failure) => {
                     let why = crate::redact::scrub(&failure.why, &secrets);
-                    eprintln!("session: {imdb} skipped \"{}\": {why}", c.attributes.label);
+                    eprintln!(
+                        "session {short}: {imdb} skipped \"{}\": {why}{rid_suffix}",
+                        c.attributes.label
+                    );
                     if let Some(key) = unplayable_key(imdb, c).filter(|_| failure.lasting) {
                         st.remember_unplayable(key, why);
                     }
@@ -2319,6 +2482,8 @@ pub async fn create(
         }
     }
     let who = if guest { "a guest" } else { "a member" };
+    // Set only on the branch that actually converts, for the end-of-session summary line.
+    let mut transcode_reason: Option<String> = None;
     if chosen.is_none() && may_convert && (fitting.is_some() || too_big.is_empty()) {
         // A conversion at the preset the link takes — of the first release that plays only converted, else of the
         // first HEVC copy too big for the link that the preset comes in under.
@@ -2346,13 +2511,14 @@ pub async fn create(
                 true => {
                     // The GPU is acquired fairly only when the player asks for media; an abandoned session owns none.
                     eprintln!(
-                        "session: {imdb} converting \"{}\" for {who} to {}p at {} kbit/s (at most {}){}: {why}",
+                        "session {short}: {imdb} converting \"{}\" for {who} to {}p at {} kbit/s (at most {}){}: {why}{rid_suffix}",
                         c.attributes.label,
                         preset.height,
                         preset.bitrate / 1000,
                         preset.peak / 1000,
                         if fitting.is_none() { ", more than the link carries" } else { "" }
                     );
+                    transcode_reason = Some(why.clone());
                     chosen = Some((c, found, true));
                 }
                 // The GPU is unavailable: it still plays as it is, below.
@@ -2360,8 +2526,8 @@ pub async fn create(
                 false => {
                     no_transcode = true;
                     eprintln!(
-                        "session: {imdb} can't play \"{}\" for {who}: it needs converting ({why}), and transcoding \
-                         is unavailable",
+                        "session {short}: {imdb} can't play \"{}\" for {who}: it needs converting ({why}), and \
+                         transcoding is unavailable{rid_suffix}",
                         c.attributes.label
                     );
                 }
@@ -2408,13 +2574,12 @@ pub async fn create(
     let source_channels = info.audio[audio].channels;
     let (audio_copy, audio_out) = audio_plan(&info.audio[audio].codec, source_channels, want.playable);
 
-    let sid = crate::auth::random_id();
     let exp = unix_now() + (info.duration.ceil() as u64 + SESSION_GRACE_SECS).min(SESSION_MAX_SECS);
     let sig = crate::auth::url_sig(&st.cfg.url_key, &sid, exp);
     let dir = st.cfg.scratch_dir.join(format!("s-{sid}"));
     if let Err(e) = std::fs::create_dir_all(&dir) {
         st.scratch_ok.store(false, Relaxed);
-        eprintln!("session: scratch {} is unusable: {e}", st.cfg.scratch_dir.display());
+        eprintln!("session {short}: scratch {} is unusable: {e}{rid_suffix}", st.cfg.scratch_dir.display());
         return Err(api(
             StatusCode::SERVICE_UNAVAILABLE,
             "scratch_unavailable",
@@ -2536,6 +2701,7 @@ pub async fn create(
         owner,
         public,
         started: Instant::now(),
+        rid: want.rid.map(String::from),
         imdb: imdb.to_string(),
         dir,
         release: Release {
@@ -2563,6 +2729,7 @@ pub async fn create(
         text_tracks,
         own: Default::default(),
         transcoded: transcode,
+        transcode_reason: transcode_reason.clone(),
         preset,
         inner: Mutex::new(Inner {
             job: None,
@@ -2577,6 +2744,9 @@ pub async fn create(
             failures: 0,
             input: resolved.url,
             reresolved: false,
+            segments_served: 0,
+            seconds_served: 0.0,
+            subtitle_used: None,
         }),
         producer_gate: tokio::sync::Mutex::new(()),
         wake: Notify::new(),
@@ -2592,7 +2762,7 @@ pub async fn create(
     let link = want.max_bitrate.map(|b| format!(", link {} kbit/s", b / 1000)).unwrap_or_default();
     let client = &want.client;
     eprintln!(
-        "session {}: {imdb} \"{}\" ({}, {:?} {}{}{}, {:.0}s, {} keyframes, {} segments, audio {} {}{}; player: {player}{link}; client: {client})",
+        "session {}: {imdb} \"{}\" ({}, {:?} {}{}{}, {:.0}s, {} keyframes, {} segments, audio {} {}{}; player: {player}{link}; client: {client}){rid_suffix}",
         session.short(),
         session.release.label,
         session.info.container,
@@ -2621,12 +2791,25 @@ pub async fn create(
     // log alone, on the next report — never a URL, just the release's own subtitle streams and
     // `plan()`'s verdict on each.
     eprintln!(
-        "session {}: subtitles: {}",
+        "session {}: subtitles: {}{rid_suffix}",
         session.short(),
         crate::subs::describe_subtitles(
             &session.info.subtitles,
             &session.renditions,
             session.audio_lang().as_deref()
+        )
+    );
+    eprintln!(
+        "{}",
+        audio_track_line(
+            &short,
+            want.rid,
+            st.cfg.log_identity,
+            session.audio,
+            session.info.audio[session.audio].language.as_deref().unwrap_or("und"),
+            session.audio_copy.unwrap_or("aac"),
+            session.audio_channels,
+            &audio_reason,
         )
     );
     tokio::spawn(supervise(st.clone(), session.clone()));
@@ -2666,7 +2849,12 @@ async fn supervise(st: Arc<AppState>, s: Arc<Session>) {
                     .and_then(|_| i.job.take())
             };
             if let Some(job) = parked {
-                eprintln!("session {}: {}", s.short(), job.pull_line("parked; producer slot released"));
+                eprintln!(
+                    "session {}: {}{}",
+                    s.short(),
+                    job.pull_line("parked; producer slot released"),
+                    rid_tail(s.rid.as_deref())
+                );
                 job.stop().await;
                 continue;
             }
@@ -2701,6 +2889,87 @@ mod tests {
 
     fn gop(job: u32, idx: u32, start: f64, dur: f64) -> Gop {
         Gop { job, idx, start, dur, path: PathBuf::from(format!("j{job}/g{idx}")), size: 1 }
+    }
+
+    #[test]
+    fn audio_track_line_drops_identity_when_asked() {
+        let reason = crate::lang::AudioReason::Preferred("fi".into());
+        let on = audio_track_line("abc123", Some("r1"), true, 2, "fi", "ec-3", 6, &reason);
+        assert_eq!(
+            on,
+            "session abc123: event=audio_track outcome=served reason=preferred language fi rid=r1 \
+             session=abc123 codec=ec-3 channels=6 idx=2 lang=fi"
+        );
+        let off = audio_track_line("abc123", Some("r1"), false, 2, "fi", "ec-3", 6, &reason);
+        assert_eq!(
+            off,
+            "session abc123: event=audio_track outcome=served reason=preferred language fi rid=r1 \
+             session=abc123 codec=ec-3 channels=6"
+        );
+        assert!(!off.contains("idx=") && !off.contains("lang="), "{off}");
+        let no_rid =
+            audio_track_line("abc123", None, true, 0, "en", "aac", 2, &crate::lang::AudioReason::First);
+        assert!(!no_rid.contains("rid="), "{no_rid}");
+    }
+
+    #[test]
+    fn session_summary_line_drops_identity_when_asked() {
+        let on = session_summary_line(
+            "abc123",
+            Some("r1"),
+            true,
+            "idle",
+            "tt1234567",
+            "Movie.2160p.mkv",
+            Some(123),
+            0,
+            "en",
+            "ec-3",
+            6,
+            Some((1, "fi", "den-subtitles")),
+            true,
+            Some("no copy plays within a 10s head start"),
+            42,
+            252.0,
+        );
+        assert_eq!(
+            on,
+            "session abc123: event=session outcome=ended reason=idle rid=r1 session=abc123 audio_idx=0 \
+             audio_codec=ec-3 audio_channels=6 audio_lang=en subtitle=den-subtitles subtitle_idx=1 \
+             subtitle_lang=fi transcoded=yes transcode_reason=\"no copy plays within a 10s head start\" \
+             segments=42 seconds=252.0 imdb=tt1234567 label=\"Movie.2160p.mkv\" size=123"
+        );
+        let off = session_summary_line(
+            "abc123",
+            Some("r1"),
+            false,
+            "idle",
+            "tt1234567",
+            "Movie.2160p.mkv",
+            Some(123),
+            0,
+            "en",
+            "ec-3",
+            6,
+            Some((1, "fi", "den-subtitles")),
+            true,
+            Some("no copy plays within a 10s head start"),
+            42,
+            252.0,
+        );
+        assert_eq!(
+            off,
+            "session abc123: event=session outcome=ended reason=idle rid=r1 session=abc123 audio_idx=0 \
+             audio_codec=ec-3 audio_channels=6 subtitle=den-subtitles transcoded=yes \
+             transcode_reason=\"no copy plays within a 10s head start\" segments=42 seconds=252.0"
+        );
+        assert!(!off.contains("imdb=") && !off.contains("label=") && !off.contains("lang="), "{off}");
+        let no_subtitle = session_summary_line(
+            "abc123", None, true, "expired", "tt1", "X", None, 0, "en", "aac", 2, None, false, None, 0, 0.0,
+        );
+        assert!(no_subtitle.contains("subtitle=none"), "{no_subtitle}");
+        assert!(no_subtitle.contains("transcoded=no"), "{no_subtitle}");
+        assert!(!no_subtitle.contains("rid="), "{no_subtitle}");
     }
 
     const SEG: Segment = Segment { start: 8.0, end: 13.0 };
@@ -2930,6 +3199,7 @@ mod tests {
             no_transcode: false,
             fits_only: false,
             replaces: None,
+            rid: None,
         };
         assert!(!no_picture(want.playable, true, &release), "the BT.2020 base layer has a picture");
     }
@@ -3232,6 +3502,7 @@ mod tests {
             no_transcode: false,
             fits_only: false,
             replaces: None,
+            rid: None,
         }
     }
 

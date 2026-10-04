@@ -161,7 +161,11 @@ mod tests {
         assert_eq!(pick_audio(&tracks, &prefs(&["fi", "en"])), (2, AudioReason::Preferred("fi".into())));
         let (i, why) = pick_audio(&tracks, &prefs(&["sv", "en-US"]));
         assert_eq!((i, why), (1, AudioReason::Preferred("en".into())), "no Swedish, so English");
-        assert_eq!(pick_audio(&tracks, &prefs(&["sv"])), (0, AudioReason::Default), "nothing matches: the default track");
+        assert_eq!(
+            pick_audio(&tracks, &prefs(&["sv"])),
+            (0, AudioReason::Default),
+            "nothing matches: the default track"
+        );
         assert_eq!(pick_audio(&tracks, &[]), (0, AudioReason::Default));
         assert_eq!(AudioReason::Preferred("fi".into()).to_string(), "preferred language fi");
         assert_eq!(AudioReason::Default.to_string(), "original language");

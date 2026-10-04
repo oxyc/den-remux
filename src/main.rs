@@ -266,6 +266,10 @@ where
     let start = std::time::Instant::now();
     let (parts, body) = req.into_parts();
     let mut resp = route(&state, &parts, body).await;
+    // Set by `create_session` on a 201, for the log line below alone — never sent on, a client has no use
+    // for it, and `POST /remux/session` isn't in the CORS-exposed list anyway.
+    let created_session =
+        resp.headers_mut().remove("x-den-session-id").and_then(|v| v.to_str().ok().map(str::to_string));
     // The route sets this private marker only after the session signature verifies. Removing it before the answer
     // leaves malformed and forged paths without CORS, so a public listener cannot be used as a cross-origin oracle.
     if resp.headers_mut().remove("x-den-valid-session").is_some() {
@@ -305,6 +309,12 @@ where
         if let Some(rid) = redact::request_id(&parts.headers) {
             line.push_str(" rid=");
             line.push_str(&rid);
+        }
+        // Joins this line to every one the session itself goes on to write, including its end-of-session
+        // summary, by the same id.
+        if let Some(sid) = &created_session {
+            line.push_str(" session=");
+            line.push_str(sid);
         }
         eprintln!("{line}");
     }
@@ -784,6 +794,7 @@ where
     // nobody had played it in Apple's own player; codec lab has now done so, on an iPhone and on a Mac, and it
     // plays (oxyc/den#37).
     let playable = req.playable;
+    let rid = redact::request_id(&parts.headers);
     let want = session::Want {
         id: &id,
         filename: req.filename.as_deref(),
@@ -802,6 +813,7 @@ where
         no_transcode,
         fits_only: req.fits_only,
         replaces: req.replaces.as_deref(),
+        rid: rid.as_deref(),
     };
     let public = public_session_request(state, parts);
     let created = session::create(state, admission, &want, public).await;
@@ -881,7 +893,9 @@ where
                         "name": lang::name(&r.lang),
                     })).collect::<Vec<_>>(),
                 }),
-                &[("server-timing", server_timing.as_str())],
+                // Read and stripped by `handle_request`'s own log line, never sent on: so the request that
+                // created a session can be joined to everything that session later logs, by one grep.
+                &[("server-timing", server_timing.as_str()), ("x-den-session-id", s.short())],
             )
         }
         Err(e) => httputil::error(e.status, e.code, &e.detail),
