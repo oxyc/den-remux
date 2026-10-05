@@ -35,6 +35,9 @@ const RESTART_GAP_SEGMENTS: usize = 3;
 const SEGMENT_WAIT: Duration = Duration::from_secs(20);
 /// How long creating a session for a native player waits for its `init.mp4` (`Session::prepare`).
 const INIT_WAIT: Duration = Duration::from_secs(15);
+/// How long a job that just filled its ahead window must sit paused before contention over
+/// `MAX_ACTIVE_REMUXES` may reap its slot — see [`should_reap_parked`].
+const MIN_PARK_GRACE: Duration = Duration::from_secs(2);
 const POLL: Duration = Duration::from_millis(100);
 /// How often the supervisor looks at a RUNNING job. A paused one is not looked at at all.
 const TICK: Duration = Duration::from_millis(500);
@@ -2872,6 +2875,23 @@ pub async fn create(
     Ok((session, Timing { resolve_ms, open_ms, tried }))
 }
 
+/// Whether a job parked for `paused` (SIGSTOPped, having filled its ahead window) should have its producer
+/// slot reaped now: once it has genuinely gone idle (`producer_idle`) regardless of contention, or — under
+/// contention alone — only once it has had `MIN_PARK_GRACE` to sit stopped first.
+///
+/// Reaping it kills the process; the session's own next request, arriving once the player catches up to where
+/// the pause left off, would otherwise have resumed the same one with a `SIGCONT` in microseconds. Without the
+/// grace, a session still being actively watched loses its producer to a mere passer-by the instant one shows
+/// up waiting — the FIFO fairness this is meant to serve — and its next segment then needs a full restart: a
+/// fresh seek into the source and a new ffmpeg. `MAX_ACTIVE_REMUXES` defaults to 2, so any third concurrent
+/// session (one browser switching releases while another plays) is a passer-by. A native player gives up on a
+/// stalled request after about five seconds (`Session::prepare`'s doc) and reports it as "Media failed to
+/// decode" — far less than a cold restart over a slow source can take, so the steal that cost nothing here
+/// cost that session its whole playback.
+fn should_reap_parked(paused: Duration, producer_idle: Duration, under_pressure: bool) -> bool {
+    paused >= producer_idle || (under_pressure && paused >= MIN_PARK_GRACE)
+}
+
 /// The one task per session: tick while ffmpeg runs, sleep otherwise, and end the session when it
 /// goes idle or expires.
 async fn supervise(st: Arc<AppState>, s: Arc<Session>) {
@@ -2901,7 +2921,7 @@ async fn supervise(st: Arc<AppState>, s: Arc<Session>) {
                 i.job
                     .as_ref()
                     .and_then(Job::parked_for)
-                    .filter(|paused| under_pressure || *paused >= st.cfg.producer_idle)
+                    .filter(|paused| should_reap_parked(*paused, st.cfg.producer_idle, under_pressure))
                     .and_then(|_| i.job.take())
             };
             if let Some(job) = parked {
@@ -3742,6 +3762,28 @@ mod tests {
         );
         assert!(!Session::heads_for(&segs, 0, 0.5, 1, 6.0, 6.0, &[]), "but not a job begun past it");
         assert!(!heads(1, 0.0, 30.0, &[gop(2, 1, 6.0, 6.0)]), "a GOP of another job is not this job's");
+    }
+
+    /// A job that just paused for filling its ahead window must not be reaped the instant some other session
+    /// is waiting for a slot: that other session is a passer-by, and this one's own next request would have
+    /// resumed the same process for nothing. Only once it has sat stopped for `MIN_PARK_GRACE` does contention
+    /// get to take it; a genuinely idle one (no contention at all) still goes at `producer_idle` as before.
+    #[test]
+    fn a_freshly_parked_job_survives_a_passing_waiter() {
+        let idle = Duration::from_secs(10);
+        assert!(
+            !should_reap_parked(Duration::from_millis(100), idle, true),
+            "a passer-by must not steal a job that only just paused"
+        );
+        assert!(
+            should_reap_parked(MIN_PARK_GRACE, idle, true),
+            "once it has had its grace, contention may take it"
+        );
+        assert!(
+            !should_reap_parked(Duration::from_secs(5), idle, false),
+            "without contention it waits out the full idle timeout"
+        );
+        assert!(should_reap_parked(idle, idle, false), "idle that long is reaped with no waiter at all");
     }
 
     #[test]
