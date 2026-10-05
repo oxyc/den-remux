@@ -887,9 +887,8 @@ impl AppState {
                 t.insert(sid.to_string(), s.exp);
             }
         }
-        if s.end(self).await {
-            eprintln!("session {}: ended ({why})", &sid[..6]);
-        }
+        // `Session::end` writes the one summary line for this, naming `why`: nothing more to log here.
+        s.end(self, why).await;
     }
 
     /// End every session `owner` has published, as a client's DELETE does; how many there were.

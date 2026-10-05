@@ -418,6 +418,9 @@ fn parse_moov(moov: &[u8]) -> Result<MediaInfo, ProbeError> {
             language: t.language.clone().filter(|l| l != "und"),
             text: &t.fourcc == b"tx3g",
             forced: false,
+            default: true,
+            hearing_impaired: false,
+            name: None,
         })
         .collect();
     let closed_gops = match codec {

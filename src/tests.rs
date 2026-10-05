@@ -595,8 +595,10 @@ fn test_config(origin: &str, max_sessions: usize, idle: Duration, scout_key: Opt
         web_origins: vec!["https://d.example".into()],
         metrics_token: None,
         log_requests: false,
+        log_identity: true,
         edge_secret: Some(EDGE_SECRET.into()),
         guest_max_sessions: 2,
+        edge_report_url: None,
     }
 }
 
@@ -717,6 +719,10 @@ async fn end_to_end(
     };
     let r = call(&state, "POST", "/remux/session", Some(&cookie), &body).await;
     assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    // den-edge#234's step 0: resolve and open, timed, so a slow start can be read back from a real session.
+    let timing = r.headers["server-timing"].to_str().unwrap().to_string();
+    assert!(timing.contains("resolve;dur="), "{timing}");
+    assert!(timing.contains("open;dur=") && timing.contains("tried\""), "{timing}");
     let created = r.json();
     let playlist = created["playlist"].as_str().unwrap().to_string();
     let base = playlist.trim_end_matches("master.m3u8").to_string();
@@ -1691,6 +1697,78 @@ async fn a_guest_owner_is_honoured_only_with_the_edge_secret() {
     assert_eq!(r.status, StatusCode::OK, "{}", r.text());
 }
 
+/// A one-shot stand-in for den-edge's `/grant/usage` (oxyc/den#100's follow-up): captures the path, the
+/// `x-den-edge-secret` header and the body of the one request it answers, then 204s.
+async fn mock_edge_usage() -> (String, tokio::sync::oneshot::Receiver<(String, Option<String>, String)>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let tx = Arc::new(std::sync::Mutex::new(Some(tx)));
+    tokio::spawn(async move {
+        let Ok((stream, _)) = listener.accept().await else { return };
+        let service = hyper::service::service_fn(move |req: Request<hyper::body::Incoming>| {
+            let tx = Arc::clone(&tx);
+            async move {
+                let secret =
+                    req.headers().get("x-den-edge-secret").and_then(|v| v.to_str().ok()).map(String::from);
+                let path = req.uri().path().to_string();
+                let body = req.into_body().collect().await.map(|c| c.to_bytes()).unwrap_or_default();
+                if let Some(tx) = tx.lock().unwrap().take() {
+                    let _ = tx.send((path, secret, String::from_utf8_lossy(&body).into_owned()));
+                }
+                Ok::<_, Infallible>(Response::new(Full::new(Bytes::new())))
+            }
+        });
+        let _ = hyper::server::conn::http1::Builder::new()
+            .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
+            .await;
+    });
+    (format!("http://{addr}"), rx)
+}
+
+/// den-remux's smallest piece for the host's "your guests" counts: a grant's session, ending, names only itself
+/// and how long it played — never a title, a release or an address. The secret is the one the two already share.
+#[tokio::test]
+async fn a_guests_session_reports_only_the_grant_and_the_seconds() {
+    let (edge_url, rx) = mock_edge_usage().await;
+    let state = state_from(Config {
+        edge_report_url: Some(edge_url),
+        ..test_config("http://127.0.0.1:1", 2, Duration::from_secs(600), None)
+    });
+    crate::session::report_usage(&state, "0a1b2c3d", 42);
+    let (path, secret, body) = tokio::time::timeout(Duration::from_secs(2), rx).await.unwrap().unwrap();
+    assert_eq!(path, "/grant/usage");
+    assert_eq!(secret.as_deref(), Some(EDGE_SECRET));
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&body).unwrap(),
+        serde_json::json!({ "gid": "0a1b2c3d", "seconds": 42 })
+    );
+}
+
+/// Nothing is sent for a session that played no time, nor when the box isn't told where den-edge is: a lost
+/// report must never be the reason a session fails to end.
+#[tokio::test]
+async fn a_guests_session_report_is_skipped_without_a_url_or_without_any_time_played() {
+    let (edge_url, rx) = mock_edge_usage().await;
+    let no_time = state_from(Config {
+        edge_report_url: Some(edge_url),
+        ..test_config("http://127.0.0.1:1", 2, Duration::from_secs(600), None)
+    });
+    crate::session::report_usage(&no_time, "0a1b2c3d", 0);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), rx).await.is_err(),
+        "zero seconds: nothing sent"
+    );
+
+    let (_unused, rx2) = mock_edge_usage().await;
+    let no_url = state_from(Config {
+        edge_report_url: None,
+        ..test_config("http://127.0.0.1:1", 2, Duration::from_secs(600), None)
+    });
+    crate::session::report_usage(&no_url, "0a1b2c3d", 42);
+    assert!(tokio::time::timeout(Duration::from_millis(200), rx2).await.is_err(), "no URL: nothing sent");
+}
+
 /// A grant plays `GUEST_MAX_SESSIONS` at once and its oldest gives way; that never touches a host's sessions,
 /// and a host starting more never touches a grant's.
 #[tokio::test]
@@ -2336,9 +2414,12 @@ async fn a_subtitle_that_failed_once_is_tried_again() {
     state.end_all("test").await;
 }
 
-/// A release that carries its own text subtitles offers them: a language den-subtitles has nothing in is the release's
-/// track, cut per video segment; one den-subtitles has stays its one document; and the release's other languages are
-/// offered with no den-subtitles or language named at all. Forced tracks are never a rendition.
+/// A release that carries its own text subtitles offers them: a language den-subtitles has nothing in is the
+/// release's track, cut per video segment, and so is English — the release's own English track wins its tie with
+/// den-subtitles' (the session's audio is English too, but den's listed file is a plain, unflagged one, so there
+/// is no forced/foreign-parts reason to prefer it; own costs no download and is already in sync). Swedish's only
+/// own track is forced, and the session's audio is not a Swedish dub, so it is no rendition at all: offered plain
+/// it would caption only the foreign-language parts of an all-English film, reading as "barely any subtitles".
 #[tokio::test]
 async fn a_release_offers_its_own_subtitles_where_den_subtitles_has_none() {
     let origin = origin().await;
@@ -2353,17 +2434,22 @@ async fn a_release_offers_its_own_subtitles_where_den_subtitles_has_none() {
     assert_eq!(
         j["subtitles"],
         serde_json::json!([{"language": "en", "name": "English"}, {"language": "fi", "name": "Finnish"}]),
-        "the forced Swedish track is no rendition"
+        "the forced Swedish track is no rendition outside a Swedish dub context"
     );
     let base = j["playlist"].as_str().unwrap().trim_end_matches("master.m3u8").to_string();
     let master = call(&state, "GET", &format!("{base}master.m3u8"), None, "").await.text();
     assert!(master.contains("URI=\"sub0.m3u8\"") && master.contains("URI=\"sub1.m3u8\""), "{master}");
     assert!(!master.contains("URI=\"sub2.m3u8\""), "{master}");
-    let en = call(&state, "GET", &format!("{base}sub0.m3u8"), None, "").await.text();
-    assert!(en.contains("\nsub0.vtt\n") && !en.contains("sub0_0.vtt"), "den-subtitles has English: {en}");
+    let en = call(&state, "GET", &format!("{base}sub0.m3u8"), None, "").await;
+    assert_kept_for_session(&en, j["expiresAt"].as_u64().unwrap(), "sub0.m3u8");
+    let media = call(&state, "GET", &format!("{base}media.m3u8"), None, "").await.text();
+    let en = en.text();
+    for i in 0..extinfs(&media).len() {
+        assert!(en.contains(&format!("\nsub0_{i}.vtt\n")), "the own track wins its tie with den: {en}");
+    }
+    assert!(!en.contains("sub0.vtt"), "{en}");
     let fi = call(&state, "GET", &format!("{base}sub1.m3u8"), None, "").await;
     assert_kept_for_session(&fi, j["expiresAt"].as_u64().unwrap(), "sub1.m3u8");
-    let media = call(&state, "GET", &format!("{base}media.m3u8"), None, "").await.text();
     let fi = fi.text();
     for i in 0..extinfs(&media).len() {
         assert!(fi.contains(&format!("\nsub1_{i}.vtt\n")), "a segment for video segment {i}: {fi}");

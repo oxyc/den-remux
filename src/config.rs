@@ -4,8 +4,8 @@
 //!      REMUX_URL_KEY,
 //!      MAX_SESSIONS, MAX_SESSIONS_PER_INSTALL, MAX_ACTIVE_REMUXES, PRODUCER_IDLE_SECS, SESSION_IDLE_SECS,
 //!      SCRATCH_DIR, SCRATCH_MAX_BYTES, FFMPEG_PATH, MAX_TRANSCODES, VAAPI_DEVICE, TRUSTED_PROXIES, WEB_ORIGINS,
-//!      METRICS_TOKEN, LOG_REQUESTS,
-//!      EDGE_SECRET, GUEST_MAX_SESSIONS.
+//!      METRICS_TOKEN, LOG_REQUESTS, LOG_IDENTITY,
+//!      EDGE_SECRET, GUEST_MAX_SESSIONS, EDGE_REPORT_URL.
 
 use std::env;
 use std::path::PathBuf;
@@ -74,11 +74,20 @@ pub struct Config {
     pub metrics_token: Option<String>,
     /// `LOG_REQUESTS` — one stderr line per response when set (anything but empty or `0`).
     pub log_requests: bool,
+    /// `LOG_IDENTITY` — on unless set to `0` or `false`. Decision and summary lines (which release, which
+    /// audio/subtitle language, its size) always carry it; off drops just those fields, keeping the rest —
+    /// the session id, `rid`, codecs, channel counts, segment/second counts, end reason — which never say
+    /// what title is playing.
+    pub log_identity: bool,
     /// `EDGE_SECRET` — the secret den-edge presents as `x-den-edge-secret` to name a guest grant's sessions
     /// (`x-den-owner`) and to end them (`/remux/admin/kill`). Unset turns both off. Never logged.
     pub edge_secret: Option<String>,
     /// `GUEST_MAX_SESSIONS` — sessions one grant may play at once (default 2, at most 8); past it, its oldest ends.
     pub guest_max_sessions: usize,
+    /// `EDGE_REPORT_URL` — den-edge's own base URL, if set: where a guest grant's session reports how long it
+    /// played when it ends (`session::report_usage`), so den-edge's "your guests" list can show plays and hours
+    /// without ever being told a title. `None` turns the report off; a grant's session still ends the same.
+    pub edge_report_url: Option<String>,
 }
 
 fn env_opt(key: &str) -> Option<String> {
@@ -92,6 +101,13 @@ fn env_opt(key: &str) -> Option<String> {
 /// addon reads it by.
 pub(crate) fn log_requests_on(v: Option<&str>) -> bool {
     v.is_some_and(|v| !v.is_empty() && v != "0")
+}
+
+/// `LOG_IDENTITY`: on unless it is exactly `0` or `false` (either case) — the one flag here that
+/// defaults to on, since every decision line already names a release today and turning that off is
+/// the exception, not the rule.
+pub(crate) fn log_identity_on(v: Option<&str>) -> bool {
+    !matches!(v.map(str::to_ascii_lowercase).as_deref(), Some("0") | Some("false"))
 }
 
 /// `BROWSER_KEY_HASHES`: comma-separated 64-character hex digests. A malformed entry is said once and
@@ -259,11 +275,13 @@ impl Config {
             web_origins: parse_origins(&env_opt("WEB_ORIGINS").unwrap_or_default()),
             metrics_token: env_opt("METRICS_TOKEN"),
             log_requests: log_requests_on(env::var("LOG_REQUESTS").ok().as_deref()),
+            log_identity: log_identity_on(env::var("LOG_IDENTITY").ok().as_deref()),
             edge_secret: env_opt("EDGE_SECRET"),
             guest_max_sessions: env_opt("GUEST_MAX_SESSIONS")
                 .and_then(|v| v.parse().ok())
                 .filter(|n| (1..=8).contains(n))
                 .unwrap_or(2),
+            edge_report_url: env_opt("EDGE_REPORT_URL").map(|u| u.trim_end_matches('/').to_string()),
         }
     }
 }
@@ -312,6 +330,16 @@ mod tests {
         assert!(!log_requests_on(Some("0")));
         assert!(log_requests_on(Some("1")));
         assert!(log_requests_on(Some("true")));
+    }
+
+    #[test]
+    fn log_identity_defaults_on() {
+        assert!(log_identity_on(None), "unset: on");
+        assert!(log_identity_on(Some("1")));
+        assert!(log_identity_on(Some("anything else")));
+        assert!(!log_identity_on(Some("0")));
+        assert!(!log_identity_on(Some("false")));
+        assert!(!log_identity_on(Some("FALSE")), "case-insensitive");
     }
 
     #[test]

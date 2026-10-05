@@ -37,6 +37,7 @@ const NAME: u32 = 0x536E;
 const FLAG_DEFAULT: u32 = 0x88;
 const FLAG_COMMENTARY: u32 = 0x55AF;
 const FLAG_FORCED: u32 = 0x55AA;
+const FLAG_HEARING_IMPAIRED: u32 = 0x55AB;
 const VIDEO: u32 = 0xE0;
 const PIXEL_WIDTH: u32 = 0xB0;
 const PIXEL_HEIGHT: u32 = 0xBA;
@@ -141,6 +142,7 @@ struct Track {
     default: bool,
     commentary: bool,
     forced: bool,
+    hearing_impaired: bool,
     width: u32,
     height: u32,
     transfer: u64,
@@ -175,6 +177,7 @@ fn parse_tracks(b: &[u8]) -> Vec<Track> {
                     FLAG_DEFAULT => t.default = uint(v) != 0,
                     FLAG_COMMENTARY => t.commentary = uint(v) != 0,
                     FLAG_FORCED => t.forced = uint(v) != 0,
+                    FLAG_HEARING_IMPAIRED => t.hearing_impaired = uint(v) != 0,
                     VIDEO => {
                         t.width = child(v, PIXEL_WIDTH).map(uint).unwrap_or(0) as u32;
                         t.height = child(v, PIXEL_HEIGHT).map(uint).unwrap_or(0) as u32;
@@ -657,6 +660,12 @@ pub async fn probe(src: &Source<'_>, head: &[u8]) -> Result<MediaInfo, ProbeErro
             language: t.language.clone(),
             text: is_text_subtitle(&t.codec_id),
             forced: t.forced,
+            default: t.default,
+            // FlagHearingImpaired is as recent as FlagCommentary; most releases only say so in the
+            // track's title ("English [SDH]", "English - SDH").
+            hearing_impaired: t.hearing_impaired
+                || t.name.as_deref().is_some_and(|n| n.to_ascii_lowercase().contains("sdh")),
+            name: t.name.clone(),
         })
         .collect();
     Ok(MediaInfo {
