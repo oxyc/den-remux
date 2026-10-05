@@ -16,7 +16,7 @@ use hyper::{Request, Response, StatusCode};
 
 use crate::config::Config;
 use crate::probe::{self, Source, VideoCodec};
-use crate::state::AppState;
+use crate::state::{AppState, Refused};
 
 fn testdata(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata").join(name)
@@ -199,7 +199,8 @@ async fn neither_container_is_refused() {
 
 #[tokio::test]
 async fn a_report_takes_the_old_shape_and_stats_and_refuses_what_is_neither_or_too_big() {
-    let post = |body: String| crate::report("abcdef", Full::new(Bytes::from(body)));
+    let state = test_state("http://127.0.0.1:9", 2, Duration::from_secs(600));
+    let post = |body: String| crate::report(&state, "abcdef", "abcdef", Full::new(Bytes::from(body)));
     assert_eq!(post(r#"{"code":3,"message":"DECODE"}"#.into()).await.status(), StatusCode::NO_CONTENT);
     let stats = r#"{"stats":{"engine":"hls.js","fragments":{"count":3},"stalls":[{"at":1,"ms":900}]}}"#;
     assert_eq!(post(stats.into()).await.status(), StatusCode::NO_CONTENT);
@@ -917,22 +918,13 @@ async fn end_to_end(
         assert!(gap < 0.005 && gap > -(w[0].1 + 0.005), "the audio jumps {gap:.4}s at {:.3}", w[1].0);
     }
 
-    // A player that can't play it says why, into the log; a report that isn't one is refused.
-    let report =
-        call(&state, "POST", &format!("{base}report"), None, r#"{"code":3,"message":"DECODE"}"#).await;
-    assert_eq!(report.status, StatusCode::NO_CONTENT);
+    // A report that isn't one is refused, before any fatal one gets a chance to end the session.
+    let sid = created["sid"].as_str().unwrap();
+    let dir = state.cfg.scratch_dir.join(format!("s-{sid}"));
+    assert!(dir.exists());
     assert_eq!(
         call(&state, "POST", &format!("{base}report"), None, "{}").await.status,
         StatusCode::BAD_REQUEST
-    );
-    assert_eq!(
-        call(&state, "POST", &format!("{base}report"), None, r#"{"code":3,"message":"again"}"#).await.status,
-        StatusCode::NO_CONTENT
-    );
-    assert_eq!(
-        call(&state, "POST", &format!("{base}report"), None, r#"{"code":3,"message":"fourth"}"#).await.status,
-        StatusCode::TOO_MANY_REQUESTS,
-        "a signed URL cannot turn reports into an unbounded log writer"
     );
 
     let signed_speed = call(&state, "GET", &format!("{base}speed?bytes=1024"), None, "").await;
@@ -950,12 +942,20 @@ async fn end_to_end(
         "a signed session has a bounded speed-probe budget"
     );
 
-    // Ending it: 204, then 410 for anything under its URL, and its scratch is gone.
-    let sid = created["sid"].as_str().unwrap();
-    let dir = state.cfg.scratch_dir.join(format!("s-{sid}"));
-    assert!(dir.exists());
-    let del = call(&state, "DELETE", base.trim_end_matches('/'), None, "").await;
-    assert_eq!(del.status, StatusCode::NO_CONTENT);
+    // A non-fatal report (stats alone) is taken and leaves the session exactly as it was — the report
+    // route's own three-strike budget (fatal or not, well-formed or not) is exercised in full, with its
+    // fourth refused outright, by `a_signed_sessions_report_route_is_rate_limited`.
+    assert_eq!(
+        call(&state, "POST", &format!("{base}report"), None, r#"{"stats":{"engine":"native"}}"#).await.status,
+        StatusCode::NO_CONTENT
+    );
+    assert!(state.session(sid).is_some(), "a non-fatal report does not end it");
+
+    // A player that can't play it says why, into the log, and ends the session at once: 204, then 410 for
+    // anything under its URL, and its scratch is gone.
+    let report =
+        call(&state, "POST", &format!("{base}report"), None, r#"{"code":3,"message":"DECODE"}"#).await;
+    assert_eq!(report.status, StatusCode::NO_CONTENT);
     assert_eq!(call(&state, "GET", &format!("{base}seg0.m4s"), None, "").await.status, StatusCode::GONE);
     assert_eq!(call(&state, "GET", &playlist, None, "").await.status, StatusCode::GONE);
     // Tombstones reveal only that a holder's session is gone; they never retain a reporting endpoint.
@@ -1963,9 +1963,11 @@ async fn kill_without_the_secret_looks_like_an_unknown_route() {
 async fn cancelling_a_reservation_gives_back_both_limits() {
     let state = test_state("http://127.0.0.1:9", 2, Duration::from_secs(600));
     let first = state.reserve("phone", 1, None).await.unwrap();
-    assert!(state.reserve("phone", 1, None).await.is_err());
+    // Nothing of "phone"'s own is live to evict yet — its first reservation hasn't opened — so this is a
+    // different refusal from the server genuinely having no room, told apart in the API error too.
+    assert_eq!(state.reserve("phone", 1, None).await.err(), Some(Refused::StartingAlready));
     let second = state.reserve("laptop", 1, None).await.unwrap();
-    assert!(state.reserve("other", 1, None).await.is_err());
+    assert_eq!(state.reserve("other", 1, None).await.err(), Some(Refused::Full));
     drop(first);
     let replacement = state.reserve("phone", 1, None).await.unwrap();
     drop((second, replacement));
@@ -2686,6 +2688,97 @@ async fn hevc_for_a_player_without_it_takes_the_one_transcode() {
             .await;
     assert_eq!(late.status, StatusCode::GONE, "a report after the end is refused");
     assert_eq!(call(&state, "GET", ended, None, "").await.status, StatusCode::GONE);
+    state.end_all("test").await;
+}
+
+/// A player's fatal report — `error 3 "Media failed to decode"` and its like — frees the session's slot at
+/// once rather than waiting SESSION_IDLE_SECS for a tab that already gave up on it: the box's own cap is
+/// just one session here, so only ending the first on its report leaves room for the second.
+#[tokio::test]
+async fn a_fatal_report_ends_the_session_at_once() {
+    let origin = origin().await;
+    let state = test_state(&origin, 1, Duration::from_secs(600));
+    let body = format!(r#"{{"imdb":"tt0000001","scout":"{origin}/cfg"}}"#);
+    let r = call(&state, "POST", "/remux/session", None, &body).await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let j = r.json();
+    let sid = j["sid"].as_str().unwrap().to_string();
+    let playlist = j["playlist"].as_str().unwrap().to_string();
+
+    // Not yet ended: a non-fatal report (stats alone) leaves it exactly as it was.
+    let stats = r#"{"stats":{"engine":"native"}}"#;
+    assert_eq!(
+        call(&state, "POST", &playlist.replace("master.m3u8", "report"), None, stats).await.status,
+        StatusCode::NO_CONTENT
+    );
+    assert!(state.session(&sid).is_some(), "stats alone are not a failure");
+
+    // A fatal report ends it: gone from the live map, its URL now answers 410, and the slot a lone
+    // MAX_SESSIONS=1 server was holding is free for the very next request.
+    let fatal = r#"{"code":3,"message":"Media failed to decode"}"#;
+    assert_eq!(
+        call(&state, "POST", &playlist.replace("master.m3u8", "report"), None, fatal).await.status,
+        StatusCode::NO_CONTENT
+    );
+    assert!(state.session(&sid).is_none(), "the dead session is gone, not merely marked");
+    assert_eq!(call(&state, "GET", &playlist, None, "").await.status, StatusCode::GONE);
+    let again = call(&state, "POST", "/remux/session", None, &body).await;
+    assert_eq!(again.status, StatusCode::CREATED, "the freed slot admits a new session at once");
+    state.end_all("test").await;
+}
+
+/// A signed URL cannot turn `/report` into an unbounded log writer: at most three are taken per session —
+/// fatal or not, well-formed or not — before a fourth is refused outright, never read at all. So a fourth
+/// that happens to be fatal does not end a session whose three strikes are already spent either; the guard
+/// runs ahead of anything this fix (`a_fatal_report_ends_the_session_at_once`) does with the body.
+#[tokio::test]
+async fn a_signed_sessions_report_route_is_rate_limited() {
+    let origin = origin().await;
+    let state = test_state(&origin, 1, Duration::from_secs(600));
+    let body = format!(r#"{{"imdb":"tt0000001","scout":"{origin}/cfg"}}"#);
+    let r = call(&state, "POST", "/remux/session", None, &body).await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let j = r.json();
+    let sid = j["sid"].as_str().unwrap().to_string();
+    let report_path = j["playlist"].as_str().unwrap().replace("master.m3u8", "report");
+    let stats = r#"{"stats":{"engine":"native"}}"#;
+
+    assert_eq!(call(&state, "POST", &report_path, None, stats).await.status, StatusCode::NO_CONTENT);
+    assert_eq!(
+        call(&state, "POST", &report_path, None, "{}").await.status,
+        StatusCode::BAD_REQUEST,
+        "malformed still counts as one of the three"
+    );
+    assert_eq!(call(&state, "POST", &report_path, None, stats).await.status, StatusCode::NO_CONTENT);
+    assert_eq!(
+        call(&state, "POST", &report_path, None, stats).await.status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "a fourth, after three well-formed or not, is refused outright"
+    );
+    assert!(state.session(&sid).is_some(), "none of these were fatal, so nothing ended the session");
+
+    let fatal = r#"{"code":3,"message":"too late"}"#;
+    assert_eq!(call(&state, "POST", &report_path, None, fatal).await.status, StatusCode::TOO_MANY_REQUESTS);
+    assert!(state.session(&sid).is_some(), "the budget blocks even a fatal one once it is spent");
+    state.end_all("test").await;
+}
+
+/// `POST …/end` is the same as `DELETE`, for `navigator.sendBeacon` — which sends only POST — to call as a
+/// page goes away.
+#[tokio::test]
+async fn a_post_to_end_ends_the_session_like_a_delete() {
+    let origin = origin().await;
+    let state = test_state(&origin, 2, Duration::from_secs(600));
+    let body = format!(r#"{{"imdb":"tt0000001","scout":"{origin}/cfg"}}"#);
+    let r = call(&state, "POST", "/remux/session", None, &body).await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let j = r.json();
+    let sid = j["sid"].as_str().unwrap().to_string();
+    let base = j["playlist"].as_str().unwrap().trim_end_matches("master.m3u8").to_string();
+    let ended = call(&state, "POST", &format!("{base}end"), None, "").await;
+    assert_eq!(ended.status, StatusCode::NO_CONTENT, "{}", ended.text());
+    assert!(state.session(&sid).is_none());
+    assert_eq!(call(&state, "GET", &format!("{base}master.m3u8"), None, "").await.status, StatusCode::GONE);
     state.end_all("test").await;
 }
 

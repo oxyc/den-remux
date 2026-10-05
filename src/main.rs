@@ -10,8 +10,13 @@
 //!   GET  /remux/speed?bytes=<n>             → n random bytes (8 MiB at most), for a remote player to time its link
 //!   GET  /remux/s/<sid>/<sig>/…             → HLS (fMP4) and a session-bound speed probe
 //!   POST /remux/s/<sid>/<sig>/report {code?, message?, stats?} → why the player couldn't play it, and how playing
-//!                        went (`report::stats_line`), into the log
+//!                        went (`report::stats_line`), into the log; a fatal error ends the session at once, freeing
+//!                        its slot rather than waiting out its idle timer for a tab that already gave up on it
+//!   POST /remux/s/<sid>/<sig>/heartbeat     → a paused viewer's "still here": holds the session's slot a while
+//!                        past it, so a closed tab frees it sooner (`UNATTENDED_IDLE`) than a deliberate pause does
 //!   DELETE /remux/s/<sid>/<sig>             → end it (410 from then on)
+//!   POST /remux/s/<sid>/<sig>/end           → the same, `navigator.sendBeacon`-compatible (beacon is POST-only),
+//!                        for den-edge to call as the page goes away
 //!   GET  /health, /metrics
 //!
 //! A release comes from den-scout — the full install the request names, which is its own credential; for a
@@ -477,8 +482,11 @@ where
     http_body_util::Limited::new(body, cap).collect().await.ok().map(|c| c.to_bytes())
 }
 
-/// A player's report on the session `short` — why it couldn't play it, how playing went — into the log.
-async fn report<B>(short: &str, body: B) -> Response<Body>
+/// A player's report on the session `sid` (`short` for the log) — why it couldn't play it, how playing went.
+/// A fatal error ends the session at once: a player that has given up on it is not coming back to be idle-reaped,
+/// and no replacement logic needs telling apart — ending it here already drops this owner's pending
+/// `Replacement`, if any (`AppState::end_removed`).
+async fn report<B>(state: &Arc<AppState>, sid: &str, short: &str, body: B) -> Response<Body>
 where
     B: hyper::body::Body<Data = Bytes> + Send + 'static,
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
@@ -495,6 +503,7 @@ where
             "session {short}: the player couldn't play it: error {code} \"{}\"",
             redact::player_message(message)
         );
+        state.end_session(sid, "player_error").await;
     }
     if let Some(stats) = &r.stats {
         eprintln!("{}", report::stats_line(short, stats));
@@ -949,9 +958,20 @@ where
             state.end_session(sid, "deleted").await;
             Response::builder().status(StatusCode::NO_CONTENT).body(httputil::full("")).unwrap()
         }
+        // The same, as a POST so `navigator.sendBeacon` — which only sends POST — can call it as the page goes
+        // away: a beacon reaches the server even on an unload that a keepalive DELETE fetch sometimes doesn't.
+        (&Method::POST, Some("end")) => {
+            state.end_session(sid, "deleted").await;
+            Response::builder().status(StatusCode::NO_CONTENT).body(httputil::full("")).unwrap()
+        }
+        // A paused viewer's own "still here": see `Session::heartbeat`.
+        (&Method::POST, Some("heartbeat")) => {
+            s.heartbeat();
+            Response::builder().status(StatusCode::NO_CONTENT).body(httputil::full("")).unwrap()
+        }
         // The player's verdict when it can't play what it was sent — a browser's MediaError, or hls.js's — which
         // no server log sees otherwise. Only the holder of the session's signed URL gets here.
-        (&Method::POST, Some("report")) if s.take_report_slot() => report(s.short(), body).await,
+        (&Method::POST, Some("report")) if s.take_report_slot() => report(state, sid, s.short(), body).await,
         (&Method::POST, Some("report")) => rate_limited("This session already reported its player failures."),
         (&Method::HEAD, Some("speed")) => speed(parts),
         (&Method::GET, Some("speed")) if s.take_speed_slot() => {

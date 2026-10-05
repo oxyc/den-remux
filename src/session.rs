@@ -65,6 +65,13 @@ const OPEN_TIMEOUT: Duration = Duration::from_secs(20);
 /// A session lives for the film plus this, and never longer than `SESSION_MAX_SECS`.
 const SESSION_GRACE_SECS: u64 = 60 * 60;
 const SESSION_MAX_SECS: u64 = 6 * 60 * 60;
+/// How long a session with no live signal may sit before it ends — far shorter than `SESSION_IDLE_SECS`,
+/// for the two cases with no "paused mid-film" grace to honour: one that has never served a single segment
+/// (a replacement whose viewer never opened it, or gave up right after a fatal error), and one whose
+/// heartbeat — a paused viewer's explicit "still here", POST …/heartbeat — has itself stopped arriving.
+/// Not env-configurable, like `REPLACE_GRACE_SECS`: both are short-and-fixed by design, not a knob an
+/// operator should need to reach for.
+const UNATTENDED_IDLE: Duration = Duration::from_secs(60);
 
 pub fn seg_index(file: &str) -> Option<usize> {
     let n = file.strip_prefix("seg")?.strip_suffix(".m4s")?;
@@ -100,7 +107,7 @@ pub fn sub_file(file: &str) -> Option<SubFile> {
 }
 
 pub fn is_session_file(file: &str) -> bool {
-    matches!(file, "master.m3u8" | "media.m3u8" | "init.mp4" | "report")
+    matches!(file, "master.m3u8" | "media.m3u8" | "init.mp4" | "report" | "heartbeat" | "end")
         || seg_index(file).is_some()
         || sub_file(file).is_some()
 }
@@ -150,6 +157,9 @@ pub struct Inner {
     finished: Vec<u32>,
     init: Option<PathBuf>,
     last_seen: Instant,
+    /// The last `POST …/heartbeat`, a paused viewer's own "still here" — distinct from `last_seen`, which
+    /// playback itself keeps fresh. `None` until the first one arrives.
+    last_heartbeat: Option<Instant>,
     /// The newest segment asked for: production follows it.
     want: usize,
     ended: bool,
@@ -167,6 +177,24 @@ pub struct Inner {
     /// came from the release's own track or den-subtitles — for the summary line. `None` when no
     /// subtitle was ever served.
     subtitle_used: Option<(usize, &'static str)>,
+}
+
+impl Inner {
+    /// When the supervisor should end this session if nothing more arrives.
+    ///
+    /// `UNATTENDED_IDLE` past the last heartbeat, once one has come in more recently than any real request: a
+    /// paused viewer who goes quiet is freed soon after their own heartbeat stops, rather than riding out the
+    /// full silence grace. `UNATTENDED_IDLE` past the last real request too when nothing has ever been
+    /// served: there is no "paused mid-film" to protect for a session nothing has ever played from. Otherwise
+    /// `session_idle` past the last real request — the original, generous grace for playback that simply
+    /// stopped making requests, kept for a player with no heartbeat of its own.
+    fn idle_deadline(&self, session_idle: Duration) -> Instant {
+        match self.last_heartbeat {
+            Some(hb) if hb > self.last_seen => hb + UNATTENDED_IDLE,
+            _ if self.segments_served == 0 => self.last_seen + UNATTENDED_IDLE,
+            _ => self.last_seen + session_idle,
+        }
+    }
 }
 
 pub struct Session {
@@ -343,6 +371,14 @@ impl Session {
 
     pub fn touch(&self) {
         self.lock().last_seen = Instant::now();
+    }
+
+    /// A paused viewer's own "still here" (`POST …/heartbeat`): holds the session past `UNATTENDED_IDLE` for
+    /// as long as it keeps arriving, without needing the segment requests actual playback would make. Wakes
+    /// the supervisor so the fresh heartbeat reschedules its sleep now, not on whatever it next wakes for.
+    pub fn heartbeat(&self) {
+        self.lock().last_heartbeat = Some(Instant::now());
+        self.wake.notify_one();
     }
 
     /// Make the last request `ago` old and let the supervisor look again: a silence, in a test's time.
@@ -2444,6 +2480,13 @@ pub async fn create(
     // `MAX_SESSIONS_PER_INSTALL` at once — a household's people — and past that its oldest gives way. A replacement
     // mid-film keeps the one it replaces until it plays.
     let slot = st.reserve(&owner, share, want.replaces).await.map_err(|refused| match refused {
+        // Distinct from `Full`: nothing of this owner's own is live to evict, because its last attempt
+        // hasn't finished opening yet. den-edge reads this apart from a genuinely full server.
+        Refused::StartingAlready => api(
+            StatusCode::TOO_MANY_REQUESTS,
+            "starting_already",
+            "This browser or install is still finishing its last attempt.",
+        ),
         Refused::Full => api(
             StatusCode::TOO_MANY_REQUESTS,
             "too_many_sessions",
@@ -2942,6 +2985,7 @@ pub async fn create(
             finished: Vec::new(),
             init: None,
             last_seen: Instant::now(),
+            last_heartbeat: None,
             want: first_segment,
             ended: false,
             bytes: 0,
@@ -3033,7 +3077,7 @@ async fn supervise(st: Arc<AppState>, s: Arc<Session>) {
             s.gate(&mut i, &st);
             (
                 i.job.as_ref().is_some_and(|j| j.exit.is_none() && !j.stopped),
-                i.last_seen + st.cfg.session_idle,
+                i.idle_deadline(st.cfg.session_idle),
                 // Measured from the SESSION's own last request, not the job's own pause: a job paused for
                 // filling its ahead window is not idle, only unneeded for a few seconds yet, and a job's pause
                 // duration says nothing about whether its viewer is still right there. This is also the
@@ -3743,6 +3787,49 @@ mod tests {
         assert_eq!(snap(&kf, 2.500_004), 2.5);
         assert_eq!(snap(&kf, 4.99), 5.0);
         assert_eq!(snap(&kf, 3.7), 3.7, "a keyframe the index does not list keeps its own time");
+    }
+
+    fn inner(last_seen: Instant, last_heartbeat: Option<Instant>, segments_served: u64) -> Inner {
+        Inner {
+            job: None,
+            next_job: 0,
+            gops: Vec::new(),
+            finished: Vec::new(),
+            init: None,
+            last_seen,
+            last_heartbeat,
+            want: 0,
+            ended: false,
+            bytes: 0,
+            failures: 0,
+            input: String::new(),
+            reresolved: false,
+            segments_served,
+            seconds_served: 0.0,
+            subtitle_used: None,
+        }
+    }
+
+    #[test]
+    fn a_never_watched_session_or_a_lapsed_heartbeat_idles_far_sooner_than_session_idle() {
+        let now = Instant::now();
+        let session_idle = Duration::from_secs(600);
+
+        // Nothing has ever been served: no "paused mid-film" to protect, so it is freed quickly.
+        assert_eq!(inner(now, None, 0).idle_deadline(session_idle), now + UNATTENDED_IDLE);
+
+        // Actively playing, or a player with no heartbeat of its own: the full, original grace.
+        assert_eq!(inner(now, None, 3).idle_deadline(session_idle), now + session_idle);
+
+        // Paused with a fresh heartbeat: the short grace, but counted from the heartbeat, not the
+        // (older) last real request — so it keeps renewing for as long as the heartbeat does.
+        let paused_since = now - Duration::from_secs(120);
+        assert_eq!(inner(paused_since, Some(now), 3).idle_deadline(session_idle), now + UNATTENDED_IDLE);
+
+        // Resumed after a stale heartbeat: fresher real activity supersedes it, back to the full grace —
+        // a resumed, actively-playing session must not inherit a pause's short fuse.
+        let stale_heartbeat = now - Duration::from_secs(120);
+        assert_eq!(inner(now, Some(stale_heartbeat), 3).idle_deadline(session_idle), now + session_idle);
     }
 
     fn body_of(r: Response<Body>) -> Vec<u8> {
