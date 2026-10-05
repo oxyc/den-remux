@@ -29,6 +29,9 @@ pub const MAX_SUBTITLE: u64 = 4 << 20;
 pub const MAX_LIST: u64 = 1 << 20;
 /// What a rendition serves when there is nothing for its language.
 pub const EMPTY: &str = "WEBVTT\nX-TIMESTAMP-MAP=MPEGTS:0,LOCAL:00:00:00.000\n\n";
+/// The pseudo-language `plan()` files a track with no usable language tag under: BCP-47's own code for
+/// "undetermined", so it is still a valid `LANGUAGE` attribute in the playlist it ends up in.
+pub const UNDETERMINED: &str = "und";
 
 /// The most an own track's WebVTT file may grow to before it is left unread: a feature film's cues are a few hundred KB.
 pub const MAX_OWN: u64 = 8 << 20;
@@ -121,6 +124,23 @@ fn best_own(tracks: &[SubtitleTrack], lang: &str, audio_lang: Option<&str>) -> O
         .map(|(n, _)| n)
 }
 
+/// The index of the best text track that names no language at all, among tracks that name none — or `None`
+/// where there is no such track, or every one of them is forced. There is no language here to call a dub of, so
+/// unlike `best_own` there is no `dub` context to flip forced and full: a forced, language-less track stays out
+/// unconditionally, the same as a forced track outside a dub context.
+fn best_undetermined(tracks: &[SubtitleTrack]) -> Option<usize> {
+    tracks
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| {
+            t.text
+                && t.language.as_deref().map(crate::lang::canonical).is_none_or(|l| l.is_empty())
+                && !t.forced
+        })
+        .min_by_key(|(_, t)| own_tier(t))
+        .map(|(n, _)| n)
+}
+
 /// The renditions of a session, most wanted first, filling `MAX_LANGUAGES` in this order: the viewer's own first
 /// preferred language (whatever named it — the player's requested languages, this browser's, or the install's),
 /// then English — guaranteed a place even when the viewer named none, so the cap is never the reason it is
@@ -129,11 +149,15 @@ fn best_own(tracks: &[SubtitleTrack], lang: &str, audio_lang: Option<&str>) -> O
 /// track order once the viewer's list ran out, which reads as alphabetical past the first couple of languages
 /// and silently dropped a preference the release's own tracks just happened to sort late (den-remux#34).
 ///
-/// A bitmap track, or one that names no language, is never offered. `audio_lang` is also the session's own
-/// selected audio language (`lang::canonical`) for the tier pick within one language's own tracks — full, SDH,
-/// or forced/foreign-parts-only — which is the best one: see `in_context`. The pick here is provisional where
-/// den-subtitles is also asked (`den: true`): whether it actually plays over a downloaded file is
-/// `Session::subtitle_playlist`'s call, made with den-subtitles' own answer in hand.
+/// A bitmap track is never offered. A track with no usable language tag is filed under `UNDETERMINED` instead of
+/// dropped — never a preferred pick (nothing ever asks for "und"), but a candidate the fill below reaches at the
+/// file position its untagged track sits at, the same as a tagged language would: a release that has nothing in
+/// any language this viewer or the cap would otherwise reach still has cues, which beats offering none (Fauda
+/// S1E3's own 17 GB release: no embedded English, but an untagged full track that almost certainly is one).
+/// `audio_lang` is also the session's own selected audio language (`lang::canonical`) for the tier pick within
+/// one language's own tracks — full, SDH, or forced/foreign-parts-only — which is the best one: see `in_context`.
+/// The pick here is provisional where den-subtitles is also asked (`den: true`): whether it actually plays over
+/// a downloaded file is `Session::subtitle_playlist`'s call, made with den-subtitles' own answer in hand.
 pub fn plan(
     requested: &[String],
     den: bool,
@@ -142,12 +166,15 @@ pub fn plan(
 ) -> Vec<Rendition> {
     let mut own: Vec<(String, usize)> = Vec::new();
     for t in tracks {
-        let Some(lang) = t.language.as_deref().map(crate::lang::canonical).filter(|l| !l.is_empty()) else {
-            continue;
-        };
-        if t.text && !own.iter().any(|(l, _)| *l == lang) {
-            if let Some(n) = best_own(tracks, &lang, audio_lang) {
-                own.push((lang, n));
+        let lang = t.language.as_deref().map(crate::lang::canonical).filter(|l| !l.is_empty());
+        let key = lang.as_deref().unwrap_or(UNDETERMINED);
+        if t.text && !own.iter().any(|(l, _)| l == key) {
+            let best = match &lang {
+                Some(l) => best_own(tracks, l, audio_lang),
+                None => best_undetermined(tracks),
+            };
+            if let Some(n) = best {
+                own.push((key.to_string(), n));
             }
         }
     }
@@ -202,7 +229,18 @@ fn explain_track(
     let t = &tracks[n];
     let lang = t.language.as_deref().map(crate::lang::canonical).filter(|l| !l.is_empty());
     let reason = match &lang {
-        None => "dropped (no usable language tag)".to_string(),
+        None if !t.text => "dropped (bitmap, can't become WebVTT)".to_string(),
+        // No language to be a dub of either: a forced, language-less track stays out regardless of what else
+        // the release carries, the same as a forced tagged track outside a dub context.
+        None if t.forced => "dropped (forced, no usable language tag)".to_string(),
+        None => match best_undetermined(tracks) {
+            Some(best_n) if best_n != n => {
+                format!("dropped (track {best_n} ranks higher with no usable language tag)")
+            }
+            Some(_) if renditions.iter().any(|r| r.own == Some(n)) => "offered as und".to_string(),
+            Some(_) => "kept as a candidate with no usable language tag, not used this session".to_string(),
+            None => "dropped (no usable language tag)".to_string(),
+        },
         Some(_) if !t.text => "dropped (bitmap, can't become WebVTT)".to_string(),
         Some(l) => match best_own(tracks, l, audio_lang) {
             Some(best_n) if best_n != n => format!("dropped (track {best_n} ranks higher for {l})"),
@@ -550,25 +588,29 @@ mod tests {
         ];
         let named = ["fi".to_string(), "de".to_string()];
         // No den-subtitles: only what the release has, the languages asked for first, then its others.
-        // Bitmap and unlabelled tracks make no rendition, and a language with two full tracks takes the
-        // first. Swedish's only own track is forced, and nothing here names the audio as a Swedish dub,
-        // so it is no rendition at all — offered plain it would caption only the foreign-language parts,
-        // which over an otherwise-single-language film reads as "barely any subtitles".
+        // Bitmap makes no rendition, and a language with two full tracks takes the first. Swedish's only
+        // own track is forced, and nothing here names the audio as a Swedish dub, so it is no rendition at
+        // all — offered plain it would caption only the foreign-language parts, which over an otherwise-
+        // single-language film reads as "barely any subtitles". The untagged track at 5 fills the one slot
+        // left over, filed under `UNDETERMINED`.
         assert_eq!(
             plan(&named, false, &tracks, None),
             [
                 Rendition { lang: "fi".into(), den: false, own: Some(2) },
                 Rendition { lang: "en".into(), den: false, own: Some(3) },
+                Rendition { lang: "und".into(), den: false, own: Some(5) },
             ]
         );
         // With it, every language asked for is a rendition — den-subtitles may have it — and English, guaranteed
         // a place right after the viewer's own first choice, outranks "de", named second, which the release lacks.
+        // The untagged track still rides along after, same as before.
         assert_eq!(
             plan(&named, true, &tracks, None),
             [
                 Rendition { lang: "fi".into(), den: true, own: Some(2) },
                 Rendition { lang: "en".into(), den: true, own: Some(3) },
                 Rendition { lang: "de".into(), den: true, own: None },
+                Rendition { lang: "und".into(), den: false, own: Some(5) },
             ]
         );
         assert!(plan(&[], false, &[track("S_HDMV/PGS", Some("eng"), false, false)], None).is_empty());
@@ -639,12 +681,14 @@ mod tests {
         // The full track at 5 now correctly beats the SDH track at 4 (`own_tier`/`best_own`), and the full
         // Hebrew track at 1 beats the forced one at 0 — track order no longer decides it. Hebrew rides
         // along too: `plan()` offers every own-track language, not only the requested one, when nothing
-        // asked for den-subtitles.
+        // asked for den-subtitles. The untagged track at 3 rides along too, filed under `UNDETERMINED`
+        // since there is room for it.
         assert_eq!(
             renditions,
             [
                 Rendition { lang: "en".into(), den: false, own: Some(5) },
                 Rendition { lang: "he".into(), den: false, own: Some(1) },
+                Rendition { lang: "und".into(), den: false, own: Some(3) },
             ]
         );
 
@@ -653,13 +697,61 @@ mod tests {
         assert!(desc.contains("dropped (track 1 ranks higher for he)"), "{desc}");
         assert!(desc.contains("1 lang=he") && desc.contains("-> offered as he"), "{desc}");
         assert!(desc.contains("2 lang=en") && desc.contains("bitmap, can't become WebVTT"), "{desc}");
-        assert!(desc.contains("3 lang=und") && desc.contains("no usable language tag"), "{desc}");
+        assert!(desc.contains("3 lang=und") && desc.contains("-> offered as und"), "{desc}");
         assert!(
             desc.contains("4 lang=en codec=S_TEXT/UTF8 [default,sdh] title=\"English [SDH]\"")
                 && desc.contains("dropped (track 5 ranks higher for en)"),
             "the SDH track must lose to the full one, not shadow it by listing order: {desc}"
         );
         assert!(desc.contains("5 lang=en") && desc.contains("-> offered as en"), "{desc}");
+    }
+
+    /// den-remux#<TODO>: a release (Fauda S1E3, 17 GB WEB-DL) with no embedded English track at all, but an
+    /// untagged pair at 5/6 — forced-and-default, then full — almost certainly English (the dub this release's
+    /// audio is in is Hebrew, and a forced-only track over an otherwise single-language film is the shape of
+    /// a "translate the foreign bits" track, not a whole show's worth of dialogue). Before this fix neither
+    /// untagged track was ever offered; now the full one is, at its own file position, same as a tagged
+    /// language would be — and it is still passed over by an actual tagged language that out-ranks it there.
+    #[test]
+    fn an_untagged_full_track_fills_in_where_nothing_tagged_fits() {
+        let tagged = ["ar", "bg", "da", "de", "el"];
+        let mut tracks: Vec<_> = tagged.iter().map(|l| track("S_TEXT/UTF8", Some(l), true, false)).collect();
+        tracks.push(track("S_TEXT/UTF8", None, true, true)); // 5: forced, untagged
+        tracks.push(track("S_TEXT/UTF8", None, true, false)); // 6: full, untagged — likely English
+        for l in [
+            "es", "fi", "fr", "he", "it", "ja", "ko", "no", "nl", "pl", "pt", "ro", "ru", "sv", "th", "tr",
+            "vi", "zh",
+        ] {
+            tracks.push(track("S_TEXT/UTF8", Some(l), true, false));
+        }
+        let requested = ["en".to_string()];
+        // The viewer asked for English; the release tags none, so the preferred pass finds nothing there — but
+        // the untagged track at 6 fills a slot in the backfill, at the position its file order earns it:
+        // ahead of "es" and everything after, same as a tagged language at 6 would have outranked them.
+        let renditions = plan(&requested, false, &tracks, Some("he"));
+        let langs: Vec<(&str, Option<usize>)> = renditions.iter().map(|r| (r.lang.as_str(), r.own)).collect();
+        assert_eq!(
+            langs,
+            [
+                ("he", Some(10)),
+                ("ar", Some(0)),
+                ("bg", Some(1)),
+                ("da", Some(2)),
+                ("de", Some(3)),
+                ("el", Some(4)),
+                ("und", Some(6)),
+                ("es", Some(7)),
+            ],
+            "{langs:?}"
+        );
+        assert_eq!(renditions.len(), MAX_LANGUAGES);
+
+        let desc = describe_subtitles(&tracks, &renditions, Some("he"));
+        assert!(
+            desc.contains("5 lang=und") && desc.contains("dropped (forced, no usable language tag)"),
+            "{desc}"
+        );
+        assert!(desc.contains("6 lang=und") && desc.contains("-> offered as und"), "{desc}");
     }
 
     #[test]
