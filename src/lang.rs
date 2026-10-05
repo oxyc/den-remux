@@ -68,8 +68,11 @@ pub fn canonical(tag: &str) -> String {
     }
 }
 
-/// A name to show for the tag: English where known, else the tag.
+/// A name to show for the tag: English where known, `subs::UNDETERMINED`'s own "Unknown", else the tag.
 pub fn name(tag: &str) -> String {
+    if tag == crate::subs::UNDETERMINED {
+        return "Unknown".to_string();
+    }
     entry(tag).map(|e| e.3.to_string()).unwrap_or_else(|| tag.to_string())
 }
 
