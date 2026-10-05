@@ -1150,32 +1150,16 @@ impl Session {
     /// could not be had.
     async fn list_subtitles(&self, st: &AppState, sb: &crate::subs::Subs) -> Option<Vec<crate::subs::Entry>> {
         use crate::subs;
-        let size = self.release.size;
-        // The hash's second half is the file's last 64 KiB: one ranged read, only now that it is wanted.
-        let hash = match (size, sb.head_sum) {
-            (Some(size), Some(head)) if size >= subs::HASH_CHUNK => {
-                let input = self.lock().input.clone();
-                crate::probe::read_range(&st.source_http, &input, size - subs::HASH_CHUNK, subs::HASH_CHUNK)
-                    .await
-                    .ok()
-                    .filter(|t| t.len() as u64 == subs::HASH_CHUNK)
-                    .map(|tail| subs::movie_hash(size, head, subs::chunk_sum(&tail)))
-            }
-            _ => None,
-        };
-        let Some(url) = subs::list_url(&sb.base, &self.imdb, hash.as_deref(), size, &self.release.filename)
-        else {
-            return Some(Vec::new());
-        };
+        let input = self.lock().input.clone();
         let secrets = [sb.base.as_str()];
-        let listed = async {
-            let resp = st.scout_http.get(&url).send().await.map_err(|e| e.without_url().to_string())?;
-            if !resp.status().is_success() {
-                return Err(format!("den-subtitles answered {}", resp.status().as_u16()));
-            }
-            crate::probe::read_capped(resp, subs::MAX_LIST).await.map(|b| subs::parse_list(&b))
+        let release = subs::Release {
+            id: &self.imdb,
+            input: &input,
+            head_sum: sb.head_sum,
+            size: self.release.size,
+            filename: &self.release.filename,
         };
-        listed
+        subs::fetch_list(&st.scout_http, &st.source_http, &sb.base, &release)
             .await
             .inspect_err(|e| {
                 crate::log_limited("subtitles_list", || {
@@ -2886,14 +2870,42 @@ pub async fn create(
     // What language the session's own audio is in, so `plan()` can tell a dub's captions (forced/
     // foreign-parts-only is right) apart from a translation subtitle (the full track is right).
     let audio_lang = info.audio[audio].language.as_deref().map(crate::lang::canonical);
+    let head_sum = resolved.head.get(..crate::subs::HASH_CHUNK as usize).map(crate::subs::chunk_sum);
+    // den-subtitles' own list for the title, fetched now — before any rendition is promised — so `plan()`
+    // offers a `den: true` language only when den-subtitles can actually serve it, never one it merely
+    // "may have" (den-remux's phantom-English report: a Swedish/English viewer against a Polish-only
+    // Fauda S1E3 release saw "English" in the menu and loaded an empty track). The fetch costs no
+    // OpenSubtitles quota — it's the same free list `list_subtitles` would fetch anyway once a rendition
+    // is actually opened. A failed or timed-out fetch is read the same as an empty list: the safe default
+    // is to drop a den-only rendition, not promise one on a guess.
+    let den_list = match &sub_base {
+        Some(base) => {
+            let secrets = [base.as_str()];
+            let release = crate::subs::Release {
+                id: imdb,
+                input: &resolved.url,
+                head_sum,
+                size,
+                filename: c.filename(),
+            };
+            crate::subs::fetch_list(&st.scout_http, &st.source_http, base, &release)
+                .await
+                .inspect_err(|e| {
+                    crate::log_limited("subtitles_list", || {
+                        format!(
+                            "session {short}: subtitles: {}{rid_suffix}",
+                            crate::redact::scrub(e, &secrets)
+                        )
+                    });
+                })
+                .unwrap_or_default()
+        }
+        None => Vec::new(),
+    };
     let renditions =
-        crate::subs::plan(&sub_langs, sub_base.is_some(), &info.subtitles, audio_lang.as_deref());
+        crate::subs::plan(&sub_langs, sub_base.is_some(), &info.subtitles, audio_lang.as_deref(), &den_list);
     let text_tracks: Vec<usize> = renditions.iter().filter_map(|r| r.own).collect();
-    let subs = sub_base.map(|base| crate::subs::Subs {
-        base,
-        head_sum: resolved.head.get(..crate::subs::HASH_CHUNK as usize).map(crate::subs::chunk_sum),
-        cache: Default::default(),
-    });
+    let subs = sub_base.map(|base| crate::subs::Subs { base, head_sum, cache: Default::default() });
     let named: Vec<(String, String)> =
         renditions.iter().map(|r| (r.lang.clone(), crate::lang::name(&r.lang))).collect();
     let opened_key = opened_key(&source.base, c);

@@ -158,11 +158,22 @@ fn best_undetermined(tracks: &[SubtitleTrack]) -> Option<usize> {
 /// one language's own tracks — full, SDH, or forced/foreign-parts-only — which is the best one: see `in_context`.
 /// The pick here is provisional where den-subtitles is also asked (`den: true`): whether it actually plays over
 /// a downloaded file is `Session::subtitle_playlist`'s call, made with den-subtitles' own answer in hand.
+///
+/// `den_list` is den-subtitles' own list for the title (fetched before the session answers, at no OpenSubtitles
+/// cost — see `fetch_list`), never the OpenSubtitles quota itself. A language with no own track is promised a
+/// `den: true` rendition only when `den_list` already names a candidate for it: without this, a viewer's
+/// preferred language with nothing servable anywhere still got a slot on the strength of "den-subtitles may
+/// have it", which the web menu then offered and loaded empty (the Fauda S1E3 phantom-English report). A
+/// language the release's own track already covers (`own: Some`) is unaffected either way — it has something to
+/// show regardless of what the list says. An empty `den_list` (the fetch failed, timed out, or genuinely found
+/// nothing) is read the same as "nothing": the safe default is to drop a den-only rendition, not to promise one
+/// on a guess.
 pub fn plan(
     requested: &[String],
     den: bool,
     tracks: &[SubtitleTrack],
     audio_lang: Option<&str>,
+    den_list: &[Entry],
 ) -> Vec<Rendition> {
     let mut own: Vec<(String, usize)> = Vec::new();
     for t in tracks {
@@ -203,6 +214,10 @@ pub fn plan(
         .iter()
         .filter_map(|l| {
             let own = found(l);
+            // Own-backed languages keep `den` as asked — den-subtitles may still out-rank the own track
+            // (`own_wins`). A den-only slot needs `den_list` to already name this language.
+            let den =
+                den && (own.is_some() || den_list.iter().any(|e| crate::lang::canonical(&e.lang) == *l));
             (den || own.is_some()).then(|| Rendition { lang: (*l).to_string(), den, own })
         })
         .collect();
@@ -375,6 +390,48 @@ pub fn list_url(
 
 pub fn parse_list(body: &[u8]) -> Vec<Entry> {
     serde_json::from_slice::<List>(body).map(|l| l.subtitles).unwrap_or_default()
+}
+
+/// The release identity `fetch_list` hashes and names it by: scout's title id, where its bytes can be
+/// read from, the first half of its OpenSubtitles hash (from the head read when it was opened), its size
+/// and its filename.
+pub struct Release<'a> {
+    pub id: &'a str,
+    pub input: &'a str,
+    pub head_sum: Option<u64>,
+    pub size: Option<u64>,
+    pub filename: &'a str,
+}
+
+/// den-subtitles' list for a title, with the release's hash, size and filename as hints — one request,
+/// never counted against OpenSubtitles' own quota. Shared by `session::create` (to decide, before the
+/// session answers, which `den: true` renditions `plan()` may promise) and `Session::list_subtitles`
+/// (lazily, once a rendition is actually opened) so the hash and the request can never drift between the
+/// two call sites.
+pub async fn fetch_list(
+    http: &reqwest::Client,
+    source_http: &reqwest::Client,
+    base: &str,
+    release: &Release<'_>,
+) -> Result<Vec<Entry>, String> {
+    let hash = match (release.size, release.head_sum) {
+        (Some(size), Some(head_sum)) if size >= HASH_CHUNK => {
+            crate::probe::read_range(source_http, release.input, size - HASH_CHUNK, HASH_CHUNK)
+                .await
+                .ok()
+                .filter(|t| t.len() as u64 == HASH_CHUNK)
+                .map(|tail| movie_hash(size, head_sum, chunk_sum(&tail)))
+        }
+        _ => None,
+    };
+    let Some(url) = list_url(base, release.id, hash.as_deref(), release.size, release.filename) else {
+        return Ok(Vec::new());
+    };
+    let resp = http.get(&url).send().await.map_err(|e| e.without_url().to_string())?;
+    if !resp.status().is_success() {
+        return Err(format!("den-subtitles answered {}", resp.status().as_u16()));
+    }
+    crate::probe::read_capped(resp, MAX_LIST).await.map(|b| parse_list(&b))
 }
 
 /// The same entry, asked for as the caller's own last resort: den-subtitles refuses a real but
@@ -625,18 +682,19 @@ mod tests {
         // single-language film reads as "barely any subtitles". The untagged track at 5 fills the one slot
         // left over, filed under `UNDETERMINED`.
         assert_eq!(
-            plan(&named, false, &tracks, None),
+            plan(&named, false, &tracks, None, &[]),
             [
                 Rendition { lang: "fi".into(), den: false, own: Some(2) },
                 Rendition { lang: "en".into(), den: false, own: Some(3) },
                 Rendition { lang: "und".into(), den: false, own: Some(5) },
             ]
         );
-        // With it, every language asked for is a rendition — den-subtitles may have it — and English, guaranteed
-        // a place right after the viewer's own first choice, outranks "de", named second, which the release lacks.
-        // The untagged track still rides along after, same as before.
+        // With it AND a den-subtitles list that actually names "de": every language asked for is a
+        // rendition, and English, guaranteed a place right after the viewer's own first choice, outranks
+        // "de", named second, which the release lacks. The untagged track still rides along after, same
+        // as before.
         assert_eq!(
-            plan(&named, true, &tracks, None),
+            plan(&named, true, &tracks, None, &[den_entry("de")]),
             [
                 Rendition { lang: "fi".into(), den: true, own: Some(2) },
                 Rendition { lang: "en".into(), den: true, own: Some(3) },
@@ -644,7 +702,31 @@ mod tests {
                 Rendition { lang: "und".into(), den: false, own: Some(5) },
             ]
         );
-        assert!(plan(&[], false, &[track("S_HDMV/PGS", Some("eng"), false, false)], None).is_empty());
+        assert!(plan(&[], false, &[track("S_HDMV/PGS", Some("eng"), false, false)], None, &[]).is_empty());
+    }
+
+    /// den-remux#<TODO>: with den-subtitles connected, `plan()` used to promise a `den: true` rendition for
+    /// every preferred language regardless of whether den-subtitles had anything to serve — "den-subtitles
+    /// may have it" — so the web menu offered a language nothing could play (Fauda S1E3: Swedish/English
+    /// preferences, a Polish-only release, den-subtitles listing Hebrew and Polish but no English or
+    /// Swedish). Neither phantom language may appear; Polish, backed by the release's own track, still does.
+    #[test]
+    fn a_den_only_rendition_needs_a_candidate_in_den_subtitles_own_list() {
+        let tracks = [track("S_TEXT/UTF8", Some("pl"), true, false)];
+        let requested = ["sv".to_string(), "en".to_string()];
+        let den_list = [den_entry("he"), den_entry("pl")];
+        let renditions = plan(&requested, true, &tracks, None, &den_list);
+        let langs: Vec<&str> = renditions.iter().map(|r| r.lang.as_str()).collect();
+        assert!(!langs.contains(&"sv"), "{langs:?}");
+        assert!(!langs.contains(&"en"), "{langs:?}");
+        assert_eq!(renditions, [Rendition { lang: "pl".into(), den: false, own: Some(0) }], "{langs:?}");
+
+        // An empty list (the fetch failed, timed out, or genuinely found nothing) is read the same way:
+        // no den-only rendition is promised on a guess.
+        let renditions = plan(&requested, true, &tracks, None, &[]);
+        let langs: Vec<&str> = renditions.iter().map(|r| r.lang.as_str()).collect();
+        assert!(!langs.contains(&"sv"), "{langs:?}");
+        assert!(!langs.contains(&"en"), "{langs:?}");
     }
 
     #[test]
@@ -653,7 +735,7 @@ mod tests {
             .iter()
             .map(|l| track("S_TEXT/UTF8", Some(l), true, false))
             .collect();
-        assert_eq!(plan(&[], false, &tracks, None).len(), MAX_LANGUAGES);
+        assert_eq!(plan(&[], false, &tracks, None, &[]).len(), MAX_LANGUAGES);
     }
 
     /// The real bug this fix was filed against: a release with 30 embedded languages, in the muxer's own
@@ -671,19 +753,19 @@ mod tests {
         // The viewer's own languages lead — English guaranteed right behind the first of them even though it
         // wasn't named — then the rest fills from the release in file order.
         let preferred = ["sv".to_string(), "fi".to_string()];
-        let out = plan(&preferred, false, &tracks, None);
+        let out = plan(&preferred, false, &tracks, None, &[]);
         let langs: Vec<&str> = out.iter().map(|r| r.lang.as_str()).collect();
         assert_eq!(langs, ["sv", "en", "fi", "ar", "cs", "da", "de", "el"], "{langs:?}");
         assert_eq!(out.len(), MAX_LANGUAGES);
 
         // A preference that already leads with English keeps it first rather than inserting a duplicate.
         let english_first = ["en".to_string(), "sv".to_string()];
-        let out = plan(&english_first, false, &tracks, None);
+        let out = plan(&english_first, false, &tracks, None, &[]);
         assert_eq!((out[0].lang.as_str(), out[1].lang.as_str()), ("en", "sv"));
 
         // No named preference at all: English still leads when the release carries it, ahead of the session's
         // own audio language, which in turn outranks the rest of the release's languages.
-        let out = plan(&[], false, &tracks, Some("fi"));
+        let out = plan(&[], false, &tracks, Some("fi"), &[]);
         let langs: Vec<&str> = out.iter().map(|r| r.lang.as_str()).collect();
         assert_eq!(&langs[..2], ["en", "fi"], "{langs:?}");
     }
@@ -708,7 +790,7 @@ mod tests {
         let requested = ["en".to_string()];
         // No audio language known: neither Hebrew nor English is a dub-in-its-own-language context, so the
         // plain full-over-SDH-over-forced order applies throughout.
-        let renditions = plan(&requested, false, &tracks, None);
+        let renditions = plan(&requested, false, &tracks, None, &[]);
         // The full track at 5 now correctly beats the SDH track at 4 (`own_tier`/`best_own`), and the full
         // Hebrew track at 1 beats the forced one at 0 — track order no longer decides it. Hebrew rides
         // along too: `plan()` offers every own-track language, not only the requested one, when nothing
@@ -759,7 +841,7 @@ mod tests {
         // The viewer asked for English; the release tags none, so the preferred pass finds nothing there — but
         // the untagged track at 6 fills a slot in the backfill, at the position its file order earns it:
         // ahead of "es" and everything after, same as a tagged language at 6 would have outranked them.
-        let renditions = plan(&requested, false, &tracks, Some("he"));
+        let renditions = plan(&requested, false, &tracks, Some("he"), &[]);
         let langs: Vec<(&str, Option<usize>)> = renditions.iter().map(|r| (r.lang.as_str(), r.own)).collect();
         assert_eq!(
             langs,
@@ -801,7 +883,7 @@ mod tests {
         ];
         let requested = ["en".to_string()];
         assert_eq!(
-            plan(&requested, false, &tracks, None),
+            plan(&requested, false, &tracks, None, &[]),
             [Rendition { lang: "en".into(), den: false, own: Some(1) }]
         );
     }
@@ -818,12 +900,12 @@ mod tests {
         let requested = ["en".to_string()];
         // Without a dub context, full still wins, same as any other language.
         assert_eq!(
-            plan(&requested, false, &tracks, None),
+            plan(&requested, false, &tracks, None, &[]),
             [Rendition { lang: "en".into(), den: false, own: Some(0) }]
         );
         // The session's own audio is an English dub: forced is now the better own candidate.
         assert_eq!(
-            plan(&requested, false, &tracks, Some("en")),
+            plan(&requested, false, &tracks, Some("en"), &[]),
             [Rendition { lang: "en".into(), den: false, own: Some(1) }]
         );
     }
@@ -838,11 +920,11 @@ mod tests {
         let swedish = [track("S_TEXT/UTF8", Some("swe"), true, true)];
         let requested = ["sv".to_string()];
         // English audio: not a Swedish dub. The forced Swedish track is no candidate at all.
-        assert!(plan(&requested, false, &swedish, Some("en")).is_empty());
+        assert!(plan(&requested, false, &swedish, Some("en"), &[]).is_empty());
         assert_eq!(best_own(&swedish, "sv", Some("en")), None);
         // A Swedish dub: now it's the only, and therefore the default, candidate.
         assert_eq!(
-            plan(&requested, false, &swedish, Some("sv")),
+            plan(&requested, false, &swedish, Some("sv"), &[]),
             [Rendition { lang: "sv".into(), den: false, own: Some(0) }]
         );
         assert_eq!(best_own(&swedish, "sv", Some("sv")), Some(0));
@@ -891,14 +973,15 @@ mod tests {
             assert!(own_wins(&own, Some(&den_entry("en")), true));
         }
 
-        /// A release with no own English track at all: den-subtitles is used — there is no own candidate for
-        /// `own_wins` to call, and `plan()` never puts one in a `Rendition` to call it with.
+        /// A release with no own English track at all, and den-subtitles' own list naming English as a
+        /// candidate: den-subtitles is used — there is no own candidate for `own_wins` to call, and
+        /// `plan()` never puts one in a `Rendition` to call it with.
         #[test]
         fn no_own_track_means_plan_names_none() {
             let tracks = [track("S_HDMV/PGS", Some("eng"), false, false)];
             let requested = ["en".to_string()];
             assert_eq!(
-                plan(&requested, true, &tracks, None),
+                plan(&requested, true, &tracks, None, &[den_entry("en")]),
                 [Rendition { lang: "en".into(), den: true, own: None }]
             );
         }

@@ -359,9 +359,13 @@ async fn origin_handle(
             _ => origin_degraded(502, "sparse"),
         };
     }
-    // den-subtitles, install `flaky`: its list and its subtitle each fail the first time they are asked for.
+    // den-subtitles, install `flaky`: its list fails the SECOND time it's asked, and its subtitle fails
+    // the first time it's asked. The list's first call is `session::create`'s own pre-session check
+    // (whether to promise a den-only rendition at all) — that one must succeed, or no rendition is ever
+    // created for the player to retry against; the one it's testing for retry is the lazy fetch a played
+    // rendition makes on its own.
     if path.starts_with("/flaky/subtitles/movie/tt0000001/") {
-        if FLAKY_LISTS.fetch_add(1, Relaxed) == 0 {
+        if FLAKY_LISTS.fetch_add(1, Relaxed) == 1 {
             return origin_full(500, "");
         }
         let url = format!("http://{addr}/flaky/subtitle/1.srt?lang=eng");
@@ -2432,7 +2436,9 @@ fn assert_kept_for_session(r: &Reply, expires: u64, what: &str) {
 }
 
 /// A den-subtitles list or subtitle that fails is asked for again on the player's next request, and served empty
-/// and unkept meanwhile; once found, the subtitle is kept for the session and not fetched again.
+/// and unkept meanwhile; once found, the subtitle is kept for the session and not fetched again. The session's
+/// own pre-creation list check (whether to promise the `en` rendition at all) succeeds — see the `flaky` fixture
+/// — so this exercises only the lazy, per-rendition retry a played subtitle makes on its own.
 #[tokio::test]
 async fn a_subtitle_that_failed_once_is_tried_again() {
     let origin = origin().await;
@@ -2452,7 +2458,9 @@ async fn a_subtitle_that_failed_once_is_tried_again() {
     assert!(found.text().contains("Hello"), "{}", found.text());
     assert_kept_for_session(&found, j["expiresAt"].as_u64().unwrap(), "sub0.vtt");
     assert!(call(&state, "GET", &vtt, None, "").await.text().contains("Hello"));
-    assert_eq!((FLAKY_LISTS.load(Relaxed), FLAKY_SUBTITLES.load(Relaxed)), (2, 2), "kept once found");
+    // 3 list calls: `create`'s own pre-session check (succeeds), the lazy fetch's first try (fails), its
+    // retry (succeeds). 2 subtitle calls: the first try (fails), the retry (succeeds).
+    assert_eq!((FLAKY_LISTS.load(Relaxed), FLAKY_SUBTITLES.load(Relaxed)), (3, 2), "kept once found");
     state.end_all("test").await;
 }
 
