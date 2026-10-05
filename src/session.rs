@@ -304,6 +304,18 @@ fn is_last(gops: &[Gop], g: &Gop) -> bool {
     !gops.iter().any(|o| o.job == g.job && o.idx > g.idx)
 }
 
+/// What trying one subtitle candidate produced. A refusal splits in two because den-remux cannot
+/// otherwise tell them apart — both are a non-2xx — and only one of them is worth a second request:
+/// `Sparse` (den-subtitles' `X-Den-Degraded: sparse`) names a real, too-sparse-for-its-span track
+/// that its own `?sparse=1` can still serve; `Refused` covers everything else (a cue-less body, an
+/// expired link, a dead upload, a transient failure, an origin this install does not allow) — asking
+/// again with the flag would refuse those identically and spend a metered credit doing it.
+enum Fetched {
+    Found(String),
+    Sparse,
+    Refused,
+}
+
 impl Session {
     fn lock(&self) -> MutexGuard<'_, Inner> {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
@@ -948,10 +960,31 @@ impl Session {
             .take(3)
             .collect();
         let mut doc = None;
-        for url in offered {
-            if let Some(d) = self.fetch_subtitle(st, sb, &url).await {
-                doc = Some(d);
-                break;
+        // Only a candidate den-subtitles itself named `sparse` (`X-Den-Degraded`, read by
+        // `fetch_subtitle`) is worth asking again below — never one refused for any other reason
+        // (a cue-less body, an expired link, a dead upload, a transient blip): `?sparse=1` would
+        // refuse those identically, for a second metered credit spent finding that out again.
+        let mut sparse_candidates: Vec<&String> = Vec::new();
+        for url in &offered {
+            match self.fetch_subtitle(st, sb, url).await {
+                Fetched::Found(d) => {
+                    doc = Some(d);
+                    break;
+                }
+                Fetched::Sparse => sparse_candidates.push(url),
+                Fetched::Refused => {}
+            }
+        }
+        // Every candidate den-subtitles offered for this language was tried, and the only ones that
+        // refused as `sparse` are retried with `sparse=1` — the caller's own last resort — best-ranked
+        // first, same as the strict pass above. This never overrides a non-sparse candidate: it only
+        // runs once the whole strict pass has already failed to find one.
+        if doc.is_none() {
+            for url in sparse_candidates {
+                if let Fetched::Found(d) = self.fetch_subtitle(st, sb, &crate::subs::with_sparse(url)).await {
+                    doc = Some(d);
+                    break;
+                }
             }
         }
         let doc = doc?;
@@ -1008,7 +1041,7 @@ impl Session {
     }
 
     /// One subtitle as HLS WebVTT, if it is on an allowed origin and is WebVTT.
-    async fn fetch_subtitle(&self, st: &AppState, sb: &crate::subs::Subs, url: &str) -> Option<String> {
+    async fn fetch_subtitle(&self, st: &AppState, sb: &crate::subs::Subs, url: &str) -> Fetched {
         use crate::subs;
         let vtt = subs::vtt_url(url);
         if !subs::on_origin(&vtt, &st.cfg.subtitle_origins) {
@@ -1019,18 +1052,41 @@ impl Session {
                     rid_tail(self.rid.as_deref())
                 )
             });
-            return None;
+            return Fetched::Refused;
         }
         let vtt = crate::config::local(&vtt, &st.cfg.origin_aliases);
-        let fetched = async {
-            let resp = st.scout_http.get(&vtt).send().await.map_err(|e| e.without_url().to_string())?;
-            if !resp.status().is_success() {
-                return Err(format!("a subtitle answered {}", resp.status().as_u16()));
+        let resp = match st.scout_http.get(&vtt).send().await {
+            Ok(resp) => resp,
+            Err(e) => {
+                let e = e.without_url().to_string();
+                crate::log_limited("subtitle_fetch", || {
+                    format!(
+                        "session {}: {}{}",
+                        self.short(),
+                        crate::redact::scrub(&e, &[sb.base.as_str()]),
+                        rid_tail(self.rid.as_deref())
+                    )
+                });
+                return Fetched::Refused;
             }
-            crate::probe::read_capped(resp, subs::MAX_SUBTITLE).await
         };
-        match fetched.await {
-            Ok(body) => subs::for_hls(&body),
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let sparse = resp.headers().get("x-den-degraded").is_some_and(|v| v == "sparse");
+            crate::log_limited("subtitle_fetch", || {
+                format!(
+                    "session {}: a subtitle answered {status}{}",
+                    self.short(),
+                    rid_tail(self.rid.as_deref())
+                )
+            });
+            return if sparse { Fetched::Sparse } else { Fetched::Refused };
+        }
+        match crate::probe::read_capped(resp, subs::MAX_SUBTITLE).await {
+            Ok(body) => match subs::for_hls(&body) {
+                Some(doc) => Fetched::Found(doc),
+                None => Fetched::Refused,
+            },
             Err(e) => {
                 crate::log_limited("subtitle_fetch", || {
                     format!(
@@ -1040,7 +1096,7 @@ impl Session {
                         rid_tail(self.rid.as_deref())
                     )
                 });
-                None
+                Fetched::Refused
             }
         }
     }

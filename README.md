@@ -99,7 +99,13 @@ itself is never logged. Brave on iOS sends Safari's User-Agent, so it reads as S
   so an unset preference remains off and the player or receiver can select one. Nothing is fetched until a player opens one:
   then den-remux asks den-subtitles for the title with the release's OpenSubtitles hash, size and
   filename (the Apple TV's hints, so an exact-encode match ranks first) and serves the first subtitle in
-  that language. A subtitle URL off `SUBTITLE_ORIGINS` is skipped.
+  that language that den-subtitles actually serves — trying each listed candidate in rank order until
+  one succeeds. A subtitle URL off `SUBTITLE_ORIGINS` is skipped. If EVERY candidate in a language
+  refuses, but den-subtitles named at least one of those refusals `sparse` (`X-Den-Degraded: sparse` —
+  a real track, just too little of it for its span, e.g. a dubbed release's captions), den-remux asks
+  again for that one with `?sparse=1`: den-subtitles' own last resort, serving it rather than leaving
+  the language empty. A candidate refused for any other reason (a cue-less body, an expired link, a
+  dead upload, a transient failure) is never retried this way.
   **The release's own text tracks** — SRT, ASS/SSA, WebVTT, `mov_text` — are the fallback where den-subtitles lists
   nothing in a language, and add the release's other languages (up to eight renditions in all, the languages asked for
   first), with or without a den-subtitles install. Matroska interleaves them with the video, so a separate pass would

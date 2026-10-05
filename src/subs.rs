@@ -377,6 +377,19 @@ pub fn parse_list(body: &[u8]) -> Vec<Entry> {
     serde_json::from_slice::<List>(body).map(|l| l.subtitles).unwrap_or_default()
 }
 
+/// The same entry, asked for as the caller's own last resort: den-subtitles refuses a real but
+/// too-sparse-for-its-span track (a dubbed release's captions, say) on a plain request, so a language
+/// with nothing else offered would otherwise come back empty. `?sparse=1` is only ever tried after
+/// every candidate for a language has already been fetched and refused (see `Session::subtitle`) —
+/// den-subtitles still refuses anything that isn't a real, merely-incomplete track (a cue-less body,
+/// an expired link, a dead upload) regardless of this flag.
+pub fn with_sparse(url: &str) -> String {
+    match url.contains('?') {
+        true => format!("{url}&sparse=1"),
+        false => format!("{url}?sparse=1"),
+    }
+}
+
 /// den-subtitles serves every subtitle as `.srt` or, the same document, `.vtt`.
 pub fn vtt_url(url: &str) -> String {
     let (path, query) = match url.split_once('?') {
@@ -562,6 +575,24 @@ mod tests {
         assert!(on_origin("http://192.168.86.193:8093/c/subtitle/9.vtt?x=1", &allowed));
         assert!(!on_origin("http://169.254.169.254/latest", &allowed));
         assert!(!on_origin("http://u@192.168.86.193:8093/c", &allowed));
+    }
+
+    /// The last-resort retry's query has to land correctly whether den-subtitles' entry already
+    /// carries one (`?ref=`/`&lang=`, from a hash-matched or legacy-encoded sub) or not — and
+    /// `vtt_url`'s own query-preserving split must still find `sparse=1` afterwards, since
+    /// `fetch_subtitle` runs that AFTER this.
+    #[test]
+    fn with_sparse_appends_to_whichever_query_shape_the_entry_already_has() {
+        assert_eq!(with_sparse("http://s/c/subtitle/9.srt"), "http://s/c/subtitle/9.srt?sparse=1");
+        assert_eq!(
+            with_sparse("http://s/c/subtitle/9.srt?ref=5&lang=en"),
+            "http://s/c/subtitle/9.srt?ref=5&lang=en&sparse=1"
+        );
+        // `vtt_url` must still carry it through to the `.vtt` form fetch_subtitle actually requests.
+        assert_eq!(
+            vtt_url(&with_sparse("http://s/c/subtitle/9.srt?lang=fin")),
+            "http://s/c/subtitle/9.vtt?lang=fin&sparse=1"
+        );
     }
 
     fn track(codec: &str, language: Option<&str>, text: bool, forced: bool) -> SubtitleTrack {
