@@ -1048,7 +1048,7 @@ async fn run(cfg: Config) -> std::io::Result<()> {
     eprintln!(
         "den-remux {} listening on :{} — metrics={} log_requests={} scout_origins={} scout_key={} scout_install={} \
          browser_keys={} url_key={} trusted_proxies={} public_session_proxy={} \
-         max_sessions={} per_install={} active_remuxes={} producer_idle={}s session_idle={}s scratch={} \
+         max_sessions={} per_install={} active_remuxes={} producer_idle={}s uplink={} session_idle={}s scratch={} \
          scratch_max={} ffmpeg={} transcode={}",
         env!("CARGO_PKG_VERSION"),
         state.cfg.port,
@@ -1065,6 +1065,7 @@ async fn run(cfg: Config) -> std::io::Result<()> {
         state.cfg.max_sessions_per_install,
         state.cfg.max_active_remuxes,
         state.cfg.producer_idle.as_secs(),
+        state.cfg.uplink_bps.map_or_else(|| "unset".to_string(), |b| format!("{}Mbit/s", b / 1_000_000)),
         state.cfg.session_idle.as_secs(),
         state.cfg.scratch_dir.display(),
         state.cfg.scratch_max_bytes,

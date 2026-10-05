@@ -623,6 +623,13 @@ impl AppState {
         })
     }
 
+    /// Whether a `producer_slots` permit is available right now — cheap and synchronous, so a session about to
+    /// wait for one can first ask whether reaping a passing victim (`Session::reap_for_contention`) would even
+    /// help, rather than always walking every other session's state for nothing.
+    pub fn producer_slots_busy(&self) -> bool {
+        self.producer_slots.available_permits() == 0
+    }
+
     pub fn known(&self) -> MutexGuard<'_, KnownReleases> {
         self.known.lock().unwrap_or_else(|e| e.into_inner())
     }
