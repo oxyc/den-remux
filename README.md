@@ -499,9 +499,9 @@ signing, cookies, redaction, release picking, the scoped-scout validation, and a
 fake scout that refuses a scoped config without the key and a file host that fails if it ever sees the
 key. The `#[ignore]`d tests drive the whole path with real ffmpeg: five end-to-end remuxes (H.264, HEVC and AV1
 Matroska, MP4, and a 5.1 and a 7.1 track converted to AAC 5.1), the session cap, the idle kill (ffmpeg killed and reaped), and `DELETE` → 410. They
-run in the Dockerfile's `test` stage, against the ffmpeg the image ships — another version seeks
-differently (ffmpeg 8.0 lands a restarted H.264 Matroska run one keyframe early), and the alignment
-depends on exactly how it seeks. CI's `e2e` job runs the same:
+run in the Dockerfile's `test` stage, against the ffmpeg the image ships. Local ffmpeg 8.0 lands a restarted
+H.264 Matroska run one keyframe early; the tests admit only that bounded one-GOP rewind locally while keeping
+the image's segment timing exact. CI's `e2e` job runs the image path:
 
 ```bash
 docker build --target test .
