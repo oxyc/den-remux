@@ -546,18 +546,30 @@ impl Job {
     }
 
     /// Stop ffmpeg where it is: no CPU, no reads. The window ahead of the player is full.
+    ///
+    /// Gives its `MAX_ACTIVE_REMUXES` permit back too: a SIGSTOPped process costs no CPU and little memory, so
+    /// the cap only needs to bound what is actually RUNNING at once, not every session merely holding a
+    /// paused one a few segments ahead of its player. `resume` has to be handed a fresh permit for exactly
+    /// this reason — one has to be had again from the same pool before this can run any more.
     pub fn pause(&mut self) {
         if self.exit.is_none() && !self.stopped {
             signal_group(self.pid, libc::SIGSTOP);
             self.stopped = true;
             self.paused_since = Some(Instant::now());
+            self.permit = None;
         }
     }
 
-    pub fn resume(&mut self) {
-        if self.exit.is_none() && self.stopped {
+    /// Whether this job is paused and could run again given a permit — never true once it has exited.
+    pub fn resumable(&self) -> bool {
+        self.exit.is_none() && self.stopped
+    }
+
+    pub fn resume(&mut self, permit: crate::state::ProducerPermit) {
+        if self.resumable() {
             signal_group(self.pid, libc::SIGCONT);
             self.stopped = false;
+            self.permit = Some(permit);
             if let Some(since) = self.paused_since.take() {
                 self.paused += since.elapsed();
             }

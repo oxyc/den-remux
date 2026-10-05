@@ -209,16 +209,19 @@ const MIN_SCRATCH_BYTES: u64 = 64 * 1024 * 1024;
 /// minutes and comes back, so a player picks up where it was rather than starting over. The public gate's grant for
 /// it is refreshed every 30 s while the session exists, so the two don't part.
 pub const SESSION_IDLE_SECS: u64 = 600;
-pub const DEFAULT_MAX_SESSIONS: usize = 2;
+/// Raised 2 -> 4 alongside `DEFAULT_MAX_ACTIVE_REMUXES` below (render-env on `den` master): the box already
+/// runs both at 4.
+pub const DEFAULT_MAX_SESSIONS: usize = 4;
 /// A copy-remux is one ffmpeg thread (`-threads 1`) doing no decode or encode, so it costs little: the
-/// container's own 512 MB idles at a couple of megabytes. 4 lets a third concurrent viewer (a browser
-/// replacing one release with another while another session plays) never have to steal an actively watched
-/// session's producer to get one — see `should_reap_parked`. The GPU transcode path has its own, separate
-/// ceiling (`MAX_TRANSCODES`).
+/// container's own 512 MB idles at a couple of megabytes. The GPU transcode path has its own, separate
+/// ceiling (`MAX_TRANSCODES`). Pausing for a full ahead window gives the slot straight back regardless of this
+/// cap (`Job::pause`), so it only ever bounds jobs actually RUNNING at once, not every session merely holding
+/// one a few segments ahead of its player.
 pub const DEFAULT_MAX_ACTIVE_REMUXES: usize = 4;
-/// Also how recently a session must have been asked of to count as actively watched — a job merely paused for
-/// filling `AHEAD_SEGMENTS` is not idle, only unneeded for a few seconds yet, and killing it on a passing
-/// contender's behalf forces the next request into a cold restart a native player's own patience won't survive.
+/// How recently a session must have been asked of to count as actively watched: below this, a STOPPED job's
+/// process is kept around rather than killed (`supervise`'s own housekeeping), and a RUNNING one's permit is
+/// never taken for a passing contender (`Session::reap_for_contention`) — only a job whose own session has
+/// gone quiet this long is ever a sound victim either way.
 pub const DEFAULT_PRODUCER_IDLE_SECS: u64 = 30;
 
 /// How long a mid-film replacement has to serve its first segment before it is ended as abandoned: a start is

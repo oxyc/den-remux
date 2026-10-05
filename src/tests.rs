@@ -1357,7 +1357,9 @@ async fn a_paused_session_releases_its_producer_and_resumes_on_demand() {
 #[tokio::test]
 #[ignore = "needs ffmpeg"]
 async fn one_two_four_and_eight_sessions_stay_inside_the_active_cap() {
-    const { assert!(crate::config::DEFAULT_MAX_SESSIONS == 2, "raise logical sessions only after rollout") };
+    // Rolled out on the box (render-env, den master) before this default followed — raise it again only once
+    // the next value is live there too.
+    const { assert!(crate::config::DEFAULT_MAX_SESSIONS == 4, "raise logical sessions only after rollout") };
     for count in [1usize, 2, 4, 8] {
         let origin = origin().await;
         let state = test_state(&origin, 8, Duration::from_secs(600));

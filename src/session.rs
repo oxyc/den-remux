@@ -535,17 +535,26 @@ impl Session {
             && (!passed || kept)
     }
 
+    /// Whether the session's current job already heads for `n` (`heads_for`) — shared by `producer_needed` and
+    /// `ensure_job`, which both need the same answer for different reasons.
+    fn job_heads_for(&self, i: &Inner, n: usize) -> bool {
+        let first_keyframe = self.info.keyframes.first().copied().unwrap_or(0.0);
+        i.job.as_ref().is_some_and(|j| {
+            j.exit.is_none()
+                && Self::heads_for(&self.segments, n, first_keyframe, j.id, j.start, j.next_start, &i.gops)
+        })
+    }
+
     fn producer_needed(&self, i: &Inner, n: usize) -> Result<bool, ()> {
         if i.ended {
             return Err(());
         }
-        let first_keyframe = self.info.keyframes.first().copied().unwrap_or(0.0);
-        let keep = i.job.as_ref().is_some_and(|j| {
-            j.exit.is_none()
-                && Self::heads_for(&self.segments, n, first_keyframe, j.id, j.start, j.next_start, &i.gops)
-        });
-        if keep {
-            return Ok(false);
+        if self.job_heads_for(i, n) {
+            // Running, it is only a matter of time. Stopped, it gave its permit back when it paused
+            // (`Job::pause`) and needs one again before it can produce any further — not a restart, `gate`'s
+            // own best-effort resume may already be racing this, but "needed" all the same so a request this
+            // job alone can answer isn't left relying only on that.
+            return Ok(i.job.as_ref().is_some_and(|j| j.stopped));
         }
         // A run failed without output: the next one waits for `reresolve_if_needed` to fetch a fresh link.
         if i.failures > 0 && !i.reresolved {
@@ -567,6 +576,16 @@ impl Session {
         permit: crate::state::ProducerPermit,
     ) -> Result<(), ()> {
         if !self.producer_needed(i, n)? {
+            return Ok(());
+        }
+        // Already heads for it, only stopped for want of a permit: a SIGCONT, not a seek into the source and a
+        // fresh ffmpeg. `gate`'s own best-effort resume may have already won this race while the permit above
+        // was being waited for — in which case the job is running again and this permit simply isn't used,
+        // dropped back to the pool for whoever is next.
+        if self.job_heads_for(i, n) {
+            if let Some(job) = i.job.as_mut().filter(|j| j.resumable()) {
+                job.resume(permit);
+            }
             return Ok(());
         }
         let (start, seek) = self.restart_point(n);
@@ -615,13 +634,13 @@ impl Session {
         }
     }
 
-    /// The sid of the best parked job to reap for a session about to wait for a producer slot: among
-    /// `candidates` (every OTHER session with one parked, paired with how long since its own last request),
-    /// the one idle longest — but only once idle for at least `min_idle`. `None` when every candidate is
-    /// still within `min_idle`: none of them is a sound victim, because a job merely paused for filling its
-    /// ahead window is not idle, only unneeded for a few seconds yet — stealing it forces that session's own
-    /// next request into a cold restart a native player's patience won't survive (`Session::prepare`'s doc).
-    /// The waiter is then the one with nothing playing yet, so it queues fairly instead.
+    /// The sid of the best RUNNING job to reap for a session about to wait for a producer slot: among
+    /// `candidates` (every OTHER session with one actually running, paired with how long since its own last
+    /// request), the one idle longest — but only once idle for at least `min_idle`. `None` when every
+    /// candidate is still within `min_idle`: none of them is a sound victim, and the waiter queues fairly
+    /// instead. A job merely paused for filling its ahead window is never a candidate at all — it gave its
+    /// permit back when it paused (`Job::pause`), so there is nothing to take from it; only a job genuinely
+    /// still running past its own session going quiet is an abandoned one worth taking back.
     fn pick_reap_victim<'a>(
         candidates: impl Iterator<Item = (&'a str, Duration)>,
         min_idle: Duration,
@@ -630,9 +649,11 @@ impl Session {
     }
 
     /// Free a producer slot for `waiter`, about to wait for one, by reaping the best candidate among every
-    /// OTHER session's parked job (`pick_reap_victim`). Does nothing, and logs nothing, when none qualifies:
-    /// every parked job's session is still within `min_idle` of its own last request, so there is no spare
-    /// capacity right now, and `waiter` simply queues fairly for the next one to free up on its own.
+    /// OTHER session's RUNNING job (`pick_reap_victim`) — a producer still running after its own session has
+    /// gone quiet for `min_idle`, which, with `gate`'s pause already giving back a merely ahead-and-paused
+    /// job's permit on its own, is now the only kind of "stuck" producer there is. Does nothing, and logs
+    /// nothing, when none qualifies: every running job's session is still within `min_idle` of its own last
+    /// request, so there is genuinely no spare capacity right now, and `waiter` simply queues fairly.
     async fn reap_for_contention(st: &AppState, waiter: &str, min_idle: Duration) {
         let victim = {
             let sessions = st.sessions();
@@ -641,7 +662,10 @@ impl Session {
                 .filter(|(sid, _)| sid.as_str() != waiter)
                 .filter_map(|(sid, s)| {
                     let i = s.lock();
-                    i.job.as_ref().and_then(Job::parked_for).map(|_| (sid.clone(), i.last_seen.elapsed()))
+                    i.job
+                        .as_ref()
+                        .filter(|j| j.exit.is_none() && !j.stopped)
+                        .map(|_| (sid.clone(), i.last_seen.elapsed()))
                 })
                 .collect();
             Self::pick_reap_victim(ages.iter().map(|(sid, age)| (sid.as_str(), *age)), min_idle)
@@ -651,8 +675,9 @@ impl Session {
         let Some(victim_session) = st.sessions().get(&victim_sid).cloned() else { return };
         let reaped = {
             let mut i = victim_session.lock();
-            match i.job.as_ref().and_then(Job::parked_for) {
-                Some(idle) if idle >= min_idle => i.job.take().map(|job| (job, idle)),
+            let idle = i.last_seen.elapsed();
+            match i.job.as_ref().filter(|j| j.exit.is_none() && !j.stopped) {
+                Some(_) if idle >= min_idle => i.job.take().map(|job| (job, idle)),
                 _ => None,
             }
         };
@@ -722,8 +747,13 @@ impl Session {
         result
     }
 
-    /// Pause the job once it is `AHEAD_SEGMENTS` past the newest request — or, once that request's
-    /// segment is done, while scratch is over its cap — and resume it when the player catches up.
+    /// Pause the job once it is `AHEAD_SEGMENTS` past the newest request — or, once that request's segment is
+    /// done, while scratch is over its cap — and resume it when the player catches up, given a free permit.
+    ///
+    /// The resume is best-effort and non-blocking: this runs from inside the session's own lock, so it cannot
+    /// wait for one. Finding none free costs nothing beyond leaving the job paused a moment longer — the
+    /// session's own next request for a segment this job no longer covers falls back to the fair, async wait
+    /// in `start_producer` regardless, which resumes the very same job rather than restarting it (`ensure_job`).
     fn gate(&self, i: &mut Inner, st: &AppState) {
         let last = self.segments.len() - 1;
         // A segment further, with the release's own subtitles: a player asks for a subtitle segment as far ahead as
@@ -736,8 +766,10 @@ impl Session {
             let ahead = j.next_start >= limit - SNAP;
             if ahead || (over_cap && j.next_start >= wanted_done - SNAP) {
                 j.pause();
-            } else {
-                j.resume();
+            } else if j.resumable() {
+                if let Some(permit) = st.try_acquire_producer_slot(self.transcoded) {
+                    j.resume(permit);
+                }
             }
         }
     }
