@@ -723,10 +723,7 @@ fn ffprobe(args: &[&str], file: &Path) -> String {
 }
 
 fn ffmpeg_major() -> Option<u32> {
-    let out = std::process::Command::new(tool("FFMPEG_PATH", "ffmpeg"))
-        .arg("-version")
-        .output()
-        .ok()?;
+    let out = std::process::Command::new(tool("FFMPEG_PATH", "ffmpeg")).arg("-version").output().ok()?;
     let first = String::from_utf8_lossy(&out.stdout).lines().next()?.to_string();
     first.split_whitespace().nth(2)?.split('.').next()?.parse().ok()
 }
