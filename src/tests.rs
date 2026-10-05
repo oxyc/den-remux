@@ -288,12 +288,23 @@ fn origin_full(status: u16, body: impl Into<Bytes>) -> Response<OriginBody> {
     Response::builder().status(status).body(Full::new(body.into()).boxed()).unwrap()
 }
 
+/// den-subtitles' own refusal shape: a non-2xx naming its reason in `X-Den-Degraded` — the one header
+/// den-remux reads to tell a `sparse` refusal (worth a `?sparse=1` retry) apart from any other.
+fn origin_degraded(status: u16, reason: &str) -> Response<OriginBody> {
+    Response::builder()
+        .status(status)
+        .header("x-den-degraded", reason)
+        .body(Full::new(Bytes::new()).boxed())
+        .unwrap()
+}
+
 async fn origin_handle(
     addr: std::net::SocketAddr,
     files: std::net::SocketAddr,
     req: Request<hyper::body::Incoming>,
 ) -> Response<OriginBody> {
     let path = req.uri().path().to_string();
+    let query = req.uri().query().map(str::to_string);
     let keyed = req.headers().get("x-den-remux-key").and_then(|v| v.to_str().ok()) == Some(SCOUT_KEY);
     // The key is for scout alone: the file host — the debrid, here — must never be sent it.
     if path.starts_with("/f/") && req.headers().contains_key("x-den-remux-key") {
@@ -323,6 +334,29 @@ async fn origin_handle(
     }
     if path == "/subs/subtitle/1.vtt" {
         return origin_full(200, "WEBVTT\n\n00:00:01.000 --> 00:00:02.500\nHello\n");
+    }
+    // den-subtitles, install `sparse`: the Fauda S1E3 shape — every English candidate is a real but
+    // too-sparse-for-its-span track, which den-subtitles refuses on a plain request (naming `sparse`
+    // in `X-Den-Degraded`) and serves only for the caller's own last-resort flag (`?sparse=1`). File
+    // 21 is additionally a genuinely dead upload — refused either way, with NO `X-Den-Degraded:
+    // sparse` — so this also proves den-remux only retries the candidate that one actually names.
+    if path.starts_with("/sparse/subtitles/movie/tt0000001/") {
+        let body = serde_json::json!({"subtitles": [
+            {"id": "21", "url": format!("http://{addr}/sparse/subtitle/21.srt"), "lang": "eng"},
+            {"id": "20", "url": format!("http://{addr}/sparse/subtitle/20.srt"), "lang": "eng"}
+        ]});
+        return origin_full(200, body.to_string());
+    }
+    if path == "/sparse/subtitle/21.vtt" {
+        return origin_degraded(502, "no_cues");
+    }
+    if path == "/sparse/subtitle/20.vtt" {
+        return match query.as_deref() {
+            Some("sparse=1") => {
+                origin_full(200, "WEBVTT\n\n00:00:01.000 --> 00:00:02.500\nSparse but real\n")
+            }
+            _ => origin_degraded(502, "sparse"),
+        };
     }
     // den-subtitles, install `flaky`: its list and its subtitle each fail the first time they are asked for.
     if path.starts_with("/flaky/subtitles/movie/tt0000001/") {
@@ -2411,6 +2445,35 @@ async fn a_subtitle_that_failed_once_is_tried_again() {
     assert_kept_for_session(&found, j["expiresAt"].as_u64().unwrap(), "sub0.vtt");
     assert!(call(&state, "GET", &vtt, None, "").await.text().contains("Hello"));
     assert_eq!((FLAKY_LISTS.load(Relaxed), FLAKY_SUBTITLES.load(Relaxed)), (2, 2), "kept once found");
+    state.end_all("test").await;
+}
+
+/// The exact case that lost Fauda S1E3's English subtitles: every candidate den-subtitles lists for
+/// a language is a real but too-sparse-for-its-span track (a dubbed release's captions), refused on a
+/// plain request and served only for the caller's own last-resort flag. Before this fix, den-remux
+/// never asked again with `sparse=1`, so the rendition stayed an empty document forever — not merely
+/// on a first try, the way a transient failure does. The fixture also includes a genuinely dead file
+/// (always 502, with or without the flag) ranked ahead of the sparse one, so this also proves the
+/// fallback pass moves past a candidate that still refuses rather than stopping at the first one.
+#[tokio::test]
+async fn an_all_sparse_language_is_served_by_the_last_resort_retry() {
+    let origin = origin().await;
+    let state = test_state(&origin, 2, Duration::from_secs(600));
+    let cookie = login(&state, "phone-key").await;
+    let body = format!(r#"{{"imdb":"tt0000001","subtitles":"{origin}/sparse","subtitleLanguages":["en"]}}"#);
+    let r = call(&state, "POST", "/remux/session", Some(&cookie), &body).await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let j = r.json();
+    let vtt = format!("{}sub0.vtt", j["playlist"].as_str().unwrap().trim_end_matches("master.m3u8"));
+    let resp = call(&state, "GET", &vtt, None, "").await;
+    assert!(
+        resp.text().contains("Sparse but real"),
+        "the last-resort retry must serve the sparse candidate rather than an empty document: {}",
+        resp.text()
+    );
+    assert_kept_for_session(&resp, j["expiresAt"].as_u64().unwrap(), "sub0.vtt");
+    // And once found, it is not fetched again.
+    assert!(call(&state, "GET", &vtt, None, "").await.text().contains("Sparse but real"));
     state.end_all("test").await;
 }
 
