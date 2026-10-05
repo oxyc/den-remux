@@ -121,13 +121,19 @@ fn best_own(tracks: &[SubtitleTrack], lang: &str, audio_lang: Option<&str>) -> O
         .map(|(n, _)| n)
 }
 
-/// The renditions of a session, most wanted first: each language the browser named that den-subtitles can be
-/// asked for or the release carries, then the release's other languages. A bitmap track, or one that names no
-/// language, is never offered. `audio_lang` is the session's own selected audio language (`lang::canonical`),
-/// which decides which of a language's own tracks — full, SDH, or forced/foreign-parts-only — is the best one:
-/// see `in_context`. The pick here is provisional where den-subtitles is also asked (`den: true`): whether it
-/// actually plays over a downloaded file is `Session::subtitle_playlist`'s call, made with den-subtitles' own
-/// answer in hand.
+/// The renditions of a session, most wanted first, filling `MAX_LANGUAGES` in this order: the viewer's own first
+/// preferred language (whatever named it — the player's requested languages, this browser's, or the install's),
+/// then English — guaranteed a place even when the viewer named none, so the cap is never the reason it is
+/// missing — then the viewer's other preferred languages in their own order, then the session's audio language,
+/// then the rest of the release's languages. Without this order, the cap used to fall back to the release's own
+/// track order once the viewer's list ran out, which reads as alphabetical past the first couple of languages
+/// and silently dropped a preference the release's own tracks just happened to sort late (den-remux#34).
+///
+/// A bitmap track, or one that names no language, is never offered. `audio_lang` is also the session's own
+/// selected audio language (`lang::canonical`) for the tier pick within one language's own tracks — full, SDH,
+/// or forced/foreign-parts-only — which is the best one: see `in_context`. The pick here is provisional where
+/// den-subtitles is also asked (`den: true`): whether it actually plays over a downloaded file is
+/// `Session::subtitle_playlist`'s call, made with den-subtitles' own answer in hand.
 pub fn plan(
     requested: &[String],
     den: bool,
@@ -146,11 +152,31 @@ pub fn plan(
         }
     }
     let found = |lang: &str| own.iter().find(|(l, _)| l == lang).map(|(_, n)| *n);
-    let mut out: Vec<Rendition> = requested
+
+    // The viewer's own first choice leads; English sits right behind it (or leads itself, where that choice is
+    // already English or there is none) so the cap never has to pick between the two.
+    fn prefer<'a>(preferred: &mut Vec<&'a str>, lang: &'a str) {
+        if !preferred.contains(&lang) {
+            preferred.push(lang);
+        }
+    }
+    let mut preferred: Vec<&str> = Vec::new();
+    if let Some(first) = requested.first() {
+        prefer(&mut preferred, first);
+    }
+    prefer(&mut preferred, "en");
+    for lang in requested {
+        prefer(&mut preferred, lang);
+    }
+    if let Some(lang) = audio_lang {
+        prefer(&mut preferred, lang);
+    }
+
+    let mut out: Vec<Rendition> = preferred
         .iter()
         .filter_map(|l| {
             let own = found(l);
-            (den || own.is_some()).then(|| Rendition { lang: l.clone(), den, own })
+            (den || own.is_some()).then(|| Rendition { lang: (*l).to_string(), den, own })
         })
         .collect();
     for (lang, n) in &own {
@@ -535,14 +561,14 @@ mod tests {
                 Rendition { lang: "en".into(), den: false, own: Some(3) },
             ]
         );
-        // With it, every language asked for is a rendition — den-subtitles may have it — and the release's own track is
-        // its fallback where there is one.
+        // With it, every language asked for is a rendition — den-subtitles may have it — and English, guaranteed
+        // a place right after the viewer's own first choice, outranks "de", named second, which the release lacks.
         assert_eq!(
             plan(&named, true, &tracks, None),
             [
                 Rendition { lang: "fi".into(), den: true, own: Some(2) },
+                Rendition { lang: "en".into(), den: true, own: Some(3) },
                 Rendition { lang: "de".into(), den: true, own: None },
-                Rendition { lang: "en".into(), den: false, own: Some(3) },
             ]
         );
         assert!(plan(&[], false, &[track("S_HDMV/PGS", Some("eng"), false, false)], None).is_empty());
@@ -555,6 +581,38 @@ mod tests {
             .map(|l| track("S_TEXT/UTF8", Some(l), true, false))
             .collect();
         assert_eq!(plan(&[], false, &tracks, None).len(), MAX_LANGUAGES);
+    }
+
+    /// The real bug this fix was filed against: a release with 30 embedded languages, in the muxer's own
+    /// near-alphabetical order, where the cap offered "he, en, ar, cs, da, de, el, es" and left out "sv" and
+    /// "fi" — the household's own languages — because they sorted past the eighth slot. The cap must fill from
+    /// the viewer's own languages and English first, never from file order alone.
+    #[test]
+    fn the_cap_never_excludes_english_or_the_viewers_own_languages() {
+        let codes = [
+            "ar", "cs", "da", "de", "el", "es", "he", "hi", "hr", "hu", "id", "is", "it", "en", "ja", "ko",
+            "lt", "lv", "ms", "nl", "no", "pl", "pt", "ro", "ru", "sk", "sl", "sv", "th", "fi",
+        ];
+        let tracks: Vec<_> = codes.iter().map(|l| track("S_TEXT/UTF8", Some(l), true, false)).collect();
+
+        // The viewer's own languages lead — English guaranteed right behind the first of them even though it
+        // wasn't named — then the rest fills from the release in file order.
+        let preferred = ["sv".to_string(), "fi".to_string()];
+        let out = plan(&preferred, false, &tracks, None);
+        let langs: Vec<&str> = out.iter().map(|r| r.lang.as_str()).collect();
+        assert_eq!(langs, ["sv", "en", "fi", "ar", "cs", "da", "de", "el"], "{langs:?}");
+        assert_eq!(out.len(), MAX_LANGUAGES);
+
+        // A preference that already leads with English keeps it first rather than inserting a duplicate.
+        let english_first = ["en".to_string(), "sv".to_string()];
+        let out = plan(&english_first, false, &tracks, None);
+        assert_eq!((out[0].lang.as_str(), out[1].lang.as_str()), ("en", "sv"));
+
+        // No named preference at all: English still leads when the release carries it, ahead of the session's
+        // own audio language, which in turn outranks the rest of the release's languages.
+        let out = plan(&[], false, &tracks, Some("fi"));
+        let langs: Vec<&str> = out.iter().map(|r| r.lang.as_str()).collect();
+        assert_eq!(&langs[..2], ["en", "fi"], "{langs:?}");
     }
 
     /// `describe_subtitles`'s account of each track must agree with what `plan()` actually decided —
