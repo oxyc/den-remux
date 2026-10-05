@@ -2,7 +2,7 @@
 //!
 //! Env: PORT, SCOUT_ORIGINS, REMUX_SCOUT_KEY, SCOUT_INSTALL_URL, SUBTITLE_ORIGINS, ORIGIN_ALIASES, BROWSER_KEY_HASHES,
 //!      REMUX_URL_KEY,
-//!      MAX_SESSIONS, MAX_SESSIONS_PER_INSTALL, MAX_ACTIVE_REMUXES, PRODUCER_IDLE_SECS, SESSION_IDLE_SECS,
+//!      MAX_SESSIONS, MAX_SESSIONS_PER_INSTALL, MAX_ACTIVE_REMUXES, PRODUCER_IDLE_SECS, UPLINK_MBPS, SESSION_IDLE_SECS,
 //!      SCRATCH_DIR, SCRATCH_MAX_BYTES, FFMPEG_PATH, MAX_TRANSCODES, VAAPI_DEVICE, TRUSTED_PROXIES, WEB_ORIGINS,
 //!      METRICS_TOKEN, LOG_REQUESTS, LOG_IDENTITY,
 //!      EDGE_SECRET, GUEST_MAX_SESSIONS, EDGE_REPORT_URL.
@@ -47,9 +47,15 @@ pub struct Config {
     /// `MAX_ACTIVE_REMUXES` — ffmpeg producers allowed to run or hold an ahead window. Logical sessions beyond this
     /// wait fairly without owning a process.
     pub max_active_remuxes: usize,
-    /// A producer stopped on a full ahead window is reaped after this long. Its session and finished GOPs remain.
+    /// A producer stopped on a full ahead window is reaped once its session itself has gone this long with no
+    /// request — never earlier, even under contention: see `should_reap_parked` (session.rs). Its session and
+    /// finished GOPs remain.
     pub producer_idle: Duration,
     pub session_idle: Duration,
+    /// `UPLINK_MBPS` — the box's own upload, megabits a second, for sessions away from home: a copy's fit-check
+    /// then weighs what every other remote session already needs off the same link, not just what this one
+    /// measured for itself. `None` (unset) leaves every session's own measurement as the whole budget, as before.
+    pub uplink_bps: Option<u64>,
     /// How long a session replacing another mid-film may go without serving a segment before it is taken as
     /// abandoned (`AppState::reserve`): `REPLACE_GRACE_SECS`, not set from the environment.
     pub replace_grace: Duration,
@@ -203,9 +209,20 @@ const MIN_SCRATCH_BYTES: u64 = 64 * 1024 * 1024;
 /// minutes and comes back, so a player picks up where it was rather than starting over. The public gate's grant for
 /// it is refreshed every 30 s while the session exists, so the two don't part.
 pub const SESSION_IDLE_SECS: u64 = 600;
-pub const DEFAULT_MAX_SESSIONS: usize = 2;
-pub const DEFAULT_MAX_ACTIVE_REMUXES: usize = 2;
-pub const DEFAULT_PRODUCER_IDLE_SECS: u64 = 10;
+/// Raised 2 -> 4 alongside `DEFAULT_MAX_ACTIVE_REMUXES` below (render-env on `den` master): the box already
+/// runs both at 4.
+pub const DEFAULT_MAX_SESSIONS: usize = 4;
+/// A copy-remux is one ffmpeg thread (`-threads 1`) doing no decode or encode, so it costs little: the
+/// container's own 512 MB idles at a couple of megabytes. The GPU transcode path has its own, separate
+/// ceiling (`MAX_TRANSCODES`). Pausing for a full ahead window gives the slot straight back regardless of this
+/// cap (`Job::pause`), so it only ever bounds jobs actually RUNNING at once, not every session merely holding
+/// one a few segments ahead of its player.
+pub const DEFAULT_MAX_ACTIVE_REMUXES: usize = 4;
+/// How recently a session must have been asked of to count as actively watched: below this, a STOPPED job's
+/// process is kept around rather than killed (`supervise`'s own housekeeping), and a RUNNING one's permit is
+/// never taken for a passing contender (`Session::reap_for_contention`) — only a job whose own session has
+/// gone quiet this long is ever a sound victim either way.
+pub const DEFAULT_PRODUCER_IDLE_SECS: u64 = 30;
 
 /// How long a mid-film replacement has to serve its first segment before it is ended as abandoned: a start is
 /// admitted at most 30 s of pre-buffer (`LONG_PREBUFFER`), and the first segment is asked for long before that.
@@ -251,6 +268,10 @@ impl Config {
                     .filter(|s| *s >= 1)
                     .unwrap_or(DEFAULT_PRODUCER_IDLE_SECS),
             ),
+            uplink_bps: env_opt("UPLINK_MBPS")
+                .and_then(|v| v.parse::<u64>().ok())
+                .filter(|m| *m > 0)
+                .map(|m| m * 1_000_000),
             // Floored: an idle window shorter than a player's pause-and-resume would kill sessions
             // that are merely paused.
             session_idle: Duration::from_secs(

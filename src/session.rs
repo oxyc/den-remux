@@ -35,6 +35,10 @@ const RESTART_GAP_SEGMENTS: usize = 3;
 const SEGMENT_WAIT: Duration = Duration::from_secs(20);
 /// How long creating a session for a native player waits for its `init.mp4` (`Session::prepare`).
 const INIT_WAIT: Duration = Duration::from_secs(15);
+/// `start_producer` taking at least this long is worth a log line: resuming a merely paused job answers in
+/// microseconds, so crossing this means a job was actually (re)spawned — a cold restart worth watching
+/// against a native player's own, much shorter patience for a stalled request.
+const RESTART_LOG_THRESHOLD: Duration = Duration::from_secs(2);
 const POLL: Duration = Duration::from_millis(100);
 /// How often the supervisor looks at a RUNNING job. A paused one is not looked at at all.
 const TICK: Duration = Duration::from_millis(500);
@@ -211,6 +215,10 @@ pub struct Session {
     pub prebuffer: Option<f64>,
     /// What a copy asks of a link (`need`); `None` for a transcode, whose rate is its preset's.
     pub need: Option<Need>,
+    /// The bits a second the player's own link measured for itself (`Want::max_bitrate`), before any
+    /// `UPLINK_MBPS` budget narrowed it: `None` is a player at home. Also this session's mark as "away from
+    /// home" for `other_remote_bps` — what every other such session already needs off the shared uplink.
+    pub max_bitrate: Option<u64>,
     /// Each segment's start and bytes as the session sends them (`playlist::segment_bytes`), for a copy with a byte
     /// index: what a player needs to work out, as the film plays, whether its link keeps up.
     pub demand: Option<Vec<(f64, u64)>>,
@@ -527,17 +535,26 @@ impl Session {
             && (!passed || kept)
     }
 
+    /// Whether the session's current job already heads for `n` (`heads_for`) — shared by `producer_needed` and
+    /// `ensure_job`, which both need the same answer for different reasons.
+    fn job_heads_for(&self, i: &Inner, n: usize) -> bool {
+        let first_keyframe = self.info.keyframes.first().copied().unwrap_or(0.0);
+        i.job.as_ref().is_some_and(|j| {
+            j.exit.is_none()
+                && Self::heads_for(&self.segments, n, first_keyframe, j.id, j.start, j.next_start, &i.gops)
+        })
+    }
+
     fn producer_needed(&self, i: &Inner, n: usize) -> Result<bool, ()> {
         if i.ended {
             return Err(());
         }
-        let first_keyframe = self.info.keyframes.first().copied().unwrap_or(0.0);
-        let keep = i.job.as_ref().is_some_and(|j| {
-            j.exit.is_none()
-                && Self::heads_for(&self.segments, n, first_keyframe, j.id, j.start, j.next_start, &i.gops)
-        });
-        if keep {
-            return Ok(false);
+        if self.job_heads_for(i, n) {
+            // Running, it is only a matter of time. Stopped, it gave its permit back when it paused
+            // (`Job::pause`) and needs one again before it can produce any further — not a restart, `gate`'s
+            // own best-effort resume may already be racing this, but "needed" all the same so a request this
+            // job alone can answer isn't left relying only on that.
+            return Ok(i.job.as_ref().is_some_and(|j| j.stopped));
         }
         // A run failed without output: the next one waits for `reresolve_if_needed` to fetch a fresh link.
         if i.failures > 0 && !i.reresolved {
@@ -559,6 +576,16 @@ impl Session {
         permit: crate::state::ProducerPermit,
     ) -> Result<(), ()> {
         if !self.producer_needed(i, n)? {
+            return Ok(());
+        }
+        // Already heads for it, only stopped for want of a permit: a SIGCONT, not a seek into the source and a
+        // fresh ffmpeg. `gate`'s own best-effort resume may have already won this race while the permit above
+        // was being waited for — in which case the job is running again and this permit simply isn't used,
+        // dropped back to the pool for whoever is next.
+        if self.job_heads_for(i, n) {
+            if let Some(job) = i.job.as_mut().filter(|j| j.resumable()) {
+                job.resume(permit);
+            }
             return Ok(());
         }
         let (start, seek) = self.restart_point(n);
@@ -607,7 +634,66 @@ impl Session {
         }
     }
 
+    /// The sid of the best RUNNING job to reap for a session about to wait for a producer slot: among
+    /// `candidates` (every OTHER session with one actually running, paired with how long since its own last
+    /// request), the one idle longest — but only once idle for at least `min_idle`. `None` when every
+    /// candidate is still within `min_idle`: none of them is a sound victim, and the waiter queues fairly
+    /// instead. A job merely paused for filling its ahead window is never a candidate at all — it gave its
+    /// permit back when it paused (`Job::pause`), so there is nothing to take from it; only a job genuinely
+    /// still running past its own session going quiet is an abandoned one worth taking back.
+    fn pick_reap_victim<'a>(
+        candidates: impl Iterator<Item = (&'a str, Duration)>,
+        min_idle: Duration,
+    ) -> Option<&'a str> {
+        candidates.filter(|(_, idle)| *idle >= min_idle).max_by_key(|&(_, idle)| idle).map(|(sid, _)| sid)
+    }
+
+    /// Free a producer slot for `waiter`, about to wait for one, by reaping the best candidate among every
+    /// OTHER session's RUNNING job (`pick_reap_victim`) — a producer still running after its own session has
+    /// gone quiet for `min_idle`, which, with `gate`'s pause already giving back a merely ahead-and-paused
+    /// job's permit on its own, is now the only kind of "stuck" producer there is. Does nothing, and logs
+    /// nothing, when none qualifies: every running job's session is still within `min_idle` of its own last
+    /// request, so there is genuinely no spare capacity right now, and `waiter` simply queues fairly.
+    async fn reap_for_contention(st: &AppState, waiter: &str, min_idle: Duration) {
+        let victim = {
+            let sessions = st.sessions();
+            let ages: Vec<(String, Duration)> = sessions
+                .iter()
+                .filter(|(sid, _)| sid.as_str() != waiter)
+                .filter_map(|(sid, s)| {
+                    let i = s.lock();
+                    i.job
+                        .as_ref()
+                        .filter(|j| j.exit.is_none() && !j.stopped)
+                        .map(|_| (sid.clone(), i.last_seen.elapsed()))
+                })
+                .collect();
+            Self::pick_reap_victim(ages.iter().map(|(sid, age)| (sid.as_str(), *age)), min_idle)
+                .map(str::to_owned)
+        };
+        let Some(victim_sid) = victim else { return };
+        let Some(victim_session) = st.sessions().get(&victim_sid).cloned() else { return };
+        let reaped = {
+            let mut i = victim_session.lock();
+            let idle = i.last_seen.elapsed();
+            match i.job.as_ref().filter(|j| j.exit.is_none() && !j.stopped) {
+                Some(_) if idle >= min_idle => i.job.take().map(|job| (job, idle)),
+                _ => None,
+            }
+        };
+        let Some((job, idle)) = reaped else { return };
+        eprintln!(
+            "session {}: {}{} — idle {:.0}s, its producer slot goes to {waiter}'s wait",
+            victim_session.short(),
+            job.pull_line("reaped under contention"),
+            rid_tail(victim_session.rid.as_deref()),
+            idle.as_secs_f64(),
+        );
+        job.stop().await;
+    }
+
     async fn start_producer(&self, st: &Arc<AppState>, n: usize, deadline: Instant) -> Result<(), ()> {
+        let started = Instant::now();
         let gate =
             tokio::time::timeout_at(deadline.into(), self.producer_gate.lock()).await.map_err(|_| ())?;
         let old = {
@@ -629,6 +715,11 @@ impl Session {
             }
             old.stop().await;
         }
+        // Only worth the walk over every other session when there is in fact no spare slot: the common case,
+        // one or more of `MAX_ACTIVE_REMUXES` free, costs nothing extra.
+        if st.producer_slots_busy() {
+            Self::reap_for_contention(st, &self.sid, st.cfg.producer_idle).await;
+        }
         let permit = tokio::time::timeout_at(deadline.into(), st.acquire_producer(self.transcoded))
             .await
             .map_err(|_| ())?
@@ -640,11 +731,29 @@ impl Session {
         };
         drop(gate);
         self.wake.notify_one();
+        // A resumed (merely SIGSTOPped) job answers in microseconds; this path is only reached once one had to
+        // be freshly spawned, so a slow one here is a cold restart — a seek into the source, a new ffmpeg —
+        // taking long enough to matter against a native player's own, much shorter patience for a stalled
+        // request (`Session::prepare`'s doc).
+        let elapsed = started.elapsed();
+        if result.is_ok() && elapsed >= RESTART_LOG_THRESHOLD {
+            eprintln!(
+                "session {}: segment {n}'s producer took {:.1}s to restart{}",
+                self.short(),
+                elapsed.as_secs_f64(),
+                rid_tail(self.rid.as_deref())
+            );
+        }
         result
     }
 
-    /// Pause the job once it is `AHEAD_SEGMENTS` past the newest request — or, once that request's
-    /// segment is done, while scratch is over its cap — and resume it when the player catches up.
+    /// Pause the job once it is `AHEAD_SEGMENTS` past the newest request — or, once that request's segment is
+    /// done, while scratch is over its cap — and resume it when the player catches up, given a free permit.
+    ///
+    /// The resume is best-effort and non-blocking: this runs from inside the session's own lock, so it cannot
+    /// wait for one. Finding none free costs nothing beyond leaving the job paused a moment longer — the
+    /// session's own next request for a segment this job no longer covers falls back to the fair, async wait
+    /// in `start_producer` regardless, which resumes the very same job rather than restarting it (`ensure_job`).
     fn gate(&self, i: &mut Inner, st: &AppState) {
         let last = self.segments.len() - 1;
         // A segment further, with the release's own subtitles: a player asks for a subtitle segment as far ahead as
@@ -657,8 +766,10 @@ impl Session {
             let ahead = j.next_start >= limit - SNAP;
             if ahead || (over_cap && j.next_start >= wanted_done - SNAP) {
                 j.pause();
-            } else {
-                j.resume();
+            } else if j.resumable() {
+                if let Some(permit) = st.try_acquire_producer_slot(self.transcoded) {
+                    j.resume(permit);
+                }
             }
         }
     }
@@ -1957,6 +2068,34 @@ pub(crate) fn over(max_bitrate: Option<u64>, need: Option<Need>) -> bool {
     max_bitrate.zip(need).is_some_and(|(max, need)| need.bitrate > max)
 }
 
+/// What this session's picking may treat as the player's link: its own measurement (`own`), narrowed by what
+/// is left of the box's configured upload (`uplink_bps`, `UPLINK_MBPS`) once `other_bps` — every other
+/// currently open remote session's own `need` — is taken out. A release that still doesn't fit in what's left
+/// ranks as `over` just as one over the player's own measurement does; the uplink is never consulted for a
+/// player at home (`own` is `None`), and leaves `own` alone where it is unset, exactly today's behaviour.
+pub(crate) fn budgeted_max_bitrate(own: Option<u64>, uplink_bps: Option<u64>, other_bps: u64) -> Option<u64> {
+    let own = own?;
+    Some(match uplink_bps {
+        Some(uplink) => own.min(uplink.saturating_sub(other_bps)),
+        None => own,
+    })
+}
+
+/// What every other currently open remote session already needs of the shared uplink: the sum of `need`'s
+/// bitrate for every session with a link of its own (`max_bitrate.is_some()`) other than `exclude_sid` — the
+/// one now picking, not yet in the registry, but excluded by id all the same in case a replacement overlaps it
+/// briefly. A session still picking, or transcoding (whose `need` is `None`), counts for nothing yet.
+pub(crate) fn other_remote_bps(
+    sessions: &std::collections::HashMap<String, Arc<Session>>,
+    exclude_sid: &str,
+) -> u64 {
+    sessions
+        .values()
+        .filter(|s| s.sid != exclude_sid && s.max_bitrate.is_some())
+        .filter_map(|s| s.need.map(|n| n.bitrate))
+        .sum()
+}
+
 /// A transcode's output size: the source's, fitted inside the preset's with its aspect kept (a 2.4:1 4K film becomes
 /// 1920 × 800 at 1080p — 1080 lines of it would be wider than level 4.1 allows), never scaled up, both even. 0 × 0
 /// when the source's is unknown.
@@ -2264,6 +2403,10 @@ pub async fn create(
     let sid = crate::auth::random_id();
     let short = sid[..6].to_string();
     let rid_suffix = want.rid.map(|r| format!(" rid={r}")).unwrap_or_default();
+    // Narrowed by the box's own uplink budget, where one is configured, so a copy's fit-check below weighs
+    // every other remote session's own need off the same link rather than judging this one in isolation.
+    let max_bitrate =
+        budgeted_max_bitrate(want.max_bitrate, st.cfg.uplink_bps, other_remote_bps(&st.sessions(), &sid));
     let base = scout_base(st, want.scout)?;
     let by_install = !matches!(admission, Admission::Browser(_));
     let guest = matches!(admission, Admission::Guest(_));
@@ -2474,7 +2617,7 @@ pub async fn create(
                 // unless the player named it, which is then decided on below as the only one.
                 Ok((r, info))
                     if over(
-                        want.max_bitrate,
+                        max_bitrate,
                         need(&info, &Delivery::of(&info, r.size.or(c.attributes.size_bytes), want)),
                     ) =>
                 {
@@ -2483,7 +2626,7 @@ pub async fn create(
                         c.attributes.label,
                         need(&info, &Delivery::of(&info, r.size.or(c.attributes.size_bytes), want))
                             .map_or_else(String::new, |n| n.to_string()),
-                        want.max_bitrate.unwrap_or(0) / 1000
+                        max_bitrate.unwrap_or(0) / 1000
                     );
                     let named = want.filename == Some(c.filename());
                     too_big.push((c, (r, info)));
@@ -2517,7 +2660,7 @@ pub async fn create(
     // retry would not change.
     // The transcode the link carries at its peak; none fits a link below the floor's, and one that would starve ranks
     // below the copy that starves least — taken only where no copy plays at all.
-    let fitting = job::preset_for(want.max_bitrate);
+    let fitting = job::preset_for(max_bitrate);
     let preset = fitting.unwrap_or(job::SD540);
     let fallback_seen = fallback.is_some();
     let delivery = |t: &(&scout::Stream, (scout::Resolved, MediaInfo))| {
@@ -2526,7 +2669,7 @@ pub async fn create(
     let bitrate =
         |t: &(&scout::Stream, (scout::Resolved, MediaInfo))| need(&t.1 .1, &delivery(t)).map(|n| n.bitrate);
     let head_start = |t: &(&scout::Stream, (scout::Resolved, MediaInfo))| {
-        prebuffer(&t.1 .1, &delivery(t), want.max_bitrate).unwrap_or(f64::INFINITY)
+        prebuffer(&t.1 .1, &delivery(t), max_bitrate).unwrap_or(f64::INFINITY)
     };
     if chosen.is_none() && !want.fits_only {
         let longer = (0..too_big.len())
@@ -2549,7 +2692,7 @@ pub async fn create(
             (true, Some(t)) => format!(
                 "no copy plays within a {LONG_PREBUFFER:.0}s head start on the {} kbit/s link; the nearest, \"{}\", \
                  needs {}",
-                want.max_bitrate.unwrap_or(0) / 1000,
+                max_bitrate.unwrap_or(0) / 1000,
                 t.0.attributes.label,
                 need(&t.1 .1, &delivery(t)).map_or_else(|| "an unknown rate".to_string(), |n| n.to_string())
             ),
@@ -2711,12 +2854,12 @@ pub async fn create(
     // A transcode's keyframes are its encoder's IDRs, in closed GOPs; a copy's are the release's own.
     let closed_gops = transcode || info.closed_gops;
     let (prebuffer, need, demand) = match transcode {
-        true => (want.max_bitrate.map(|rate| preset.head_start(rate)), None, None),
+        true => (max_bitrate.map(|rate| preset.head_start(rate)), None, None),
         false => {
             let delivery = Delivery::of(&info, size, want);
             let bytes = playlist::segment_bytes(&segments, &info.byte_index, delivery.bytes);
             (
-                prebuffer(&info, &delivery, want.max_bitrate),
+                prebuffer(&info, &delivery, max_bitrate),
                 need(&info, &delivery),
                 bytes.map(|b| segments.iter().zip(b).map(|(s, b)| (s.start, b.round() as u64)).collect()),
             )
@@ -2725,6 +2868,7 @@ pub async fn create(
     let session = Arc::new(Session {
         prebuffer,
         need,
+        max_bitrate: want.max_bitrate,
         demand,
         master: playlist::master(
             &codecs,
@@ -2815,7 +2959,7 @@ pub async fn create(
         _ => format!(", {dv} stripped to its base layer"),
     });
     let player = want.playable.map_or_else(|| "no capability report".to_string(), |p| p.to_string());
-    let link = want.max_bitrate.map(|b| format!(", link {} kbit/s", b / 1000)).unwrap_or_default();
+    let link = max_bitrate.map(|b| format!(", link {} kbit/s", b / 1000)).unwrap_or_default();
     let client = &want.client;
     eprintln!(
         "session {}: {imdb} \"{}\" ({}, {:?} {}{}{}, {:.0}s, {} keyframes, {} segments, audio {} {}{}; player: {player}{link}; client: {client}){rid_suffix}",
@@ -2886,22 +3030,24 @@ async fn supervise(st: Arc<AppState>, s: Arc<Session>) {
             (
                 i.job.as_ref().is_some_and(|j| j.exit.is_none() && !j.stopped),
                 i.last_seen + st.cfg.session_idle,
+                // Measured from the SESSION's own last request, not the job's own pause: a job paused for
+                // filling its ahead window is not idle, only unneeded for a few seconds yet, and a job's pause
+                // duration says nothing about whether its viewer is still right there. This is also the
+                // threshold `start_producer`'s own contention reap (`reap_for_contention`) honours, so a
+                // producer is never pulled out from under a session still being watched either way.
                 i.job
                     .as_ref()
                     .and_then(Job::parked_for)
-                    .map(|paused| st.cfg.producer_idle.saturating_sub(paused)),
+                    .map(|_| (i.last_seen + st.cfg.producer_idle).saturating_duration_since(Instant::now())),
             )
         };
-        // A parked producer is reusable while capacity is free. Under contention it yields immediately instead of
-        // making the FIFO queue wait one idle timeout for every wave of logical sessions.
-        let under_pressure = park_in.is_some() && st.producer_waiters.load(Relaxed) > 0;
-        if park_in.is_some_and(|remaining| remaining.is_zero()) || under_pressure {
+        if park_in.is_some_and(|remaining| remaining.is_zero()) {
             let parked = {
                 let mut i = s.lock();
                 i.job
                     .as_ref()
                     .and_then(Job::parked_for)
-                    .filter(|paused| under_pressure || *paused >= st.cfg.producer_idle)
+                    .filter(|_| i.last_seen.elapsed() >= st.cfg.producer_idle)
                     .and_then(|_| i.job.take())
             };
             if let Some(job) = parked {
@@ -3742,6 +3888,78 @@ mod tests {
         );
         assert!(!Session::heads_for(&segs, 0, 0.5, 1, 6.0, 6.0, &[]), "but not a job begun past it");
         assert!(!heads(1, 0.0, 30.0, &[gop(2, 1, 6.0, 6.0)]), "a GOP of another job is not this job's");
+    }
+
+    /// Two sessions still actively watched (idle under the threshold) plus a third, newcomer session about to
+    /// wait for a slot: neither watched job may be the victim, whatever their relative ages — only an idle one
+    /// is ever a sound victim, and the newcomer gets nothing when there isn't one.
+    #[test]
+    fn a_newcomer_never_reaps_an_actively_watched_job() {
+        let threshold = Duration::from_secs(30);
+        // Both well under the threshold: one freshly paused, one a little longer, neither idle enough to take.
+        let watched = [("alice", Duration::from_secs(1)), ("bob", Duration::from_secs(25))];
+        assert_eq!(
+            Session::pick_reap_victim(watched.into_iter(), threshold),
+            None,
+            "a newcomer waits rather than steal from either watched session"
+        );
+    }
+
+    /// Among several candidates, once one has gone unwatched for the full threshold it is a sound victim even
+    /// next to others also past it — and the one idle LONGEST is picked, not merely any that qualifies.
+    #[test]
+    fn the_longest_idle_candidate_is_reaped_first() {
+        let threshold = Duration::from_secs(30);
+        let candidates = [
+            ("alice", Duration::from_secs(5)),  // still watched: never a candidate
+            ("bob", Duration::from_secs(40)),   // idle longer than the threshold
+            ("carol", Duration::from_secs(90)), // idle longest of all: the one to take
+        ];
+        assert_eq!(Session::pick_reap_victim(candidates.into_iter(), threshold), Some("carol"));
+    }
+
+    /// Exactly at the threshold counts as idle enough — the same boundary `supervise`'s own housekeeping reap
+    /// uses, so a session is never protected by one path and not the other.
+    #[test]
+    fn exactly_the_threshold_is_a_sound_victim() {
+        let threshold = Duration::from_secs(30);
+        assert_eq!(Session::pick_reap_victim([("alice", threshold)].into_iter(), threshold), Some("alice"));
+        assert_eq!(
+            Session::pick_reap_victim(
+                [("alice", threshold - Duration::from_millis(1))].into_iter(),
+                threshold
+            ),
+            None,
+            "a millisecond short of it is still watched"
+        );
+    }
+
+    /// Without a configured uplink, a session's own measured link is the whole budget — today's behaviour,
+    /// unchanged. With one, the budget is the smaller of that and what the uplink has left once every other
+    /// remote session's own need is taken out; a fully spent uplink floors at 0 rather than going negative.
+    #[test]
+    fn the_uplink_budget_narrows_a_sessions_own_measurement() {
+        assert_eq!(budgeted_max_bitrate(Some(5_000_000), None, 3_000_000), Some(5_000_000));
+        assert_eq!(
+            budgeted_max_bitrate(None, Some(30_000_000), 3_000_000),
+            None,
+            "a player at home has no link to narrow"
+        );
+        assert_eq!(
+            budgeted_max_bitrate(Some(10_000_000), Some(30_000_000), 25_000_000),
+            Some(5_000_000),
+            "the uplink has 5 Mbit/s left, less than this session's own 10"
+        );
+        assert_eq!(
+            budgeted_max_bitrate(Some(10_000_000), Some(30_000_000), 1_000_000),
+            Some(10_000_000),
+            "the uplink has plenty left; this session's own measurement still governs"
+        );
+        assert_eq!(
+            budgeted_max_bitrate(Some(10_000_000), Some(30_000_000), 40_000_000),
+            Some(0),
+            "other sessions already claim more than the whole uplink: nothing is left, not a negative budget"
+        );
     }
 
     #[test]

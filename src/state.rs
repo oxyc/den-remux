@@ -623,6 +623,40 @@ impl AppState {
         })
     }
 
+    /// Whether a `producer_slots` permit is available right now — cheap and synchronous, so a session about to
+    /// wait for one can first ask whether reaping a passing victim (`Session::reap_for_contention`) would even
+    /// help, rather than always walking every other session's state for nothing.
+    pub fn producer_slots_busy(&self) -> bool {
+        self.producer_slots.available_permits() == 0
+    }
+
+    /// The same permit `acquire_producer` waits for, but only if one is free right now — never waits, and never
+    /// counts toward `producer_waiters`, since nothing is actually queuing. For `Session::gate`'s resume: it
+    /// runs from inside a session's own lock, so it cannot await, and it would rather leave a job paused a
+    /// moment longer than block there — the session's own next request falls back to the fair, async
+    /// `acquire_producer` path (`Session::start_producer`) regardless.
+    pub fn try_acquire_producer_slot(&self, transcode: bool) -> Option<ProducerPermit> {
+        if transcode && !self.can_transcode() {
+            return None;
+        }
+        let gpu = match transcode {
+            true => Some(self.transcode_slots.clone().try_acquire_owned().ok()?),
+            false => None,
+        };
+        let producer = self.producer_slots.clone().try_acquire_owned().ok()?;
+        self.active_producers.fetch_add(1, Relaxed);
+        let transcodes = transcode.then(|| {
+            self.transcodes.fetch_add(1, Relaxed);
+            self.transcodes.clone()
+        });
+        Some(ProducerPermit {
+            _producer: producer,
+            _transcode: gpu,
+            active: self.active_producers.clone(),
+            transcodes,
+        })
+    }
+
     pub fn known(&self) -> MutexGuard<'_, KnownReleases> {
         self.known.lock().unwrap_or_else(|e| e.into_inner())
     }
