@@ -309,13 +309,13 @@ impl Session {
     /// A player's diagnostic is useful once and bounded to three attempts. The signed URL is a bearer
     /// credential; it must not also be an unbounded log-writing endpoint.
     pub fn take_report_slot(&self) -> bool {
-        self.reports.fetch_update(Relaxed, Relaxed, |count| (count < 3).then_some(count + 1)).is_ok()
+        self.reports.try_update(Relaxed, Relaxed, |count| (count < 3).then_some(count + 1)).is_ok()
     }
 
     /// A receiver may retry one interrupted measurement. Beyond that, the signed bearer must not become an
     /// unbounded random-byte and home-upload generator for the rest of the session lifetime.
     pub fn take_speed_slot(&self) -> bool {
-        self.speed_probes.fetch_update(Relaxed, Relaxed, |count| (count < 2).then_some(count + 1)).is_ok()
+        self.speed_probes.try_update(Relaxed, Relaxed, |count| (count < 2).then_some(count + 1)).is_ok()
     }
 
     /// `Cache-Control` for what the session's URL serves the same for its whole life: its playlists, a found
