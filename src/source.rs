@@ -666,8 +666,15 @@ mod tests {
         assert!(requests(bytes, true) < requests(bytes, false) / 4.0);
     }
 
+    /// Drives the real `fetch` against a real (loopback) upstream with an injected per-request RTT, and holds the
+    /// request count to a deterministic bound — not wall-clock elapsed. Wall time here rides whatever the OS
+    /// scheduler is doing for the real byte transfer and the `tokio::time::sleep` in `delayed_upstream`, both real
+    /// time, so a loaded CI runner can shrink or invert the gap between two sequential runs even though neither run's
+    /// *request count* moves at all: that count depends only on SIZE/FIRST_CHUNK/CHUNKS, never on scheduling. The
+    /// time/round-trip relationship itself is covered deterministically, with no real clock or network, by
+    /// `growing_ranges_remove_the_high_bdp_round_trip_ceiling` above.
     #[tokio::test]
-    async fn growing_ranges_are_over_twice_as_fast_on_a_controlled_high_bdp_path() {
+    async fn growing_ranges_need_far_fewer_round_trips_on_a_controlled_high_bdp_path() {
         const SIZE: u64 = 512 * 1024 * 1024;
         const FIXED: [u64; 1] = [16 * 1024 * 1024];
         let (url, requests) = delayed_upstream(SIZE, Duration::from_millis(50)).await;
@@ -696,10 +703,10 @@ mod tests {
         let fixed_requests = requests.swap(0, Relaxed);
         let adaptive = run(&CHUNKS).await;
         let adaptive_requests = requests.load(Relaxed);
+        // Elapsed time is logged for a human chasing a regression, never asserted on: see the comment above.
         eprintln!(
             "controlled range pull: fixed={fixed:?}/{fixed_requests} requests adaptive={adaptive:?}/{adaptive_requests} requests"
         );
-        assert!(fixed > adaptive * 2, "fixed={fixed:?} adaptive={adaptive:?}");
         assert!(
             fixed_requests > adaptive_requests * 4,
             "fixed={fixed_requests} adaptive={adaptive_requests}"
