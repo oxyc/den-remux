@@ -686,6 +686,10 @@ where
                     "label": v.stream.attributes.label,
                     "filename": v.stream.filename(),
                     "size": v.stream.attributes.size_bytes,
+                    // The season pack this episode came from, present only when it differs meaningfully
+                    // from `size` — context for a client that renders its own compact label rather than
+                    // scout's, never a number to budget or rank on.
+                    "packSize": v.stream.attributes.pack_size_bytes,
                     "plays": v.plays.as_str(),
                     "why": v.why,
                 })).collect::<Vec<_>>(),
@@ -861,6 +865,7 @@ where
                         "label": s.release.label,
                         "filename": s.release.filename,
                         "size": s.release.size,
+                        "packSize": s.release.pack_size,
                         "requested": s.release.requested.as_ref().map(|r| serde_json::json!({
                             "filename": r.filename,
                             "why": r.why,

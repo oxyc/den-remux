@@ -31,8 +31,16 @@ pub struct Attributes {
     pub codec: Option<String>,
     /// Three answers, as scout sends them: held by the debrid, not held, or nobody could ask (absent).
     pub cached: Option<bool>,
+    /// The size of the file this stream actually plays. For an episode scout picked out of a season pack,
+    /// scout corrects this to the episode's own size once it has probed the resolved file — never the
+    /// pack's, which is what an indexer's title names.
     #[serde(rename = "sizeBytes")]
     pub size_bytes: Option<u64>,
+    /// The season pack's own total, present only when scout knows it differs meaningfully from
+    /// `size_bytes` for an episode request. Display-only context ("1.1 GB · from a 68 GB pack"), never a
+    /// size to resolve, budget or open a door against — `resolved.size` in session.rs is the one that does.
+    #[serde(default, rename = "packSizeBytes")]
+    pub pack_size_bytes: Option<u64>,
     #[serde(default)]
     pub label: String,
     #[serde(default, rename = "threeD")]
@@ -452,5 +460,15 @@ mod tests {
         assert_eq!(s.attributes.size_bytes, Some(58_000_000_000));
         assert!(s.url.contains("/p/"));
         assert!(!s.attributes.label.is_empty());
+    }
+
+    // Fauda S1E3: scout corrects `sizeBytes` to the episode's own 1.1 GB and keeps the season pack's 68 GB
+    // only as `packSizeBytes` — a field den-remux must carry through rather than drop, since nothing here
+    // should ever fall back to re-deriving a size from the indexer's title.
+    #[test]
+    fn a_season_pack_episode_carries_its_pack_size_separately() {
+        let s = &fixture()[9];
+        assert_eq!(s.attributes.size_bytes, Some(1_136_580_921));
+        assert_eq!(s.attributes.pack_size_bytes, Some(68_000_000_000));
     }
 }

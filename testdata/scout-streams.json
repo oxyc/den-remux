@@ -62,6 +62,13 @@
       "url": "http://scout.test/p/ticket-bluray",
       "attributes": {"resolution": "1080p", "codec": null, "cached": true, "sizeBytes": 12000000000, "label": "1080p BluRay"},
       "behaviorHints": {"bingeGroup": "x", "notWebReady": true, "filename": "Film.2019.1080p.BluRay.mkv"}
+    },
+    {
+      "name": "Den Scout",
+      "title": "Show.S01E03.1080p.WEB-DL.mkv",
+      "url": "http://scout.test/p/ticket-seasonpack",
+      "attributes": {"resolution": "1080p", "codec": "h264", "cached": false, "sizeBytes": 1136580921, "packSizeBytes": 68000000000, "label": "1080p • WEB-DL • 1.1 GB · from a 68 GB pack"},
+      "behaviorHints": {"bingeGroup": "x", "notWebReady": true, "filename": "Show.S01E03.1080p.WEB-DL.mkv"}
     }
   ]
 }

@@ -109,6 +109,9 @@ pub struct Release {
     pub label: String,
     pub filename: String,
     pub size: Option<u64>,
+    /// The season pack this release's file was picked out of, when scout named one — display context
+    /// alongside `label`/`size`, which are already the episode's own (resolved.size, not the pack's).
+    pub pack_size: Option<u64>,
     /// The release the player named when this one was played instead, and why it was passed over — where that is
     /// known.
     pub requested: Option<Requested>,
@@ -2908,6 +2911,7 @@ pub async fn create(
             label: c.attributes.label.clone(),
             filename: c.filename().to_string(),
             size,
+            pack_size: c.attributes.pack_size_bytes,
             requested,
         },
         segments,
