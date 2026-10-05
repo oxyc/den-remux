@@ -485,6 +485,10 @@ struct Replacement {
 /// Why `reserve` gave no slot.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Refused {
+    /// The owner already has `share` sessions being set up right now — none of them live yet, so there is
+    /// nothing of this owner's own to evict. Waiting the moment for one of those to finish opening (succeed
+    /// or fail) is the only way to a free slot, which is a different wait from the server's being full.
+    StartingAlready,
     /// The owner's share or the server is full.
     Full,
     /// The session named to be replaced is another owner's.
@@ -789,7 +793,7 @@ impl AppState {
             let mut replacements = self.replacements.lock().unwrap_or_else(|e| e.into_inner());
             let pending = creating.get(owner).copied().unwrap_or(0);
             if pending >= share {
-                return Err(Refused::Full);
+                return Err(Refused::StartingAlready);
             }
             // A session already gone leaves nothing to keep: an ordinary start.
             let replaces = match replaces.and_then(|sid| map.get(sid)) {

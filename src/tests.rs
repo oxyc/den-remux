@@ -16,7 +16,7 @@ use hyper::{Request, Response, StatusCode};
 
 use crate::config::Config;
 use crate::probe::{self, Source, VideoCodec};
-use crate::state::AppState;
+use crate::state::{AppState, Refused};
 
 fn testdata(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata").join(name)
@@ -199,7 +199,8 @@ async fn neither_container_is_refused() {
 
 #[tokio::test]
 async fn a_report_takes_the_old_shape_and_stats_and_refuses_what_is_neither_or_too_big() {
-    let post = |body: String| crate::report("abcdef", Full::new(Bytes::from(body)));
+    let state = test_state("http://127.0.0.1:9", 2, Duration::from_secs(600));
+    let post = |body: String| crate::report(&state, "abcdef", "abcdef", Full::new(Bytes::from(body)));
     assert_eq!(post(r#"{"code":3,"message":"DECODE"}"#.into()).await.status(), StatusCode::NO_CONTENT);
     let stats = r#"{"stats":{"engine":"hls.js","fragments":{"count":3},"stalls":[{"at":1,"ms":900}]}}"#;
     assert_eq!(post(stats.into()).await.status(), StatusCode::NO_CONTENT);
@@ -1963,9 +1964,11 @@ async fn kill_without_the_secret_looks_like_an_unknown_route() {
 async fn cancelling_a_reservation_gives_back_both_limits() {
     let state = test_state("http://127.0.0.1:9", 2, Duration::from_secs(600));
     let first = state.reserve("phone", 1, None).await.unwrap();
-    assert!(state.reserve("phone", 1, None).await.is_err());
+    // Nothing of "phone"'s own is live to evict yet — its first reservation hasn't opened — so this is a
+    // different refusal from the server genuinely having no room, told apart in the API error too.
+    assert_eq!(state.reserve("phone", 1, None).await.err(), Some(Refused::StartingAlready));
     let second = state.reserve("laptop", 1, None).await.unwrap();
-    assert!(state.reserve("other", 1, None).await.is_err());
+    assert_eq!(state.reserve("other", 1, None).await.err(), Some(Refused::Full));
     drop(first);
     let replacement = state.reserve("phone", 1, None).await.unwrap();
     drop((second, replacement));
@@ -2686,6 +2689,61 @@ async fn hevc_for_a_player_without_it_takes_the_one_transcode() {
             .await;
     assert_eq!(late.status, StatusCode::GONE, "a report after the end is refused");
     assert_eq!(call(&state, "GET", ended, None, "").await.status, StatusCode::GONE);
+    state.end_all("test").await;
+}
+
+/// A player's fatal report — `error 3 "Media failed to decode"` and its like — frees the session's slot at
+/// once rather than waiting SESSION_IDLE_SECS for a tab that already gave up on it: the box's own cap is
+/// just one session here, so only ending the first on its report leaves room for the second.
+#[tokio::test]
+async fn a_fatal_report_ends_the_session_at_once() {
+    let origin = origin().await;
+    let state = test_state(&origin, 1, Duration::from_secs(600));
+    let body = format!(r#"{{"imdb":"tt0000001","scout":"{origin}/cfg"}}"#);
+    let r = call(&state, "POST", "/remux/session", None, &body).await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let j = r.json();
+    let sid = j["sid"].as_str().unwrap().to_string();
+    let playlist = j["playlist"].as_str().unwrap().to_string();
+
+    // Not yet ended: a non-fatal report (stats alone) leaves it exactly as it was.
+    let stats = r#"{"stats":{"engine":"native"}}"#;
+    assert_eq!(
+        call(&state, "POST", &playlist.replace("master.m3u8", "report"), None, stats).await.status,
+        StatusCode::NO_CONTENT
+    );
+    assert!(state.session(&sid).is_some(), "stats alone are not a failure");
+
+    // A fatal report ends it: gone from the live map, its URL now answers 410, and the slot a lone
+    // MAX_SESSIONS=1 server was holding is free for the very next request.
+    let fatal = r#"{"code":3,"message":"Media failed to decode"}"#;
+    assert_eq!(
+        call(&state, "POST", &playlist.replace("master.m3u8", "report"), None, fatal).await.status,
+        StatusCode::NO_CONTENT
+    );
+    assert!(state.session(&sid).is_none(), "the dead session is gone, not merely marked");
+    assert_eq!(call(&state, "GET", &playlist, None, "").await.status, StatusCode::GONE);
+    let again = call(&state, "POST", "/remux/session", None, &body).await;
+    assert_eq!(again.status, StatusCode::CREATED, "the freed slot admits a new session at once");
+    state.end_all("test").await;
+}
+
+/// `POST …/end` is the same as `DELETE`, for `navigator.sendBeacon` — which sends only POST — to call as a
+/// page goes away.
+#[tokio::test]
+async fn a_post_to_end_ends_the_session_like_a_delete() {
+    let origin = origin().await;
+    let state = test_state(&origin, 2, Duration::from_secs(600));
+    let body = format!(r#"{{"imdb":"tt0000001","scout":"{origin}/cfg"}}"#);
+    let r = call(&state, "POST", "/remux/session", None, &body).await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let j = r.json();
+    let sid = j["sid"].as_str().unwrap().to_string();
+    let base = j["playlist"].as_str().unwrap().trim_end_matches("master.m3u8").to_string();
+    let ended = call(&state, "POST", &format!("{base}end"), None, "").await;
+    assert_eq!(ended.status, StatusCode::NO_CONTENT, "{}", ended.text());
+    assert!(state.session(&sid).is_none());
+    assert_eq!(call(&state, "GET", &format!("{base}master.m3u8"), None, "").await.status, StatusCode::GONE);
     state.end_all("test").await;
 }
 
