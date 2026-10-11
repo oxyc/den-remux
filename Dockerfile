@@ -10,15 +10,28 @@
 # Idle it runs nothing either way; the driver is only loaded by a transcode.
 
 # ---- build: Rust -----------------------------------------------------------
-FROM rust:1-alpine3.22 AS build
+# The manifests and a dummy main, so the dependency layers below are keyed on Cargo.toml and Cargo.lock alone.
+# The release number lives in VERSION, not Cargo.toml, so a release never invalidates them.
+FROM rust:1-alpine3.22 AS rust-deps
 RUN apk add --no-cache musl-dev
 WORKDIR /src
-# Cache deps: build against the manifests and a dummy main first, so a code-only change re-runs only the
-# final (LTO'd) link of our crate.
 COPY Cargo.toml Cargo.lock ./
-RUN mkdir src && echo 'fn main() {}' > src/main.rs && cargo build --release --locked && rm -rf src
+RUN mkdir src && echo 'fn main() {}' > src/main.rs
+
+# The release profile's dependencies; a code-only change re-runs only the final (LTO'd) build of our crate.
+FROM rust-deps AS build-deps
+RUN cargo build --release --locked
+
+FROM build-deps AS build
 COPY src ./src
 RUN touch src/main.rs && cargo build --release --locked   # `strip = true` in the release profile
+
+# The test profile's dependencies, for the test stage: it never needs the release binary. Not incremental and
+# with line tables only, which the one-shot build in CI compiles faster and caches smaller.
+FROM rust-deps AS test-deps
+ENV CARGO_INCREMENTAL=0 \
+    CARGO_PROFILE_DEV_DEBUG=line-tables-only
+RUN cargo test --locked --no-run
 
 # ---- build: ffmpeg ---------------------------------------------------------
 FROM alpine:3.24 AS ffmpeg
@@ -75,29 +88,47 @@ RUN ./configure \
 # `docker build --target test .` (CI runs it; the default build skips it). The segment alignment depends
 # on exactly how ffmpeg seeks, so these tests only count with the ffmpeg the image ships. ffprobe is built
 # for them alone; the runtime image does not carry it. No GPU here: the transcode's flags are unit-tested.
-FROM build AS test
+# The test profile's dependencies come from `test-deps`, so a code-only change compiles den-remux alone.
+FROM test-deps AS test
 RUN apk add --no-cache libssl3 zlib libva
 COPY --from=ffmpeg /opt/ffmpeg/bin/ffmpeg /opt/ffmpeg/bin/ffprobe /usr/local/bin/
 COPY testdata ./testdata
-RUN cargo test --locked -- --include-ignored
+COPY src ./src
+RUN touch src/main.rs && cargo test --locked -- --include-ignored
+
+# ---- release metadata --------------------------------------------------------
+# The runtime copies this marker, so a build without a valid DEN_VERSION fails before an image can be pushed.
+# The version only reaches the final image's configuration and never invalidates the Rust or ffmpeg builds.
+FROM alpine:3.24 AS release-metadata
+ARG DEN_VERSION
+RUN printf '%s\n' "$DEN_VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' \
+    || { echo "DEN_VERSION must be X.Y.Z, got '$DEN_VERSION'" >&2; exit 1; }; \
+    printf '%s' "$DEN_VERSION" > /den-version
 
 # ---- runtime ---------------------------------------------------------------
 # The libraries ffmpeg links, CA certificates (ffmpeg verifies the debrid's TLS against them), and on
 # amd64 — the box, with its UHD 630 — Intel's VAAPI driver. nonroot is 65532, the uid every den addon
 # image uses.
-FROM alpine:3.24
+FROM alpine:3.24 AS runtime
 RUN apk add --no-cache ca-certificates libssl3 zlib libva \
     && if [ "$(apk --print-arch)" = x86_64 ]; then apk add --no-cache intel-media-driver; fi \
     && adduser -D -H -u 65532 -s /sbin/nologin nonroot \
     && install -d -o 65532 -g 65532 /cache
 COPY --from=ffmpeg /opt/ffmpeg/bin/ffmpeg /usr/local/bin/ffmpeg
 COPY --from=build /src/target/release/den-remux /usr/local/bin/den-remux
+COPY --from=release-metadata /den-version /den-version
 
-# LIBVA_DRIVER_NAME: the UHD 630's driver, named, so libva does not probe for others.
+# LIBVA_DRIVER_NAME: the UHD 630's driver, named, so libva does not probe for others. DEN_VERSION is the release
+# the startup line, /metrics and the User-Agent report.
+ARG DEN_VERSION
+ARG GIT_REVISION
 ENV PORT=8095 \
     SCRATCH_DIR=/cache \
     FFMPEG_PATH=/usr/local/bin/ffmpeg \
-    LIBVA_DRIVER_NAME=iHD
+    LIBVA_DRIVER_NAME=iHD \
+    DEN_VERSION=$DEN_VERSION
+LABEL org.opencontainers.image.version=$DEN_VERSION \
+      org.opencontainers.image.revision=$GIT_REVISION
 VOLUME ["/cache"]
 EXPOSE 8095
 

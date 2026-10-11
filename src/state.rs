@@ -423,7 +423,7 @@ pub fn source_client(connect: Duration, read_idle: Duration) -> reqwest::Client 
     reqwest::Client::builder()
         .connect_timeout(connect)
         .read_timeout(read_idle)
-        .user_agent(concat!("den-remux/", env!("CARGO_PKG_VERSION")))
+        .user_agent(crate::user_agent())
         .build()
         .expect("reqwest client")
 }
@@ -555,7 +555,7 @@ impl AppState {
                 .connect_timeout(Duration::from_secs(10))
                 // Scout may spend its whole scrape timeout on a slow indexer before it answers a list.
                 .timeout(Duration::from_secs(60))
-                .user_agent(concat!("den-remux/", env!("CARGO_PKG_VERSION")))
+                .user_agent(crate::user_agent())
                 .redirect(redirects)
                 .build()
                 .expect("reqwest client")

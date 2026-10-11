@@ -520,7 +520,7 @@ audio and subtitles are unchanged.
 ## Run
 
 ```bash
-docker build -t den-remux .
+docker build --build-arg DEN_VERSION="$(cat VERSION)" -t den-remux .
 docker run -d --name remux -p 8095:8095 -v remux-scratch:/cache \
   -e SCOUT_ORIGINS=http://<scout>:8080 -e REMUX_SCOUT_KEY=<secret> \
   -e BROWSER_KEY_HASHES=<sha256> -e REMUX_URL_KEY=<secret> den-remux
@@ -552,11 +552,23 @@ Planned like the other addons: a Podman Quadlet unit from the den repo's `deploy
 capability dropped, read-only rootfs, scratch bind-mounted from `/var/lib/den/remux-scratch` (owned by
 65532), updated through the health-gated `den-update`.
 
-**Release images.** `docker-publish` builds on a `v*` tag, and again every Monday from the newest tag with
-the bases re-pulled and no cache, so a fix to the distroless base or to the OpenSSL ffmpeg links statically
-reaches the box between releases. Trivy scans each image before `:latest` moves (it sees the distroless
-base; the static binaries carry no package database, so their OpenSSL and ffmpeg are tracked by their
-pins). Every image carries SLSA provenance and an SBOM and is signed keylessly with cosign:
+**Releases.** Run `scripts/release.sh X.Y.Z` on an up-to-date main checkout. It changes only `VERSION`, pushes
+that commit, waits for its exact main CI, and only then tags `vX.Y.Z`. Don't bump `Cargo.toml`: its version stays
+fixed so a release never invalidates the cached dependency layers, and the image supplies `DEN_VERSION` at run
+time (the startup line, `/metrics` and the User-Agent report it).
+
+Main CI is the release gate and the artifact producer: for every main commit it runs the tests and the e2e
+stage, and builds, probes (`scripts/probe-image.sh`: the startup line names the release and `ffmpeg=ok`) and
+scans an immutable `candidate-<sha>` image, recording its digest. The tag's `docker-publish` run only checks
+that record against the registry, probes it once more, signs it and moves the version tags and `:latest`; it
+never rebuilds a subtly different artifact. A failed main run creates no tag and cannot move `:latest`.
+
+Every Monday, and on a manual run, `docker-publish` instead rebuilds the newest tag with the bases re-pulled and
+no cache, so a fix to the Alpine base or the OpenSSL ffmpeg links reaches the box between releases; it is probed,
+scanned (gating on OS packages) and signed the same way. Tags cut before `VERSION` existed cannot be patch-rebuilt;
+the job says to cut one release first. Trivy sees the Alpine packages; the Rust binary and the source-built
+ffmpeg carry no package database, so they are tracked by their pins. Every image carries SLSA provenance and an
+SBOM and is signed keylessly with cosign:
 
 ```bash
 cosign verify \

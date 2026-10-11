@@ -49,7 +49,7 @@ mod tests;
 use std::convert::Infallible;
 use std::future::Future;
 use std::sync::atomic::Ordering::Relaxed;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -65,6 +65,25 @@ use crate::config::Config;
 use crate::httputil::Body;
 use crate::session::SubFile;
 use crate::state::{unix_now, AppState};
+
+/// The release the runtime image carries (`DEN_VERSION`, from the repository's `VERSION`). Keeping it out of
+/// Cargo.toml means a release does not invalidate the cached dependency and compile layers merely to change its
+/// number. Developer builds and tests have no image metadata, so they fall back to the package version.
+pub fn release_version() -> &'static str {
+    static VERSION: OnceLock<String> = OnceLock::new();
+    VERSION.get_or_init(|| {
+        std::env::var("DEN_VERSION")
+            .ok()
+            .filter(|version| !version.is_empty())
+            .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_owned())
+    })
+}
+
+/// `den-remux/<release>`, the User-Agent of every request this service and its ffmpeg make.
+pub fn user_agent() -> &'static str {
+    static AGENT: OnceLock<String> = OnceLock::new();
+    AGENT.get_or_init(|| format!("den-remux/{}", release_version()))
+}
 
 /// How often one failure condition may write a line.
 const LOG_EVERY: Duration = Duration::from_secs(60);
@@ -153,7 +172,7 @@ fn metrics_body(state: &AppState) -> String {
         "remux_build_info",
         "gauge",
         "The running build.",
-        concat!("{version=\"", env!("CARGO_PKG_VERSION"), "\"}"),
+        &format!("{{version=\"{}\"}}", release_version()),
         1,
     );
     let sessions = state.sessions();
@@ -1086,7 +1105,7 @@ async fn run(cfg: Config) -> std::io::Result<()> {
          browser_keys={} url_key={} trusted_proxies={} public_session_proxy={} \
          max_sessions={} per_install={} active_remuxes={} producer_idle={}s uplink={} session_idle={}s scratch={} \
          scratch_max={} ffmpeg={} transcode={} segments={}",
-        env!("CARGO_PKG_VERSION"),
+        release_version(),
         state.cfg.port,
         on(state.cfg.metrics_token.is_some()),
         on(state.cfg.log_requests),

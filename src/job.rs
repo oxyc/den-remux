@@ -204,12 +204,7 @@ pub fn args(spec: &Spec<'_>, ca_file: Option<&str>) -> Vec<String> {
         // A debrid CDN drops a connection that has sat idle while the run was paused; reconnect
         // resumes it with a Range request at the offset ffmpeg had reached.
         a.extend(s(&["-reconnect", "1", "-reconnect_on_network_error", "1", "-reconnect_delay_max", "5"]));
-        a.extend(s(&[
-            "-rw_timeout",
-            "30000000",
-            "-user_agent",
-            concat!("den-remux/", env!("CARGO_PKG_VERSION")),
-        ]));
+        a.extend(s(&["-rw_timeout", "30000000", "-user_agent", crate::user_agent()]));
     }
     if spec.input.starts_with("https://") {
         // ffmpeg does not verify TLS peers unless asked.
