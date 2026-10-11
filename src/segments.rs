@@ -801,9 +801,9 @@ async fn decode(ffmpeg: &str, input: &str, start: f64, len: f64) -> Result<Vec<u
             samples.push(i16::from_le_bytes([lo, bytes[0]]));
             bytes = &bytes[1..];
         }
-        let pairs = bytes.chunks_exact(2);
-        carry = pairs.remainder().first().copied();
-        samples.extend(pairs.map(|p| i16::from_le_bytes([p[0], p[1]])));
+        let (pairs, rest) = bytes.as_chunks::<2>();
+        carry = rest.first().copied();
+        samples.extend(pairs.iter().map(|p| i16::from_le_bytes(*p)));
         if tx.send(samples).await.is_err() {
             break;
         }
