@@ -3193,7 +3193,7 @@ async fn scan(state: &Arc<AppState>, key: &str, body: &str) -> Reply {
 async fn the_scan_route_wants_its_key_and_a_whole_episode() {
     let off = test_state("http://127.0.0.1:9", 2, Duration::from_secs(600));
     let r = scan(&off, SEGMENTS_KEY, r#"{"imdb":"tt0000020","season":1,"episode":1}"#).await;
-    assert_eq!(r.status, StatusCode::NOT_FOUND, "no SEGMENTS_KEY, no route");
+    assert_eq!(r.status, StatusCode::NOT_FOUND, "no PCM-capable ffmpeg, no route");
 
     let state = segments_state("http://127.0.0.1:9");
     let ep1 = r#"{"imdb":"tt0000020","season":1,"episode":1}"#;
@@ -3224,6 +3224,74 @@ async fn the_scan_route_wants_its_key_and_a_whole_episode() {
     }
     let r = scan(&state, SEGMENTS_KEY, r#"{"imdb":"tt0000020","season":1,"episode":33}"#).await;
     assert_eq!((r.status, r.json()["status"].clone()), (StatusCode::SERVICE_UNAVAILABLE, "busy".into()));
+}
+
+#[tokio::test]
+async fn a_scan_is_accepted_with_a_valid_scout_install_and_no_key() {
+    let origin = "http://127.0.0.1:9";
+    let mut cfg = test_config(origin, 2, Duration::from_secs(600), Some(SCOUT_KEY));
+    cfg.scout_install_url = None;
+    let state = state_from(cfg);
+    state.segments_ffmpeg.store(true, Relaxed);
+    let secret = format!("{origin}/sealed-install-config");
+    let body = |scout: &str| format!(r#"{{"imdb":"tt0000020","season":1,"episode":1,"scout":"{scout}"}}"#);
+
+    let r = call(&state, "POST", "/remux/segments/scan", None, &body(&secret)).await;
+    assert_eq!((r.status, r.json()["status"].clone()), (StatusCode::ACCEPTED, "queued".into()));
+    assert!(!r.text().contains("sealed-install-config"), "the install is not echoed");
+
+    // A second install for the same episode does not replace the first.
+    let other = body(&format!("{origin}/another-install"));
+    let r = call(&state, "POST", "/remux/segments/scan", None, &other).await;
+    assert_eq!(r.json()["status"], "queued", "de-duplicated by episode");
+    let (ep, install) = state.segments.take_for_test().await;
+    assert_eq!(ep.episode, 1);
+    assert_eq!(install.as_deref(), Some(secret.as_str()), "first install kept");
+
+    // Nothing the scan wrote can hold it: results are written only by a finished scan, from Stored's fields.
+    let dir = state.cfg.scratch_dir.join("segments");
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for e in entries.flatten() {
+            let text = std::fs::read_to_string(e.path()).unwrap_or_default();
+            assert!(!text.contains("sealed-install-config"), "{:?}", e.path());
+        }
+    }
+
+    // Outside SCOUT_ORIGINS: refused, and nothing queued.
+    let foreign = body("http://10.9.9.9:8080/cfg").replace(r#""episode":1"#, r#""episode":5"#);
+    let r = call(&state, "POST", "/remux/segments/scan", None, &foreign).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    assert_eq!(r.json()["error"], "bad_scout");
+    let ep5 = crate::segments::Episode { imdb: "tt0000020".into(), season: 1, episode: 5 };
+    assert!(state.segments.pending(&ep5).is_none());
+
+    // Neither a key nor a scout.
+    let none = r#"{"imdb":"tt0000020","season":1,"episode":1}"#;
+    assert_eq!(
+        call(&state, "POST", "/remux/segments/scan", None, none).await.status,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(scan(&state, "wrong", none).await.status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn a_keyed_scan_without_any_install_is_refused_before_it_queues() {
+    let mut cfg = test_config("http://127.0.0.1:9", 2, Duration::from_secs(600), Some(SCOUT_KEY));
+    cfg.segments_key = Some(SEGMENTS_KEY.into());
+    cfg.scout_install_url = None;
+    cfg.segments_daily_cap = 1;
+    let state = state_from(cfg);
+    state.segments_ffmpeg.store(true, Relaxed);
+    for e in 1..=3 {
+        let body = format!(r#"{{"imdb":"tt0000020","season":1,"episode":{e}}}"#);
+        let r = scan(&state, SEGMENTS_KEY, &body).await;
+        assert_eq!(
+            (r.status, r.json()["status"].clone()),
+            (StatusCode::UNPROCESSABLE_ENTITY, "no_install".into())
+        );
+    }
+    let ep = crate::segments::Episode { imdb: "tt0000020".into(), season: 1, episode: 1 };
+    assert!(state.segments.pending(&ep).is_none(), "never queued");
 }
 
 /// Real ffmpeg: episode 1 is scanned with episode 2 as its sibling (there is no 3), the shared theme found at each

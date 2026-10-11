@@ -68,10 +68,13 @@ GET    /health, /remux/health           200 {status} — ok, or degraded with a 
 GET    /metrics                         Prometheus text (bearer METRICS_TOKEN; 404 without it)
 POST   /remux/admin/kill                {owner: "grant:<gid>"} → {ended: n}; only with x-den-edge-secret (EDGE_SECRET),
                                         else the same 404 as any unknown route
-POST   /remux/segments/scan             {imdb, season, episode} with X-Den-Segments-Key (SEGMENTS_KEY) → 202
+POST   /remux/segments/scan             {imdb, season, episode, scout?} → 202
                                         {status: queued|running|done|none} (none: scanned, nothing found);
-                                        503 {status: busy} (queue full or the daily cap spent) · 400 · 401 bad_key;
-                                        404 while SEGMENTS_KEY is unset
+                                        auth: X-Den-Segments-Key (SEGMENTS_KEY), or "scout": the caller's full install
+                                        URL, validated as a session's is (SCOUT_ORIGINS); the scan resolves through it.
+                                        Keyed without scout uses SCOUT_INSTALL_URL: 422 {status: no_install} if unset.
+                                        503 {status: busy} (queue full or the daily cap spent) · 400 (bad_scout too) ·
+                                        401 bad_key (neither); 404 only while ffmpeg can't do PCM
 GET    /remux/segments/<tt>/<s>/<e>     public: 200 {duration, intro: {start, end}|null, credits: {start, end}|null,
                                         method: "fingerprint", scanned_at} (seconds) · 202 {status: pending} ·
                                         404 {status: unknown}
@@ -242,7 +245,7 @@ people watching, not titles clicked.
 
 For episodes SkipDB has no times for (oxyc/den#227), Jellyfin Intro Skipper's audio-fingerprint method
 (`src/segments.rs`, which cites the thresholds taken from its source). A scan resolves the episode through
-`SCOUT_INSTALL_URL` and reads the smallest cached release, anything up to 1080p before a 4K copy. ffmpeg decodes two
+the scout install the request names (`"scout"`, kept in memory only) or, for a keyed request, `SCOUT_INSTALL_URL`, and reads the smallest cached release, anything up to 1080p before a 4K copy. ffmpeg decodes two
 windows of its first audio track — the intro window from the start (a quarter of the runtime, at most 6 min) and
 the credits window (the last 8 min) — to 11025 Hz mono PCM on a pipe, seeking with `-ss` before `-i` through the
 session door, so only those byte ranges are read; it runs at nice 19 with one decoder thread. The PCM is
@@ -424,7 +427,7 @@ Every variable is unprefixed; `.env.example` lists them with their defaults.
 | `WEB_ORIGINS` | — | Pages on another origin that may log in and start sessions (comma-separated): the Den web app on its public name. Session files are readable from anywhere already. |
 | `METRICS_TOKEN` | — | Turns on `/metrics` behind `Authorization: Bearer <token>`; otherwise it is a 404. |
 | `EDGE_SECRET` | — | **Secret**, shared with den-edge (`REMUX_EDGE_SECRET`). With it, a request to `/remux/session` or `/remux/releases` carrying `x-den-edge-secret` and `x-den-owner: grant:<8 hex>` plays as that guest grant: its own cap (`GUEST_MAX_SESSIONS`), never counted against a host; converted for as a host is, on the same one GPU slot. It also turns on `POST /remux/admin/kill {"owner":"grant:<gid>"}` → `{"ended": n}`, which ends that grant's sessions. Unset, the headers are ignored and the admin route is a 404. |
-| `SEGMENTS_KEY` | — | **Secret**, shared with den-edge: `POST /remux/segments/scan` asks for it as `X-Den-Segments-Key`. Unset, scanning is off and the route is a 404. Needs `SCOUT_INSTALL_URL`. |
+| `SEGMENTS_KEY` | — | **Secret**, shared with den-edge: `POST /remux/segments/scan` accepts it as `X-Den-Segments-Key` in place of a `scout` install in the body, and then scans through `SCOUT_INSTALL_URL` (422 `no_install` without it). Unset, only a request with a valid `scout` is accepted. |
 | `SEGMENTS_DAILY_CAP` | `300` | Episodes fingerprinted per UTC day at most; past it a scan request is `503 busy`. Counted in memory, so a restart resets it. |
 | `GUEST_MAX_SESSIONS` | `2` | Sessions one guest grant plays at once (1–8); past it, its oldest ends. |
 | `LOG_REQUESTS` | off | `1` writes `<METHOD> <path> <status> <ms>ms[ rid=<X-Request-Id>]` per response; `POST /remux/session`'s line also carries `session=<id>` once it creates one. |

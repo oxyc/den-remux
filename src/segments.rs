@@ -1,12 +1,13 @@
 //! Intro and credits detection for series episodes (oxyc/den#227): Jellyfin Intro Skipper's audio-fingerprint
 //! method, on the box, for the shows SkipDB has no times for.
 //!
-//!   POST /remux/segments/scan {imdb, season, episode}   X-Den-Segments-Key
-//!        → 202 {status: queued|running|done|none} | 503 {status: busy}
+//!   POST /remux/segments/scan {imdb, season, episode, scout?}   X-Den-Segments-Key, or a valid `scout` install
+//!        → 202 {status: queued|running|done|none} | 503 {status: busy} | 422 {status: no_install}
 //!   GET  /remux/segments/<tt>/<season>/<episode>
 //!        → 200 {duration, intro, credits, method, scanned_at} | 202 {status: pending} | 404 {status: unknown}
 //!
-//! A scan resolves the episode through this service's own scout install (`SCOUT_INSTALL_URL`), takes the smallest
+//! A scan resolves the episode through the scout install the request brought (held in memory, never stored or
+//! logged), else this service's own (`SCOUT_INSTALL_URL`), takes the smallest
 //! cached release, and has ffmpeg decode only the two windows it needs — the intro window from the start and the
 //! credits window at the end — to 11025 Hz mono PCM on a pipe. An input seek (`-ss` before `-i`) reads just those
 //! byte ranges, through the session door (`source`), so the link never reaches ffmpeg's command line. The PCM is
@@ -355,6 +356,9 @@ const TRANSCODE_WAIT: Duration = Duration::from_secs(5);
 #[derive(Default)]
 struct Inner {
     queue: VecDeque<Episode>,
+    /// The scout install a queued episode was asked with, where the request named one. Memory only: an install is
+    /// a credential, so it is never written to a result or a log.
+    installs: HashMap<Episode, String>,
     running: HashSet<Episode>,
     /// The UTC day `used` counts, and the episodes fingerprinted on it.
     day: u64,
@@ -392,7 +396,8 @@ impl Segments {
     }
 
     /// Queue `ep` unless it is already waiting or running; `None` when the queue is full or today's budget spent.
-    pub fn enqueue(&self, ep: Episode, cap: u32) -> Option<Pending> {
+    /// `install` is the scout install to resolve it through; an episode already waiting keeps the one it has.
+    pub fn enqueue(&self, ep: Episode, cap: u32, install: Option<String>) -> Option<Pending> {
         let mut inner = self.lock();
         if inner.running.contains(&ep) {
             return Some(Pending::Running);
@@ -404,6 +409,9 @@ impl Segments {
         let spent = inner.day == today && inner.used >= cap;
         if inner.queue.len() >= QUEUE_MAX || spent {
             return None;
+        }
+        if let Some(install) = install {
+            inner.installs.insert(ep.clone(), install);
         }
         inner.queue.push_back(ep);
         drop(inner);
@@ -422,23 +430,30 @@ impl Segments {
         if inner.used >= cap {
             // Nothing queued can run today: let those requests come again tomorrow.
             inner.queue.clear();
+            inner.installs.clear();
             return false;
         }
         inner.used += 1;
         true
     }
 
-    async fn next(&self) -> Episode {
+    async fn next(&self) -> (Episode, Option<String>) {
         loop {
             {
                 let mut inner = self.lock();
                 if let Some(ep) = inner.queue.pop_front() {
                     inner.running.insert(ep.clone());
-                    return ep;
+                    let install = inner.installs.remove(&ep);
+                    return (ep, install);
                 }
             }
             self.wake.notified().await;
         }
+    }
+
+    #[cfg(test)]
+    pub async fn take_for_test(&self) -> (Episode, Option<String>) {
+        self.next().await
     }
 
     fn hold(&self, ep: &Episode) {
@@ -453,12 +468,12 @@ impl Segments {
 /// Runs scans one at a time, for the life of the process. Idle it waits on the queue and does nothing.
 pub async fn worker(st: Arc<AppState>) {
     loop {
-        let ep = st.segments.next().await;
+        let (ep, install) = st.segments.next().await;
         // A transcode is the box's heaviest work and a viewer is waiting on it; a scan can wait.
         while st.transcodes.load(Relaxed) > 0 {
             tokio::time::sleep(TRANSCODE_WAIT).await;
         }
-        scan(&st, &ep).await;
+        scan(&st, &ep, install.or_else(|| st.cfg.scout_install_url.clone())).await;
         st.segments.release(&ep);
     }
 }
@@ -481,13 +496,19 @@ struct Cost {
     wall: Duration,
 }
 
-async fn scan(st: &Arc<AppState>, ep: &Episode) {
+/// Scan `ep` and its sibling through the scout install `base`, which is never logged.
+async fn scan(st: &Arc<AppState>, ep: &Episode, base: Option<String>) {
     let scratch = &st.cfg.scratch_dir;
     if stored(scratch, ep).await.is_some() {
         return;
     }
+    let Some(base) = base else {
+        eprintln!("segments: {} result=failed (no scout install)", who(st, ep));
+        return;
+    };
+    let base = base.as_str();
     let mut season: Season = read_json(&season_path(scratch, ep)).await.unwrap_or_default();
-    let Some((a, cost_a)) = attempt(st, ep).await else { return };
+    let Some((a, cost_a)) = attempt(st, ep, base).await else { return };
     // A sibling is needed only for what the season has no fingerprint of yet.
     let mut b: Option<(Episode, Prints, Cost)> = None;
     if season.intro.is_none() || season.credits.is_none() {
@@ -497,7 +518,7 @@ async fn scan(st: &Arc<AppState>, ep: &Episode) {
             }
             let sib = ep.next(n);
             st.segments.hold(&sib);
-            let got = fingerprint_logged(st, &sib).await;
+            let got = fingerprint_logged(st, &sib, base).await;
             if !matches!(got, Err(Failure::NoRelease)) || n < ep.episode {
                 if let Ok((p, c)) = got {
                     b = Some((sib.clone(), p, c));
@@ -522,13 +543,13 @@ async fn scan(st: &Arc<AppState>, ep: &Episode) {
 }
 
 /// Fingerprint `ep` for the episode a scan was asked for; a failure is logged and ends the scan.
-async fn attempt(st: &Arc<AppState>, ep: &Episode) -> Option<(Prints, Cost)> {
-    fingerprint_logged(st, ep).await.ok()
+async fn attempt(st: &Arc<AppState>, ep: &Episode, base: &str) -> Option<(Prints, Cost)> {
+    fingerprint_logged(st, ep, base).await.ok()
 }
 
-async fn fingerprint_logged(st: &Arc<AppState>, ep: &Episode) -> Result<(Prints, Cost), Failure> {
+async fn fingerprint_logged(st: &Arc<AppState>, ep: &Episode, base: &str) -> Result<(Prints, Cost), Failure> {
     let started = Instant::now();
-    let got = match tokio::time::timeout(SCAN_TIMEOUT, fingerprint(st, ep)).await {
+    let got = match tokio::time::timeout(SCAN_TIMEOUT, fingerprint(st, ep, base)).await {
         Ok(got) => got,
         Err(_) => Err(Failure::Failed(format!("timed out after {}s", SCAN_TIMEOUT.as_secs()))),
     };
@@ -609,9 +630,9 @@ fn cheapest(list: &[crate::scout::Stream]) -> Vec<&crate::scout::Stream> {
 /// How many releases one episode's fingerprinting may open before giving up.
 const OPEN_MAX: usize = 3;
 
-async fn fingerprint(st: &Arc<AppState>, ep: &Episode) -> Result<(Prints, Cost), Failure> {
+async fn fingerprint(st: &Arc<AppState>, ep: &Episode, base: &str) -> Result<(Prints, Cost), Failure> {
     let started = Instant::now();
-    let base = st.cfg.scout_install_url.clone().ok_or(Failure::Failed("no SCOUT_INSTALL_URL".into()))?;
+    let base = base.to_string();
     let secrets = [base.clone()];
     let scrub = |text: &str| crate::redact::scrub(text, &[secrets[0].as_str()]);
     let src = crate::scout::ScoutSource { base, key: st.cfg.scout_key.clone() };
@@ -840,34 +861,54 @@ fn status(code: StatusCode, status: &str) -> Response<Body> {
     httputil::json(code, &serde_json::json!({ "status": status }), &[])
 }
 
-/// `POST /segments/scan`: queue an episode (and so its sibling) for a scan. A 404 while `SEGMENTS_KEY` is unset.
+/// `POST /segments/scan`: queue an episode (and so its sibling) for a scan. Off (404) while ffmpeg can't do PCM.
+/// The caller is either keyed (`X-Den-Segments-Key` = `SEGMENTS_KEY`) or brings a scout install of its own in the
+/// body, validated as a session's is; the scan resolves its releases through that install.
 pub async fn scan_route(
     st: &Arc<AppState>,
     headers: &hyper::HeaderMap,
     body: Option<Bytes>,
 ) -> Response<Body> {
     use subtle::ConstantTimeEq;
-    let Some(key) = st.cfg.segments_key.as_deref().filter(|_| st.segments_ok()) else {
+    if !st.segments_ok() {
         return httputil::not_found();
-    };
-    let presented = headers.get("x-den-segments-key").map(|v| v.as_bytes()).unwrap_or_default();
-    if !bool::from(presented.ct_eq(key.as_bytes())) {
-        return httputil::error(
-            StatusCode::UNAUTHORIZED,
-            "bad_key",
-            "X-Den-Segments-Key is missing or wrong.",
-        );
     }
     #[derive(Deserialize)]
     struct Scan {
         imdb: String,
         season: u32,
         episode: u32,
+        scout: Option<String>,
     }
-    let Some(req) = body
-        .and_then(|b| serde_json::from_slice::<Scan>(&b).ok())
-        .filter(|r| crate::scout::is_imdb(&r.imdb) && r.episode >= 1)
-    else {
+    let req = body.and_then(|b| serde_json::from_slice::<Scan>(&b).ok());
+    let presented = headers.get("x-den-segments-key").map(|v| v.as_bytes()).unwrap_or_default();
+    let keyed = st.cfg.segments_key.as_deref().is_some_and(|k| bool::from(presented.ct_eq(k.as_bytes())));
+    let scout = req.as_ref().and_then(|r| r.scout.as_deref());
+    if !keyed && scout.is_none() {
+        return httputil::error(
+            StatusCode::UNAUTHORIZED,
+            "bad_key",
+            "Send X-Den-Segments-Key, or a scout install URL as \"scout\".",
+        );
+    }
+    let install = match scout {
+        Some(url) => match crate::scout::validate_scoped(url, &st.cfg.scout_origins) {
+            Ok(valid) => Some(crate::config::local(&valid, &st.cfg.origin_aliases)),
+            Err(why) => {
+                return httputil::error(
+                    StatusCode::BAD_REQUEST,
+                    "bad_scout",
+                    &format!("The scout URL was refused: {why}."),
+                )
+            }
+        },
+        None => None,
+    };
+    // A keyed caller with no install of its own scans through this service's, if it has one.
+    if install.is_none() && st.cfg.scout_install_url.is_none() {
+        return status(StatusCode::UNPROCESSABLE_ENTITY, "no_install");
+    }
+    let Some(req) = req.filter(|r| crate::scout::is_imdb(&r.imdb) && r.episode >= 1) else {
         return httputil::error(
             StatusCode::BAD_REQUEST,
             "bad_request",
@@ -881,7 +922,7 @@ pub async fn scan_route(
         None => match stored(&st.cfg.scratch_dir, &ep).await {
             Some(s) if s.intro.is_some() || s.credits.is_some() => "done",
             Some(_) => "none",
-            None => match st.segments.enqueue(ep, st.cfg.segments_daily_cap) {
+            None => match st.segments.enqueue(ep, st.cfg.segments_daily_cap, install) {
                 Some(Pending::Running) => "running",
                 Some(Pending::Queued) => "queued",
                 None => {

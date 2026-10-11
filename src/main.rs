@@ -1068,11 +1068,9 @@ async fn run(cfg: Config) -> std::io::Result<()> {
     let transcode = state.cfg.max_transcodes > 0
         && state::check_transcode(&state.cfg.ffmpeg, &state.cfg.vaapi_device).await;
     state.transcode_ok.store(transcode, Relaxed);
-    if state.cfg.segments_key.is_some() {
-        state.segments_ffmpeg.store(segments::check_ffmpeg(&state.cfg.ffmpeg).await, Relaxed);
-        if state.segments_ok() {
-            tokio::spawn(segments::worker(state.clone()));
-        }
+    state.segments_ffmpeg.store(segments::check_ffmpeg(&state.cfg.ffmpeg).await, Relaxed);
+    if state.segments_ok() {
+        tokio::spawn(segments::worker(state.clone()));
     }
     if let Some((reason, detail)) = health_verdict(&state) {
         eprintln!("health: degraded ({reason}) — {detail}");
@@ -1109,10 +1107,10 @@ async fn run(cfg: Config) -> std::io::Result<()> {
         state.cfg.scratch_max_bytes,
         if state.ffmpeg_ok.load(Relaxed) { "ok" } else { "missing" },
         if transcode { format!("vaapi(max {})", state.cfg.max_transcodes) } else { "off".to_string() },
-        match (state.cfg.segments_key.is_some(), state.segments_ok()) {
-            (true, true) => format!("on(cap {}/day)", state.cfg.segments_daily_cap),
-            (true, false) => "off(ffmpeg)".to_string(),
-            _ => "off".to_string(),
+        if state.segments_ok() {
+            format!("on(cap {}/day)", state.cfg.segments_daily_cap)
+        } else {
+            "off(ffmpeg)".to_string()
         },
     );
 

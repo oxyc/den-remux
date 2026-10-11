@@ -595,9 +595,9 @@ impl AppState {
         })
     }
 
-    /// Is scanning on: `SEGMENTS_KEY` set and an ffmpeg that can do it.
+    /// Is scanning on: an ffmpeg that can do it.
     pub fn segments_ok(&self) -> bool {
-        self.cfg.segments_key.is_some() && self.segments_ffmpeg.load(Relaxed)
+        self.segments_ffmpeg.load(Relaxed)
     }
 
     pub fn can_transcode(&self) -> bool {

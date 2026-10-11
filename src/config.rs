@@ -94,8 +94,9 @@ pub struct Config {
     /// played when it ends (`session::report_usage`), so den-edge's "your guests" list can show plays and hours
     /// without ever being told a title. `None` turns the report off; a grant's session still ends the same.
     pub edge_report_url: Option<String>,
-    /// `SEGMENTS_KEY` — the key `POST /segments/scan` must present as `X-Den-Segments-Key`. Unset turns scanning
-    /// off: the route is a 404. Never logged.
+    /// `SEGMENTS_KEY` — the key that lets `POST /segments/scan` go without a scout install of its own, presented as
+    /// `X-Den-Segments-Key` (then `SCOUT_INSTALL_URL` is used). Unset, a scan is accepted only with a valid `scout`.
+    /// Never logged.
     pub segments_key: Option<String>,
     /// `SEGMENTS_DAILY_CAP` — episodes fingerprinted per UTC day at most (default 300).
     pub segments_daily_cap: u32,
