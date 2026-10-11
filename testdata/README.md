@@ -142,3 +142,25 @@ ffprobe -v error -select_streams V:0 -skip_frame nokey -show_entries frame=pts_t
 ```
 
 A regenerated file must reproduce those lists exactly; `src/tests.rs` asserts them.
+
+## segments-a.mkv, segments-b.mkv
+
+Two 200 s "episodes" for the intro/credits scan (`a_scan_finds_the_intro_and_credits_two_episodes_share`): each is
+its own music, a 25 s theme they share (at 6 s in A, at 14 s in B), more music of its own, and the same 35 s of end
+music. The music is a tone every quarter second whose pitch is a hash of the quarter's index and a seed, so no two
+seeds share a stretch at any offset (a seed added to the index would make two of them one tune shifted in time).
+Made with nixpkgs' ffmpeg 9.0.1 (`nix build nixpkgs#ffmpeg`):
+
+```sh
+# A tone every 0.25 s, its pitch a hash of the quarter-second index and a seed.
+mel() { local h="sin(floor(t*4)*12.9898+$1*78.233)*43758.5453"; echo "aevalsrc=exprs='0.4*sin(2*PI*t*220*pow(2\,floor(24*(($h)-floor($h)))/12))':s=44100:d=$2"; }
+make() { # name seed-pre pre seed-mid mid
+  ffmpeg -y -hide_banner -loglevel error \
+    -f lavfi -i "testsrc2=s=64x36:r=2:d=200" \
+    -f lavfi -i "$(mel $2 $3)" -f lavfi -i "$(mel 1000 25)" -f lavfi -i "$(mel $4 $5)" -f lavfi -i "$(mel 2000 35)" \
+    -filter_complex "[1:a][2:a][3:a][4:a]concat=n=4:v=0:a=1[a]" \
+    -map 0:v -map "[a]" -c:v libx264 -preset veryslow -crf 45 -g 4 -c:a aac -b:a 24k -ar 22050 -ac 1 "$1"
+}
+make segments-a.mkv 11 6 12 134
+make segments-b.mkv 21 14 22 126
+```

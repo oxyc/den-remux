@@ -49,6 +49,8 @@ struct Pull {
     failed: Arc<AtomicU64>,
     accounted: Arc<AtomicU64>,
     stats: Arc<Stats>,
+    /// The door's own count of upstream bytes handed to its reader (`Door::bytes_read`).
+    door_read: Arc<AtomicU64>,
 }
 
 impl Pull {
@@ -84,6 +86,8 @@ struct Entry {
     head: Bytes,
     size: u64,
     stats: Arc<Stats>,
+    /// Upstream bytes this door has handed its reader.
+    read: Arc<AtomicU64>,
 }
 
 /// Every open door, and the loopback port they are served on (bound on first use; `None` where it couldn't be).
@@ -111,6 +115,7 @@ impl Doors {
             head: Bytes::copy_from_slice(&head[..head.len().min(size as usize)]),
             size,
             stats: self.stats.clone(),
+            read: Arc::default(),
         });
         self.entries.lock().unwrap_or_else(|e| e.into_inner()).insert(token.clone(), entry.clone());
         Door { token, entry, entries: self.entries.clone() }
@@ -131,6 +136,11 @@ impl Door {
     /// Read from `upstream` from now on: a fresh debrid link for a session whose old one stopped working.
     pub fn set_upstream(&self, upstream: &str) {
         *self.entry.upstream.lock().unwrap_or_else(|e| e.into_inner()) = upstream.to_string();
+    }
+
+    /// Upstream bytes read through this door so far; the head it was opened with is not counted.
+    pub fn bytes_read(&self) -> u64 {
+        self.entry.read.load(Relaxed)
     }
 }
 
@@ -257,6 +267,7 @@ fn bytes(entry: Arc<Entry>, start: u64, end: u64) -> Body {
                     let n = bytes.len() as u64;
                     pull.consumed.fetch_add(n, Relaxed);
                     pull.stats.consumed.fetch_add(n, Relaxed);
+                    pull.door_read.fetch_add(n, Relaxed);
                 }
                 Some((item.map(Frame::data), State::Upstream(pull)))
             }
@@ -281,6 +292,7 @@ fn fetch(entry: Arc<Entry>, start: u64, end: u64, chunks: &'static [u64]) -> Pul
     let accounted_by_task = accounted.clone();
     let stats = entry.stats.clone();
     let task_stats = stats.clone();
+    let door_read = entry.read.clone();
     tokio::spawn(async move {
         let mut at = start;
         let mut chunk = 0usize;
@@ -385,7 +397,7 @@ fn fetch(entry: Arc<Entry>, start: u64, end: u64, chunks: &'static [u64]) -> Pul
             to = end.min(at.saturating_add(span).saturating_sub(1));
         }
     });
-    Pull { rx, requested, consumed, failed: failed_bytes, accounted, stats }
+    Pull { rx, requested, consumed, failed: failed_bytes, accounted, stats, door_read }
 }
 
 /// A read from upstream that failed: logged — the service's only record of it, ffmpeg seeing just a cut body — and
@@ -527,6 +539,7 @@ mod tests {
             head: Bytes::new(),
             size: 1000,
             stats: Arc::new(Stats::default()),
+            read: Arc::default(),
         });
         let mut pull = fetch(entry, 100, 199, &CHUNKS);
         let mut out = Vec::new();
@@ -685,6 +698,7 @@ mod tests {
                 head: Bytes::new(),
                 size: SIZE,
                 stats: Arc::new(Stats::default()),
+                read: Arc::default(),
             });
             async move {
                 let began = std::time::Instant::now();

@@ -490,6 +490,9 @@ async fn origin_handle(
             "tt0000013" => "surround.mkv",
             "tt0000015" => "subs.mkv",
             "tt0000004:1:2" if path.contains("/stream/series/") => "h264.mkv",
+            // Two episodes sharing an intro and end credits (testdata/README.md); there is no episode 3.
+            "tt0000020:1:1" if path.contains("/stream/series/") => "segments-a.mkv",
+            "tt0000020:1:2" if path.contains("/stream/series/") => "segments-b.mkv",
             _ => return origin_full(200, r#"{"streams":[]}"#),
         };
         let body = serde_json::json!({"streams": [
@@ -642,6 +645,8 @@ fn test_config(origin: &str, max_sessions: usize, idle: Duration, scout_key: Opt
         edge_secret: Some(EDGE_SECRET.into()),
         guest_max_sessions: 2,
         edge_report_url: None,
+        segments_key: None,
+        segments_daily_cap: 300,
     }
 }
 
@@ -3166,4 +3171,100 @@ async fn a_job_starts_sooner_through_the_door() {
         eprintln!("{label}: init.mp4 after {init:?}, first GOP after {gop:?}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
+}
+
+// ---- intro/credits scans ---------------------------------------------------------------------------------------
+
+const SEGMENTS_KEY: &str = "test-segments-key";
+
+fn segments_state(origin: &str) -> Arc<AppState> {
+    let mut cfg = test_config(origin, 2, Duration::from_secs(600), Some(SCOUT_KEY));
+    cfg.segments_key = Some(SEGMENTS_KEY.into());
+    let state = state_from(cfg);
+    state.segments_ffmpeg.store(true, Relaxed);
+    state
+}
+
+async fn scan(state: &Arc<AppState>, key: &str, body: &str) -> Reply {
+    call_with(state, "POST", "/remux/segments/scan", None, &[("x-den-segments-key", key)], body).await
+}
+
+#[tokio::test]
+async fn the_scan_route_wants_its_key_and_a_whole_episode() {
+    let off = test_state("http://127.0.0.1:9", 2, Duration::from_secs(600));
+    let r = scan(&off, SEGMENTS_KEY, r#"{"imdb":"tt0000020","season":1,"episode":1}"#).await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND, "no SEGMENTS_KEY, no route");
+
+    let state = segments_state("http://127.0.0.1:9");
+    let ep1 = r#"{"imdb":"tt0000020","season":1,"episode":1}"#;
+    assert_eq!(scan(&state, "wrong", ep1).await.status, StatusCode::UNAUTHORIZED);
+    let r = call(&state, "POST", "/remux/segments/scan", None, ep1).await;
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED, "no key at all");
+    for bad in [r#"{"imdb":"tt0000020","season":1}"#, r#"{"imdb":"x","season":1,"episode":1}"#, "{"] {
+        assert_eq!(scan(&state, SEGMENTS_KEY, bad).await.status, StatusCode::BAD_REQUEST, "{bad}");
+    }
+
+    let get = |path: &'static str| {
+        let state = state.clone();
+        async move { call(&state, "GET", path, None, "").await }
+    };
+    let r = get("/remux/segments/tt0000020/1/1").await;
+    assert_eq!((r.status, r.json()["status"].clone()), (StatusCode::NOT_FOUND, "unknown".into()));
+    assert_eq!(get("/remux/segments/../1/1").await.status, StatusCode::NOT_FOUND);
+
+    // Nothing runs the queue here, so a scan stays queued.
+    let r = scan(&state, SEGMENTS_KEY, ep1).await;
+    assert_eq!((r.status, r.json()["status"].clone()), (StatusCode::ACCEPTED, "queued".into()));
+    assert_eq!(scan(&state, SEGMENTS_KEY, ep1).await.json()["status"], "queued", "de-duplicated");
+    let r = get("/remux/segments/tt0000020/1/1").await;
+    assert_eq!((r.status, r.json()["status"].clone()), (StatusCode::ACCEPTED, "pending".into()));
+    for e in 2..=32 {
+        let body = format!(r#"{{"imdb":"tt0000020","season":1,"episode":{e}}}"#);
+        assert_eq!(scan(&state, SEGMENTS_KEY, &body).await.status, StatusCode::ACCEPTED);
+    }
+    let r = scan(&state, SEGMENTS_KEY, r#"{"imdb":"tt0000020","season":1,"episode":33}"#).await;
+    assert_eq!((r.status, r.json()["status"].clone()), (StatusCode::SERVICE_UNAVAILABLE, "busy".into()));
+}
+
+/// Real ffmpeg: episode 1 is scanned with episode 2 as its sibling (there is no 3), the shared theme found at each
+/// one's own offset, the shared end music anchored to the end of each file, and both results stored.
+#[tokio::test]
+#[ignore = "needs ffmpeg"]
+async fn a_scan_finds_the_intro_and_credits_two_episodes_share() {
+    let origin = origin().await;
+    let state = segments_state(&origin);
+    assert!(crate::segments::check_ffmpeg(&state.cfg.ffmpeg).await, "this ffmpeg can't write PCM to a pipe");
+    tokio::spawn(crate::segments::worker(state.clone()));
+    let r = scan(&state, SEGMENTS_KEY, r#"{"imdb":"tt0000020","season":1,"episode":1}"#).await;
+    assert_eq!(r.status, StatusCode::ACCEPTED);
+    let began = Instant::now();
+    let found = loop {
+        let r = call(&state, "GET", "/remux/segments/tt0000020/1/1", None, "").await;
+        if r.status == StatusCode::OK {
+            break r.json();
+        }
+        assert_eq!(r.status, StatusCode::ACCEPTED, "{}", r.text());
+        assert!(began.elapsed() < Duration::from_secs(60), "the scan never finished");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    let near = |v: &serde_json::Value, want: f64| {
+        let got = v.as_f64().unwrap();
+        assert!((got - want).abs() < 1.5, "{got} is not about {want}");
+    };
+    // segments-a.mkv: theme at 6–31 s; segments-b.mkv: at 14–39 s; both end on 35 s of the same music.
+    assert_eq!(found["method"], "fingerprint");
+    near(&found["duration"], 200.0);
+    near(&found["intro"]["start"], 6.0);
+    near(&found["intro"]["end"], 31.0);
+    near(&found["credits"]["start"], 165.0);
+    assert_eq!(found["credits"]["end"], found["duration"], "credits to the end of the file end there");
+    let r = call(&state, "GET", "/remux/segments/tt0000020/1/2", None, "").await;
+    assert_eq!(r.status, StatusCode::OK, "the sibling is stored too: {}", r.text());
+    let sibling = r.json();
+    near(&sibling["intro"]["start"], 14.0);
+    near(&sibling["intro"]["end"], 39.0);
+    near(&sibling["credits"]["start"], 165.0);
+    let r = scan(&state, SEGMENTS_KEY, r#"{"imdb":"tt0000020","season":1,"episode":2}"#).await;
+    assert_eq!(r.json()["status"], "done");
+    assert!(state.cfg.scratch_dir.join("segments/tt0000020-1.season.json").exists());
 }

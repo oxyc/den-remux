@@ -472,6 +472,10 @@ pub struct AppState {
     pub transcodes: Arc<AtomicUsize>,
     /// Each session's loopback door to its release, which its ffmpeg reads through (`source`).
     pub doors: crate::source::Doors,
+    /// Intro/credits scans: their queue and daily budget (`segments`).
+    pub segments: crate::segments::Segments,
+    /// Can this ffmpeg write PCM to a pipe (`segments::check_ffmpeg`)? Scanning is off without it.
+    pub segments_ffmpeg: AtomicBool,
 }
 
 /// A session replacing another of the same owner mid-film, which plays on until this one has started.
@@ -586,7 +590,14 @@ impl AppState {
             producer_waiters: AtomicUsize::new(0),
             transcodes: Arc::new(AtomicUsize::new(0)),
             doors: Default::default(),
+            segments: Default::default(),
+            segments_ffmpeg: AtomicBool::new(false),
         })
+    }
+
+    /// Is scanning on: `SEGMENTS_KEY` set and an ffmpeg that can do it.
+    pub fn segments_ok(&self) -> bool {
+        self.cfg.segments_key.is_some() && self.segments_ffmpeg.load(Relaxed)
     }
 
     pub fn can_transcode(&self) -> bool {
@@ -1007,7 +1018,7 @@ pub async fn check_transcode(ffmpeg: &str, device: &Path) -> bool {
 }
 
 /// Does `ffmpeg <args>` print `want`, for every pair? Says the first that does not.
-async fn reports_all(ffmpeg: &str, checks: &[(&[&str], &str)]) -> bool {
+pub(crate) async fn reports_all(ffmpeg: &str, checks: &[(&[&str], &str)]) -> bool {
     for (args, want) in checks {
         let out = tokio::time::timeout(
             Duration::from_secs(10),

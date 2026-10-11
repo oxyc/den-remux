@@ -619,7 +619,7 @@ impl Drop for Job {
 /// den-reel's registry, for the same reason.
 static LIVE_GROUPS: std::sync::Mutex<Option<std::collections::HashSet<u32>>> = std::sync::Mutex::new(None);
 
-fn register_group(pgid: u32) {
+pub(crate) fn register_group(pgid: u32) {
     if pgid > 1 && pgid <= i32::MAX as u32 {
         LIVE_GROUPS
             .lock()
@@ -629,7 +629,7 @@ fn register_group(pgid: u32) {
     }
 }
 
-fn unregister_group(pgid: u32) {
+pub(crate) fn unregister_group(pgid: u32) {
     if let Some(set) = LIVE_GROUPS.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
         set.remove(&pgid);
     }

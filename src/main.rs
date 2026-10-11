@@ -17,6 +17,8 @@
 //!   DELETE /remux/s/<sid>/<sig>             → end it (410 from then on)
 //!   POST /remux/s/<sid>/<sig>/end           → the same, `navigator.sendBeacon`-compatible (beacon is POST-only),
 //!                        for den-edge to call as the page goes away
+//!   POST /remux/segments/scan {imdb, season, episode} (X-Den-Segments-Key) → queue an intro/credits scan
+//!   GET  /remux/segments/<tt>/<season>/<episode> → what a scan found (`segments`)
 //!   GET  /health, /metrics
 //!
 //! A release comes from den-scout — the full install the request names, which is its own credential; for a
@@ -35,6 +37,7 @@ mod probe;
 mod redact;
 mod report;
 mod scout;
+mod segments;
 mod session;
 mod source;
 mod state;
@@ -429,9 +432,13 @@ where
             admin_kill(state, body).await
         }
         "/remux/login" | "/remux/session" | "/remux/releases" => method_not_allowed("POST"),
-        _ => match path.strip_prefix("/remux/s/") {
-            Some(rest) => session_route(state, parts, rest, body).await,
-            None => httputil::not_found(),
+        "/remux/segments/scan" if parts.method == Method::POST => {
+            segments::scan_route(state, &parts.headers, read_body(body).await).await
+        }
+        _ => match (path.strip_prefix("/remux/s/"), path.strip_prefix("/remux/segments/")) {
+            (Some(rest), _) => session_route(state, parts, rest, body).await,
+            (_, Some(rest)) if get => segments::get_route(state, rest).await,
+            _ => httputil::not_found(),
         },
     }
 }
@@ -1061,6 +1068,12 @@ async fn run(cfg: Config) -> std::io::Result<()> {
     let transcode = state.cfg.max_transcodes > 0
         && state::check_transcode(&state.cfg.ffmpeg, &state.cfg.vaapi_device).await;
     state.transcode_ok.store(transcode, Relaxed);
+    if state.cfg.segments_key.is_some() {
+        state.segments_ffmpeg.store(segments::check_ffmpeg(&state.cfg.ffmpeg).await, Relaxed);
+        if state.segments_ok() {
+            tokio::spawn(segments::worker(state.clone()));
+        }
+    }
     if let Some((reason, detail)) = health_verdict(&state) {
         eprintln!("health: degraded ({reason}) — {detail}");
     }
@@ -1074,7 +1087,7 @@ async fn run(cfg: Config) -> std::io::Result<()> {
         "den-remux {} listening on :{} — metrics={} log_requests={} scout_origins={} scout_key={} scout_install={} \
          browser_keys={} url_key={} trusted_proxies={} public_session_proxy={} \
          max_sessions={} per_install={} active_remuxes={} producer_idle={}s uplink={} session_idle={}s scratch={} \
-         scratch_max={} ffmpeg={} transcode={}",
+         scratch_max={} ffmpeg={} transcode={} segments={}",
         env!("CARGO_PKG_VERSION"),
         state.cfg.port,
         on(state.cfg.metrics_token.is_some()),
@@ -1096,6 +1109,11 @@ async fn run(cfg: Config) -> std::io::Result<()> {
         state.cfg.scratch_max_bytes,
         if state.ffmpeg_ok.load(Relaxed) { "ok" } else { "missing" },
         if transcode { format!("vaapi(max {})", state.cfg.max_transcodes) } else { "off".to_string() },
+        match (state.cfg.segments_key.is_some(), state.segments_ok()) {
+            (true, true) => format!("on(cap {}/day)", state.cfg.segments_daily_cap),
+            (true, false) => "off(ffmpeg)".to_string(),
+            _ => "off".to_string(),
+        },
     );
 
     let drained = serve_until(listener, state.clone(), shutdown, DRAIN_GRACE, HEADER_READ_TIMEOUT).await;

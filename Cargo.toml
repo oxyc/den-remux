@@ -36,6 +36,9 @@ getrandom = "0.4"
 # Parse the first Dolby Vision RPU only for the narrowly gated malformed Profile 5 case. Keeping
 # this as the library (rather than duplicating Dolby's bitstream parser) uses its validated profile verdict.
 dolby_vision = { version = "3.4", default-features = false }
+# Intro/credits detection (`segments`): Chromaprint's audio fingerprint in pure Rust, so the image needs no
+# libchromaprint and ffmpeg needs no chromaprint muxer.
+rusty-chromaprint = "0.3"
 
 # killpg / SIGSTOP / SIGCONT on the ffmpeg process group.
 [target.'cfg(unix)'.dependencies]

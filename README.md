@@ -68,6 +68,13 @@ GET    /health, /remux/health           200 {status} — ok, or degraded with a 
 GET    /metrics                         Prometheus text (bearer METRICS_TOKEN; 404 without it)
 POST   /remux/admin/kill                {owner: "grant:<gid>"} → {ended: n}; only with x-den-edge-secret (EDGE_SECRET),
                                         else the same 404 as any unknown route
+POST   /remux/segments/scan             {imdb, season, episode} with X-Den-Segments-Key (SEGMENTS_KEY) → 202
+                                        {status: queued|running|done|none} (none: scanned, nothing found);
+                                        503 {status: busy} (queue full or the daily cap spent) · 400 · 401 bad_key;
+                                        404 while SEGMENTS_KEY is unset
+GET    /remux/segments/<tt>/<s>/<e>     public: 200 {duration, intro: {start, end}|null, credits: {start, end}|null,
+                                        method: "fingerprint", scanned_at} (seconds) · 202 {status: pending} ·
+                                        404 {status: unknown}
 anything else                           404 {"error":"not_found"}
 ```
 
@@ -231,6 +238,33 @@ A logged-in browser that creates a session while it already has one ends the old
 another title), and an install past `MAX_SESSIONS_PER_INSTALL` ends its oldest, so `MAX_SESSIONS` counts
 people watching, not titles clicked.
 
+## Intro and credits detection
+
+For episodes SkipDB has no times for (oxyc/den#227), Jellyfin Intro Skipper's audio-fingerprint method
+(`src/segments.rs`, which cites the thresholds taken from its source). A scan resolves the episode through
+`SCOUT_INSTALL_URL` and reads the smallest cached release, anything up to 1080p before a 4K copy. ffmpeg decodes two
+windows of its first audio track — the intro window from the start (a quarter of the runtime, at most 6 min) and
+the credits window (the last 8 min) — to 11025 Hz mono PCM on a pipe, seeking with `-ss` before `-i` through the
+session door, so only those byte ranges are read; it runs at nice 19 with one decoder thread. The PCM is
+fingerprinted as it arrives (rusty-chromaprint, `fpcalc`'s algorithm) and never held whole or written anywhere.
+
+Two episodes share their intro and end credits, so the longest run of matching points (at most 6 of 32 bits
+differ, gaps up to 3.5 s) between their windows is the segment in each: an intro 15–120 s, credits 15 s to the
+window. Candidate alignments come from an inverted index on the points. Scanning episode N also scans N+1 (or N−1
+where there is no N+1) and stores both. The matched points become the season's fingerprint, and later episodes are
+matched against it alone, so each needs one scan. Results are a JSON file per episode, plus one per season, in
+`SCRATCH_DIR/segments`.
+
+One scan runs at a time, never starting while a transcode runs; requests are de-duplicated by episode, queued 32
+deep, capped at `SEGMENTS_DAILY_CAP` fingerprinted episodes a day, and each episode is given 3 min. Each episode
+logs one line: `segments: <tt:S:E> release=<res>/<GB> read=<MB> wall=<s> result=intro:<a-b|none> credits:<…>`, or
+`result=failed (<why>)`, with no URL.
+
+Measured on Apple Silicon (nixpkgs ffmpeg 9.0.1), a 10 min window of a 720p file with 640 kbit/s E-AC-3 5.1:
+ffmpeg 1.27 CPU-s (1.03 user + 0.24 sys) in 0.59 s, 28 MB peak RSS (10.9 MB footprint); fingerprinting it in-process
+about 0.4 CPU-s and 3.4 MB peak footprint for the whole test process. A typical 45 min episode decodes 14 min of
+windows.
+
 ## Security model
 
 - **The scout install is the credential.** Every device in a Den library holds the library's plugin
@@ -390,6 +424,8 @@ Every variable is unprefixed; `.env.example` lists them with their defaults.
 | `WEB_ORIGINS` | — | Pages on another origin that may log in and start sessions (comma-separated): the Den web app on its public name. Session files are readable from anywhere already. |
 | `METRICS_TOKEN` | — | Turns on `/metrics` behind `Authorization: Bearer <token>`; otherwise it is a 404. |
 | `EDGE_SECRET` | — | **Secret**, shared with den-edge (`REMUX_EDGE_SECRET`). With it, a request to `/remux/session` or `/remux/releases` carrying `x-den-edge-secret` and `x-den-owner: grant:<8 hex>` plays as that guest grant: its own cap (`GUEST_MAX_SESSIONS`), never counted against a host; converted for as a host is, on the same one GPU slot. It also turns on `POST /remux/admin/kill {"owner":"grant:<gid>"}` → `{"ended": n}`, which ends that grant's sessions. Unset, the headers are ignored and the admin route is a 404. |
+| `SEGMENTS_KEY` | — | **Secret**, shared with den-edge: `POST /remux/segments/scan` asks for it as `X-Den-Segments-Key`. Unset, scanning is off and the route is a 404. Needs `SCOUT_INSTALL_URL`. |
+| `SEGMENTS_DAILY_CAP` | `300` | Episodes fingerprinted per UTC day at most; past it a scan request is `503 busy`. Counted in memory, so a restart resets it. |
 | `GUEST_MAX_SESSIONS` | `2` | Sessions one guest grant plays at once (1–8); past it, its oldest ends. |
 | `LOG_REQUESTS` | off | `1` writes `<METHOD> <path> <status> <ms>ms[ rid=<X-Request-Id>]` per response; `POST /remux/session`'s line also carries `session=<id>` once it creates one. |
 | `LOG_IDENTITY` | on | `0`/`false` drops the title id, release label, size and the chosen audio/subtitle's language from the audio-track and end-of-session log lines, keeping everything else (session id, `rid`, codecs, channel counts, segment/second counts, end reason). |

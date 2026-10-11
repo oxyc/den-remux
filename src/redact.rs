@@ -36,9 +36,18 @@ pub fn scrub(text: &str, secrets: &[&str]) -> String {
 pub fn path(path: &str) -> Cow<'_, str> {
     if matches!(
         path,
-        "/health" | "/remux/health" | "/metrics" | "/remux/login" | "/remux/session" | "/remux/releases"
+        "/health"
+            | "/remux/health"
+            | "/metrics"
+            | "/remux/login"
+            | "/remux/session"
+            | "/remux/releases"
+            | "/remux/segments/scan"
     ) {
         return path.into();
+    }
+    if path.starts_with("/remux/segments/") {
+        return "/remux/segments/<episode>".into();
     }
     let Some(rest) = path.strip_prefix("/remux/s/") else { return "/<unrouted>".into() };
     let mut it = rest.splitn(3, '/');

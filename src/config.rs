@@ -5,7 +5,7 @@
 //!      MAX_SESSIONS, MAX_SESSIONS_PER_INSTALL, MAX_ACTIVE_REMUXES, PRODUCER_IDLE_SECS, UPLINK_MBPS, SESSION_IDLE_SECS,
 //!      SCRATCH_DIR, SCRATCH_MAX_BYTES, FFMPEG_PATH, MAX_TRANSCODES, VAAPI_DEVICE, TRUSTED_PROXIES, WEB_ORIGINS,
 //!      METRICS_TOKEN, LOG_REQUESTS, LOG_IDENTITY,
-//!      EDGE_SECRET, GUEST_MAX_SESSIONS, EDGE_REPORT_URL.
+//!      EDGE_SECRET, GUEST_MAX_SESSIONS, EDGE_REPORT_URL, SEGMENTS_KEY, SEGMENTS_DAILY_CAP.
 
 use std::env;
 use std::path::PathBuf;
@@ -94,6 +94,11 @@ pub struct Config {
     /// played when it ends (`session::report_usage`), so den-edge's "your guests" list can show plays and hours
     /// without ever being told a title. `None` turns the report off; a grant's session still ends the same.
     pub edge_report_url: Option<String>,
+    /// `SEGMENTS_KEY` — the key `POST /segments/scan` must present as `X-Den-Segments-Key`. Unset turns scanning
+    /// off: the route is a 404. Never logged.
+    pub segments_key: Option<String>,
+    /// `SEGMENTS_DAILY_CAP` — episodes fingerprinted per UTC day at most (default 300).
+    pub segments_daily_cap: u32,
 }
 
 fn env_opt(key: &str) -> Option<String> {
@@ -303,6 +308,8 @@ impl Config {
                 .filter(|n| (1..=8).contains(n))
                 .unwrap_or(2),
             edge_report_url: env_opt("EDGE_REPORT_URL").map(|u| u.trim_end_matches('/').to_string()),
+            segments_key: env_opt("SEGMENTS_KEY"),
+            segments_daily_cap: env_opt("SEGMENTS_DAILY_CAP").and_then(|v| v.parse().ok()).unwrap_or(300),
         }
     }
 }

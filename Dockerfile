@@ -33,14 +33,16 @@ RUN wget -q -O /tmp/ffmpeg.tar.xz "https://ffmpeg.org/releases/ffmpeg-${FFMPEG_V
 WORKDIR /tmp/ffmpeg-${FFMPEG_VERSION}
 # What each group is for:
 #   demuxers   matroska, mov                  — the containers scout's releases come in
-#   muxers     hls (+ mp4, which it drives)   — fMP4 HLS output
+#   muxers     hls (+ mp4, which it drives)   — fMP4 HLS output; s16le, raw PCM on a pipe for the intro/credits
+#              fingerprint (`segments`)
 #   decoders   every audio codec a release carries: AC-3/E-AC-3, DTS (core of DTS-HD), TrueHD, FLAC,
 #              Opus, AAC, MP3/MP2, Vorbis, LPCM. And h264/hevc: a copy needs them for stream probing
 #              (to learn the B-frame reorder delay — without them ffmpeg guesses every copied packet's
 #              DTS), and a transcode decodes through them with the VAAPI hwaccels below.
 #              and the text subtitles a release carries — SRT, ASS/SSA, WebVTT, mov_text — which are written as WebVTT
 #              beside the video in the same run (bitmap subtitles have no decoder here: nothing maps them)
-#   encoders   aac (ffmpeg's native, stereo 192k); h264_vaapi for a transcode; webvtt for the subtitles
+#   encoders   aac (ffmpeg's native, stereo 192k); h264_vaapi for a transcode; webvtt for the subtitles; pcm_s16le
+#              for the fingerprint's PCM
 #   parsers    for the codecs the demuxers hand over unparsed. av1: Matroska asks for AV1's headers parsed, and
 #              the parser reads the pixel format and colours from the sequence header. A copy of AV1 needs no
 #              decoder: its packets are never reordered, so there is no delay to learn by probing
@@ -48,7 +50,8 @@ WORKDIR /tmp/ffmpeg-${FFMPEG_VERSION}
 #              endpoints every graph has); scale_vaapi and tonemap_vaapi for a transcode
 #   bsfs       dovi_rpu and filter_units: a copied Dolby Vision stream loses its RPU and enhancement layer
 #              and its configuration record, leaving the HDR10 base layer a browser can play
-#   protocols  file, and http(s) over tcp/tls (OpenSSL); --enable-version3 is what OpenSSL 3 requires
+#   protocols  file, pipe (the fingerprint's PCM on stdout), and http(s) over tcp/tls (OpenSSL); --enable-version3 is
+#              what OpenSSL 3 requires
 # ffmpeg's own libraries are linked in statically; OpenSSL, zlib and libva are the system's.
 RUN ./configure \
       --prefix=/opt/ffmpeg \
@@ -56,12 +59,12 @@ RUN ./configure \
       --disable-everything --disable-autodetect --disable-doc --disable-debug \
       --disable-ffplay --disable-avdevice --disable-swscale \
       --enable-version3 --enable-openssl --enable-zlib --enable-vaapi \
-      --enable-protocol=file,http,https,tcp,tls \
+      --enable-protocol=file,pipe,http,https,tcp,tls \
       --enable-demuxer=matroska,mov \
-      --enable-muxer=hls,mp4,webvtt \
+      --enable-muxer=hls,mp4,webvtt,s16le \
       --enable-decoder=h264,hevc,aac,ac3,eac3,dca,truehd,mlp,flac,opus,mp3,mp2,vorbis,pcm_s16le,pcm_s24le,pcm_s32le,pcm_f32le,pcm_s16be,pcm_s24be,subrip,ass,ssa,webvtt,movtext \
       --enable-hwaccel=h264_vaapi,hevc_vaapi \
-      --enable-encoder=aac,h264_vaapi,webvtt \
+      --enable-encoder=aac,h264_vaapi,webvtt,pcm_s16le \
       --enable-parser=av1,h264,hevc,aac,ac3,dca,mlp,flac,opus,mpegaudio,vorbis \
       --enable-filter=aresample,aformat,anull,atrim,abuffer,abuffersink,null,trim,buffer,buffersink,format,scale_vaapi,tonemap_vaapi \
       --enable-bsf=dovi_rpu,filter_units \
