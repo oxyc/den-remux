@@ -33,8 +33,8 @@ RUN wget -q -O /tmp/ffmpeg.tar.xz "https://ffmpeg.org/releases/ffmpeg-${FFMPEG_V
 WORKDIR /tmp/ffmpeg-${FFMPEG_VERSION}
 # What each group is for:
 #   demuxers   matroska, mov                  — the containers scout's releases come in
-#   muxers     hls (+ mp4, which it drives)   — fMP4 HLS output; s16le, raw PCM on a pipe for the intro/credits
-#              fingerprint (`segments`)
+#   muxers     hls (+ mp4, which it drives)   — fMP4 HLS output; pcm_s16le (`-f s16le` at run time), raw PCM on a
+#              pipe for the intro/credits fingerprint (`segments`)
 #   decoders   every audio codec a release carries: AC-3/E-AC-3, DTS (core of DTS-HD), TrueHD, FLAC,
 #              Opus, AAC, MP3/MP2, Vorbis, LPCM. And h264/hevc: a copy needs them for stream probing
 #              (to learn the B-frame reorder delay — without them ffmpeg guesses every copied packet's
@@ -61,7 +61,7 @@ RUN ./configure \
       --enable-version3 --enable-openssl --enable-zlib --enable-vaapi \
       --enable-protocol=file,pipe,http,https,tcp,tls \
       --enable-demuxer=matroska,mov \
-      --enable-muxer=hls,mp4,webvtt,s16le \
+      --enable-muxer=hls,mp4,webvtt,pcm_s16le \
       --enable-decoder=h264,hevc,aac,ac3,eac3,dca,truehd,mlp,flac,opus,mp3,mp2,vorbis,pcm_s16le,pcm_s24le,pcm_s32le,pcm_f32le,pcm_s16be,pcm_s24be,subrip,ass,ssa,webvtt,movtext \
       --enable-hwaccel=h264_vaapi,hevc_vaapi \
       --enable-encoder=aac,h264_vaapi,webvtt,pcm_s16le \
