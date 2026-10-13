@@ -65,7 +65,11 @@ const INTRO_WINDOW_SHARE: f64 = 0.25;
 const INTRO_WINDOW_MAX_SECS: f64 = 360.0;
 const CREDITS_WINDOW_SECS: f64 = 480.0;
 const START_SNAP_SECS: f64 = 5.0;
-/// Intro Skipper's 2 s, plus the chromaprint filters' tail: the last ~2.6 s of a window yield no point, so a
+/// Chromaprint's filters need roughly this much following audio before they emit a point. The final matching
+/// point consequently describes audio through this far beyond its timestamp; without restoring that coverage,
+/// every detected intro ends a little early (Springfloden S2E6 measured 276.8–297.1 and resumed in its tail).
+const FINGERPRINT_END_LAG_SECS: f64 = 2.6;
+/// Intro Skipper's 2 s, plus the chromaprint filter lag above: the last points of a window are absent, so a
 /// stretch that runs to the end of the file is seen to end that much early.
 const END_SNAP_SECS: f64 = 5.0;
 
@@ -184,12 +188,12 @@ fn intro_span((s, e): (usize, usize)) -> Span {
     let start = s as f64 * POINT_SECS;
     Span {
         start: if start <= START_SNAP_SECS { 0.0 } else { round3(start) },
-        end: round3(e as f64 * POINT_SECS),
+        end: round3(e as f64 * POINT_SECS + FINGERPRINT_END_LAG_SECS),
     }
 }
 
 fn credits_span(p: &Prints, (s, e): (usize, usize)) -> Span {
-    let end = p.credits_start + e as f64 * POINT_SECS;
+    let end = p.credits_start + e as f64 * POINT_SECS + FINGERPRINT_END_LAG_SECS;
     Span {
         start: round3(p.credits_start + s as f64 * POINT_SECS),
         end: if end >= p.duration - END_SNAP_SECS { round3(p.duration) } else { round3(end) },
@@ -288,6 +292,21 @@ pub struct Stored {
     pub scanned_at: u64,
 }
 
+fn upgrade_stored(stored: &mut Stored) {
+    if stored.method != "fingerprint" {
+        return;
+    }
+    let duration = stored.duration;
+    let restore = |span: &mut Option<Span>| {
+        if let Some(span) = span {
+            span.end = round3((span.end + FINGERPRINT_END_LAG_SECS).min(duration));
+        }
+    };
+    restore(&mut stored.intro);
+    restore(&mut stored.credits);
+    stored.method = "fingerprint-v2".into();
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Episode {
     pub imdb: String,
@@ -341,7 +360,12 @@ async fn write_json<T: Serialize>(path: &Path, value: &T) {
 }
 
 pub async fn stored(scratch: &Path, ep: &Episode) -> Option<Stored> {
-    read_json(&episode_path(scratch, ep)).await
+    let mut stored: Stored = read_json(&episode_path(scratch, ep)).await?;
+    // v1 wrote the timestamp of Chromaprint's final emitted point as the end. Its filters need another ~2.6 s
+    // of audio to emit that point, so every boundary was correspondingly early. Upgrade in memory so existing
+    // scans improve immediately after rollout; v2 results already include the restored coverage.
+    upgrade_stored(&mut stored);
+    Some(stored)
 }
 
 // ---- queue ----------------------------------------------------------------------------------------------------
@@ -588,7 +612,7 @@ async fn save(st: &AppState, ep: &Episode, p: &Prints, found: Found, cost: &Cost
         duration: round3(p.duration),
         intro: found.intro.or(old.as_ref().and_then(|o| o.intro)),
         credits: found.credits.or(old.as_ref().and_then(|o| o.credits)),
-        method: "fingerprint".into(),
+        method: "fingerprint-v2".into(),
         scanned_at: unix_now(),
     };
     if old.as_ref().is_none_or(|o| o.intro != result.intro || o.credits != result.credits) {
@@ -1069,9 +1093,9 @@ mod tests {
         let (fa, fb) = match_episodes(&mut season, &a, Some(&b));
         let intro_a = fa.intro.unwrap();
         assert_eq!(intro_a.start, 0.0, "a start within 5 s snaps to 0");
-        assert!((intro_a.end - 48.0).abs() < 0.3, "{intro_a:?}");
+        assert!((intro_a.end - 50.6).abs() < 0.3, "{intro_a:?}");
         let intro_b = fb.intro.unwrap();
-        assert!((intro_b.start - 70.0).abs() < 0.2 && (intro_b.end - 115.0).abs() < 0.3, "{intro_b:?}");
+        assert!((intro_b.start - 70.0).abs() < 0.2 && (intro_b.end - 117.6).abs() < 0.3, "{intro_b:?}");
         let credits_a = fa.credits.unwrap();
         assert!((credits_a.start - 2640.0).abs() < 0.5, "{credits_a:?}");
         assert_eq!(credits_a.end, duration, "an end at the file's end snaps to it");
@@ -1090,7 +1114,7 @@ mod tests {
         assert_eq!(season, kept, "the season's fingerprints are kept as they were");
         assert!((fc.intro.unwrap().start - 20.0).abs() < 0.2);
         let credits_c = fc.credits.unwrap();
-        assert!((credits_c.end - (duration - 30.0)).abs() < 0.5, "{credits_c:?}");
+        assert!((credits_c.end - (duration - 30.0 + FINGERPRINT_END_LAG_SECS)).abs() < 0.5, "{credits_c:?}");
     }
 
     #[test]
@@ -1109,6 +1133,26 @@ mod tests {
         assert_eq!(intro_window(1200.0), 300.0, "a quarter of a short episode");
         assert_eq!(credits_start(2700.0), 2220.0, "the last 8 min");
         assert_eq!(credits_start(600.0), 150.0, "never inside the intro window");
+    }
+
+    #[test]
+    fn a_stored_v1_boundary_gains_the_fingerprint_tail_once() {
+        let mut old = Stored {
+            imdb: "tt5194410".into(),
+            season: 2,
+            episode: 6,
+            duration: 2700.0,
+            intro: Some(Span { start: 276.8, end: 297.1 }),
+            credits: Some(Span { start: 2690.0, end: 2699.0 }),
+            method: "fingerprint".into(),
+            scanned_at: 0,
+        };
+        upgrade_stored(&mut old);
+        assert_eq!(old.intro.unwrap().end, 299.7);
+        assert_eq!(old.credits.unwrap().end, 2700.0, "the restored tail is clamped to the file");
+        assert_eq!(old.method, "fingerprint-v2");
+        upgrade_stored(&mut old);
+        assert_eq!(old.intro.unwrap().end, 299.7, "v2 must not be extended again on every read");
     }
 
     #[test]
