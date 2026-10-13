@@ -666,10 +666,7 @@ async fn save(st: &AppState, ep: &Episode, p: &Prints, found: Found, cost: &Cost
         method: FINGERPRINT_METHOD.into(),
         scanned_at: unix_now(),
     };
-    if old
-        .as_ref()
-        .is_none_or(|o| !current(o) || o.intro != result.intro || o.credits != result.credits)
-    {
+    if old.as_ref().is_none_or(|o| !current(o) || o.intro != result.intro || o.credits != result.credits) {
         write_json(&episode_path(scratch, ep), &result).await;
     }
     let span = |s: Option<Span>| s.map_or("none".to_string(), |s| format!("{:.1}-{:.1}", s.start, s.end));
