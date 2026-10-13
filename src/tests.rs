@@ -3319,18 +3319,19 @@ async fn a_scan_finds_the_intro_and_credits_two_episodes_share() {
         let got = v.as_f64().unwrap();
         assert!((got - want).abs() < 1.5, "{got} is not about {want}");
     };
-    // segments-a.mkv: theme at 6–31 s; segments-b.mkv: at 14–39 s; both end on 35 s of the same music.
-    assert_eq!(found["method"], "fingerprint");
+    // segments-a.mkv: theme at 6–31 s; segments-b.mkv: at 14–39 s. Chromaprint omits its 2.6 s
+    // analysis tail, which fingerprint-v2 restores before exposing the endpoints.
+    assert_eq!(found["method"], "fingerprint-v2");
     near(&found["duration"], 200.0);
     near(&found["intro"]["start"], 6.0);
-    near(&found["intro"]["end"], 31.0);
+    near(&found["intro"]["end"], 33.6);
     near(&found["credits"]["start"], 165.0);
     assert_eq!(found["credits"]["end"], found["duration"], "credits to the end of the file end there");
     let r = call(&state, "GET", "/remux/segments/tt0000020/1/2", None, "").await;
     assert_eq!(r.status, StatusCode::OK, "the sibling is stored too: {}", r.text());
     let sibling = r.json();
     near(&sibling["intro"]["start"], 14.0);
-    near(&sibling["intro"]["end"], 39.0);
+    near(&sibling["intro"]["end"], 41.6);
     near(&sibling["credits"]["start"], 165.0);
     let r = scan(&state, SEGMENTS_KEY, r#"{"imdb":"tt0000020","season":1,"episode":2}"#).await;
     assert_eq!(r.json()["status"], "done");
