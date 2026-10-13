@@ -3320,8 +3320,8 @@ async fn a_scan_finds_the_intro_and_credits_two_episodes_share() {
         assert!((got - want).abs() < 1.5, "{got} is not about {want}");
     };
     // segments-a.mkv: theme at 6–31 s; segments-b.mkv: at 14–39 s. Chromaprint omits its 2.6 s
-    // analysis tail, which fingerprint-v2 restores before exposing the endpoints.
-    assert_eq!(found["method"], "fingerprint-v2");
+    // analysis tail, which the current fingerprint format restores before exposing the endpoints.
+    assert_eq!(found["method"], "fingerprint-v3");
     near(&found["duration"], 200.0);
     near(&found["intro"]["start"], 6.0);
     near(&found["intro"]["end"], 33.6);

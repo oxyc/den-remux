@@ -59,6 +59,13 @@ const MAX_GAP_SECS: f64 = 3.5;
 const INDEX_SHIFT: i32 = 2;
 const INTRO_MIN_SECS: f64 = 15.0;
 const INTRO_MAX_SECS: f64 = 120.0;
+/// Once a strict intro match establishes an alignment, follow a differently mixed or fading copy of the same
+/// music a little farther. Random 32-bit fingerprints differ in 16 bits on average; an average of 12 across a
+/// one-second block is deliberately too loose to discover a match, but selective enough to refine its tail.
+const INTRO_TAIL_MAX_SECS: f64 = 12.0;
+const INTRO_TAIL_BLOCK_SECS: f64 = 1.0;
+const INTRO_TAIL_MAX_AVG_BIT_DIFF: u32 = 12;
+const FINGERPRINT_METHOD: &str = "fingerprint-v3";
 const CREDITS_MIN_SECS: f64 = 15.0;
 const CREDITS_MAX_SECS: f64 = 480.0;
 const INTRO_WINDOW_SHARE: f64 = 0.25;
@@ -153,6 +160,34 @@ fn contiguous(a: &[u32], b: &[u32], shift: isize, min_secs: f64) -> Option<(usiz
     longer(best, run).filter(|(s, e)| (e - s) as f64 * POINT_SECS >= min_secs)
 }
 
+/// Extend the end of an already established intro match along exactly the same alignment. This deliberately
+/// cannot find a match of its own: it only recovers the tail where a fade, voice-over or mastering difference
+/// makes corresponding Chromaprint points slightly less alike than the strict discovery threshold permits.
+fn refine_intro_tail(a: &[u32], b: &[u32], mut shared: Shared) -> Shared {
+    let block = (INTRO_TAIL_BLOCK_SECS / POINT_SECS).ceil() as usize;
+    let max_points = (INTRO_TAIL_MAX_SECS / POINT_SECS).floor() as usize;
+    let available = (a.len() - shared.a.1 - 1).min(b.len() - shared.b.1 - 1).min(max_points);
+    let mut extended = 0;
+
+    while extended + block <= available {
+        let a_start = shared.a.1 + 1 + extended;
+        let b_start = shared.b.1 + 1 + extended;
+        let difference: u32 = a[a_start..a_start + block]
+            .iter()
+            .zip(&b[b_start..b_start + block])
+            .map(|(x, y)| (x ^ y).count_ones())
+            .sum();
+        if difference > INTRO_TAIL_MAX_AVG_BIT_DIFF * block as u32 {
+            break;
+        }
+        extended += block;
+    }
+
+    shared.a.1 += extended;
+    shared.b.1 += extended;
+    shared
+}
+
 /// A segment in seconds into the file.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Span {
@@ -202,7 +237,9 @@ fn credits_span(p: &Prints, (s, e): (usize, usize)) -> Span {
 
 /// The intro two episodes share.
 fn pair_intro(a: &Prints, b: &Prints) -> Option<Shared> {
-    longest_shared(&a.intro, &b.intro, INTRO_MIN_SECS).filter(|s| s.secs() <= INTRO_MAX_SECS)
+    longest_shared(&a.intro, &b.intro, INTRO_MIN_SECS)
+        .map(|s| refine_intro_tail(&a.intro, &b.intro, s))
+        .filter(|s| s.secs() <= INTRO_MAX_SECS)
 }
 
 /// The longest credits a window of this episode can hold: under the whole window, as Intro Skipper allows.
@@ -219,6 +256,7 @@ fn pair_credits(a: &Prints, b: &Prints) -> Option<Shared> {
 /// The intro an episode shares with its season's kept fingerprint.
 fn intro_alone(p: &Prints, kept: &[u32]) -> Option<Span> {
     longest_shared(&p.intro, kept, INTRO_MIN_SECS)
+        .map(|s| refine_intro_tail(&p.intro, kept, s))
         .filter(|s| s.secs() <= INTRO_MAX_SECS)
         .map(|s| intro_span(s.a))
 }
@@ -242,6 +280,9 @@ pub struct Found {
 pub struct Season {
     pub intro: Option<Vec<u32>>,
     pub credits: Option<Vec<u32>>,
+    /// Missing on caches written before tail refinement; those truncated intro fingerprints must be rebuilt.
+    #[serde(default)]
+    pub intro_method: String,
 }
 
 /// Match `a` (and `b`, the sibling scanned beside it, if any) against the season's fingerprints, or against each
@@ -258,6 +299,7 @@ pub fn match_episodes(season: &mut Season, a: &Prints, b: Option<&Prints>) -> (F
                 fa.intro = Some(intro_span(s.a));
                 fb.intro = Some(intro_span(s.b));
                 season.intro = Some(a.intro[s.a.0..=s.a.1].to_vec());
+                season.intro_method = FINGERPRINT_METHOD.into();
             }
         }
     }
@@ -305,6 +347,10 @@ fn upgrade_stored(stored: &mut Stored) {
     restore(&mut stored.intro);
     restore(&mut stored.credits);
     stored.method = "fingerprint-v2".into();
+}
+
+fn current(stored: &Stored) -> bool {
+    stored.method == FINGERPRINT_METHOD
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -523,7 +569,7 @@ struct Cost {
 /// Scan `ep` and its sibling through the scout install `base`, which is never logged.
 async fn scan(st: &Arc<AppState>, ep: &Episode, base: Option<String>) {
     let scratch = &st.cfg.scratch_dir;
-    if stored(scratch, ep).await.is_some() {
+    if stored(scratch, ep).await.as_ref().is_some_and(current) {
         return;
     }
     let Some(base) = base else {
@@ -532,6 +578,10 @@ async fn scan(st: &Arc<AppState>, ep: &Episode, base: Option<String>) {
     };
     let base = base.as_str();
     let mut season: Season = read_json(&season_path(scratch, ep)).await.unwrap_or_default();
+    if season.intro_method != FINGERPRINT_METHOD {
+        season.intro = None;
+        season.intro_method.clear();
+    }
     let Some((a, cost_a)) = attempt(st, ep, base).await else { return };
     // A sibling is needed only for what the season has no fingerprint of yet.
     let mut b: Option<(Episode, Prints, Cost)> = None;
@@ -605,17 +655,21 @@ fn who(st: &AppState, ep: &Episode) -> String {
 async fn save(st: &AppState, ep: &Episode, p: &Prints, found: Found, cost: &Cost) {
     let scratch = &st.cfg.scratch_dir;
     let old = stored(scratch, ep).await;
+    let old_current = old.as_ref().filter(|o| current(o));
     let result = Stored {
         imdb: ep.imdb.clone(),
         season: ep.season,
         episode: ep.episode,
         duration: round3(p.duration),
-        intro: found.intro.or(old.as_ref().and_then(|o| o.intro)),
-        credits: found.credits.or(old.as_ref().and_then(|o| o.credits)),
-        method: "fingerprint-v2".into(),
+        intro: found.intro.or(old_current.and_then(|o| o.intro)),
+        credits: found.credits.or(old_current.and_then(|o| o.credits)),
+        method: FINGERPRINT_METHOD.into(),
         scanned_at: unix_now(),
     };
-    if old.as_ref().is_none_or(|o| o.intro != result.intro || o.credits != result.credits) {
+    if old
+        .as_ref()
+        .is_none_or(|o| !current(o) || o.intro != result.intro || o.credits != result.credits)
+    {
         write_json(&episode_path(scratch, ep), &result).await;
     }
     let span = |s: Option<Span>| s.map_or("none".to_string(), |s| format!("{:.1}-{:.1}", s.start, s.end));
@@ -944,9 +998,9 @@ pub async fn scan_route(
         Some(Pending::Running) => "running",
         Some(Pending::Queued) => "queued",
         None => match stored(&st.cfg.scratch_dir, &ep).await {
-            Some(s) if s.intro.is_some() || s.credits.is_some() => "done",
-            Some(_) => "none",
-            None => match st.segments.enqueue(ep, st.cfg.segments_daily_cap, install) {
+            Some(s) if current(&s) && (s.intro.is_some() || s.credits.is_some()) => "done",
+            Some(s) if current(&s) => "none",
+            _ => match st.segments.enqueue(ep, st.cfg.segments_daily_cap, install) {
                 Some(Pending::Running) => "running",
                 Some(Pending::Queued) => "queued",
                 None => {
@@ -977,7 +1031,7 @@ pub async fn get_route(st: &AppState, rest: &str) -> Response<Body> {
         return status(StatusCode::ACCEPTED, "pending");
     }
     match stored(&st.cfg.scratch_dir, &ep).await {
-        Some(s) => httputil::json(
+        Some(s) if current(&s) => httputil::json(
             StatusCode::OK,
             &serde_json::json!({
                 "duration": s.duration,
@@ -988,7 +1042,7 @@ pub async fn get_route(st: &AppState, rest: &str) -> Response<Body> {
             }),
             &[],
         ),
-        None => status(StatusCode::NOT_FOUND, "unknown"),
+        _ => status(StatusCode::NOT_FOUND, "unknown"),
     }
 }
 
@@ -1057,6 +1111,29 @@ mod tests {
         let a = episode(5, secs(5.0), &intro, secs(60.0));
         let b = episode(6, secs(5.0), &far, secs(60.0));
         assert_eq!(longest_shared(&a, &b, INTRO_MIN_SECS), None);
+    }
+
+    #[test]
+    fn a_softer_match_refines_an_established_intro_tail_only() {
+        let core = noise(80, secs(35.0));
+        let tail = noise(81, secs(8.0));
+        // Model the same music under a fade or episode-specific mix: each corresponding point is farther apart
+        // than the strict six-bit discovery threshold, but the one-second blocks remain strongly correlated.
+        let mixed_tail: Vec<u32> = tail.iter().map(|p| p ^ 0b1_1111_1111).collect();
+        let mut shared_a = core.clone();
+        shared_a.extend_from_slice(&tail);
+        let mut shared_b = core.clone();
+        shared_b.extend_from_slice(&mixed_tail);
+        let a = episode(82, secs(10.0), &shared_a, secs(40.0));
+        let b = episode(83, secs(30.0), &shared_b, secs(40.0));
+
+        let strict = longest_shared(&a, &b, INTRO_MIN_SECS).expect("the strict core");
+        assert_eq!(strict.a.1, secs(10.0) + core.len() - 1);
+        let refined = refine_intro_tail(&a, &b, strict);
+
+        let recovered = (refined.a.1 - strict.a.1) as f64 * POINT_SECS;
+        assert!(recovered >= 7.0, "recovered only {recovered:.3} s");
+        assert!(recovered <= 8.0, "extended into unrelated audio by {recovered:.3} s");
     }
 
     #[test]
